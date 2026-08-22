@@ -23,6 +23,13 @@ export const ROUTES_FILE = join(ARENA_DIR, 'routes.json')
  * the server. Human spectators on a newer client join through ViaVersion.
  */
 export const MC_VERSION = process.env.ARENA_MC_VERSION ?? '1.21.11'
+
+/**
+ * Minecraft version the Paper jar is fetched for. Kept separate from
+ * MC_VERSION (the protocol the bots speak) because Paper is only used for the
+ * one-time DataFixer upgrade, and its build numbering is its own.
+ */
+export const PAPER_VERSION = process.env.ARENA_PAPER_VERSION ?? '1.21.11'
 export const PORT = Number(process.env.ARENA_PORT ?? 25599)
 export const HOST = process.env.ARENA_HOST ?? '127.0.0.1'
 
@@ -35,7 +42,14 @@ export const BOT_BULBA_WASM = 'PF_Bulba_wasm'
 export const BOT_REFEREE = 'PF_Referee'
 export const BOT_NAMES = [BOT_UPSTREAM, BOT_BULBA, BOT_BULBA_WASM, BOT_REFEREE]
 
-export const JAR_PATH = join(RUN_DIR, `paper-${MC_VERSION}.jar`)
+export const JAR_PATH = join(RUN_DIR, `paper-${PAPER_VERSION}.jar`)
 export const SERVER_HEAP = process.env.ARENA_HEAP ?? '4G'
 /** How far the server streams chunks — must comfortably cover a whole route. */
 export const VIEW_DISTANCE = Number(process.env.ARENA_VIEW_DISTANCE ?? 16)
+
+/**
+ * Which server implementation to run: `pumpkin` (Rust, boots in
+ * milliseconds) or `paper` (Java). Paper is still needed once for
+ * `arena:server --upgrade`, which uses Minecraft's DataFixerUpper.
+ */
+export const SERVER_KIND = (process.env.ARENA_SERVER ?? 'paper') as 'pumpkin' | 'paper'

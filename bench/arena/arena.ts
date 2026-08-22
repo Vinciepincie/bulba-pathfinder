@@ -40,13 +40,41 @@ const sleep = async (ms: number): Promise<void> => await new Promise(resolve => 
  * into freshly generated terrain.
  */
 export async function prepareWorld (ref: Bot, radius: number): Promise<void> {
+  // ⚠ 1.21.11 renamed every gamerule to snake_case, and not mechanically:
+  // doDaylightCycle is now advance_time, doInsomnia is spawn_phantoms,
+  // announceAdvancements is show_advancement_messages. The old camelCase names
+  // are rejected outright ("Incorrect argument for command"), which the arena
+  // never noticed because nothing checks command replies — so the world was
+  // never actually frozen: daylight cycled, weather changed, mobs spawned and
+  // random ticks ran through every benchmark run to date.
   const rules: Array<[string, string]> = [
-    ['doDaylightCycle', 'false'], ['doWeatherCycle', 'false'], ['doFireTick', 'false'],
-    ['doMobSpawning', 'false'], ['doPatrolSpawning', 'false'], ['doTraderSpawning', 'false'],
-    ['doInsomnia', 'false'], ['disableRaids', 'true'], ['mobGriefing', 'false'],
-    ['doTileDrops', 'false'], ['randomTickSpeed', '0'], ['keepInventory', 'true'],
-    ['doImmediateRespawn', 'true'], ['showDeathMessages', 'true'], ['announceAdvancements', 'false'],
-    ['spectatorsGenerateChunks', 'false'], ['logAdminCommands', 'false'], ['fallDamage', 'true']
+    ['advance_time', 'false'], // was doDaylightCycle
+    ['advance_weather', 'false'], // was doWeatherCycle
+    ['spawn_mobs', 'false'], // was doMobSpawning
+    ['spawn_monsters', 'false'],
+    ['spawn_patrols', 'false'], // was doPatrolSpawning
+    ['spawn_wandering_traders', 'false'], // was doTraderSpawning
+    ['spawn_phantoms', 'false'], // was doInsomnia
+    ['spawn_wardens', 'false'],
+    ['raids', 'false'], // was disableRaids (note: inverted sense)
+    ['mob_griefing', 'false'],
+    ['block_drops', 'false'], // was doTileDrops
+    ['mob_drops', 'false'],
+    ['random_tick_speed', '0'],
+    ['keep_inventory', 'true'],
+    ['immediate_respawn', 'true'], // was doImmediateRespawn
+    ['show_death_messages', 'true'],
+    ['show_advancement_messages', 'false'], // was announceAdvancements
+    ['spectators_generate_chunks', 'false'],
+    ['log_admin_commands', 'false'],
+    ['fall_damage', 'true'],
+    ['drowning_damage', 'true'],
+    ['fire_damage', 'true'],
+    // No direct successor to doFireTick; 0 stops fire spreading near players,
+    // which is what mattered for a lava-heavy world staying identical between
+    // runs.
+    ['fire_spread_radius_around_player', '0'],
+    ['tnt_explodes', 'false']
   ]
   for (const [rule, value] of rules) ref.chat(`/gamerule ${rule} ${value}`)
   ref.chat('/difficulty peaceful')

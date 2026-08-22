@@ -6,14 +6,16 @@
 // racers, freezing weather/time/mobs — is a vanilla command run by an
 // opped referee bot.
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
+import { connect } from 'node:net'
 import { createHash } from 'node:crypto'
 import { createWriteStream } from 'node:fs'
-import { access, mkdir, writeFile, readFile } from 'node:fs/promises'
+import { access, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { join } from 'node:path'
+import { downloadPumpkin, writePumpkinConfig } from './pumpkin.js'
 import {
-  BOT_NAMES, JAR_PATH, MC_VERSION, PORT, RUN_DIR, SERVER_HEAP, VIEW_DISTANCE, WORLD_NAME
+  BOT_NAMES, HOST, JAR_PATH, MC_VERSION, PAPER_VERSION, PORT, RUN_DIR, SERVER_HEAP, SERVER_KIND, VIEW_DISTANCE, WORLD_NAME
 } from './config.js'
 
 const UA = 'bulba-pathfinder-arena/1.0 (+https://github.com/bulbastore)'
@@ -34,7 +36,7 @@ export function offlineUuid (name: string): string {
 export async function downloadPaper (): Promise<void> {
   if (await exists(JAR_PATH)) { console.log(`paper jar: ${JAR_PATH} (cached)`); return }
 
-  const res = await fetch(`https://fill.papermc.io/v3/projects/paper/versions/${MC_VERSION}/builds`, {
+  const res = await fetch(`https://fill.papermc.io/v3/projects/paper/versions/${PAPER_VERSION}/builds`, {
     headers: { 'User-Agent': UA }
   })
   if (!res.ok) throw new Error(`paper build list failed: ${res.status} ${res.statusText}`)
@@ -46,17 +48,22 @@ export async function downloadPaper (): Promise<void> {
   const stable = builds.filter(b => b.channel === 'STABLE')
   const build = (stable.length > 0 ? stable : builds).sort((a, b) => b.id - a.id)[0]
   const dl = build?.downloads['server:default']
-  if (dl === undefined) throw new Error(`no server download for paper ${MC_VERSION}`)
+  if (dl === undefined) throw new Error(`no server download for paper ${PAPER_VERSION}`)
 
-  console.log(`downloading paper ${MC_VERSION} build ${build.id} ...`)
+  console.log(`downloading paper ${PAPER_VERSION} build ${build.id} ...`)
   await mkdir(RUN_DIR, { recursive: true })
   const jar = await fetch(dl.url, { headers: { 'User-Agent': UA } })
   if (!jar.ok || jar.body === null) throw new Error(`jar download failed: ${jar.status}`)
   await pipeline(Readable.fromWeb(jar.body as never), createWriteStream(`${JAR_PATH}.part`))
 
   const sha = createHash('sha256').update(await readFile(`${JAR_PATH}.part`)).digest('hex')
-  if (sha !== dl.checksums.sha256) throw new Error(`jar checksum mismatch: ${sha} != ${dl.checksums.sha256}`)
-  await writeFile(JAR_PATH, await readFile(`${JAR_PATH}.part`))
+  if (sha !== dl.checksums.sha256) {
+    await rm(`${JAR_PATH}.part`, { force: true })
+    throw new Error(`jar checksum mismatch: ${sha} != ${dl.checksums.sha256}`)
+  }
+  // Rename rather than copy: the jar appears at its final path only once it
+  // has been verified, and no half-downloaded .part is left behind.
+  await rename(`${JAR_PATH}.part`, JAR_PATH)
   console.log(`paper jar: ${JAR_PATH} (verified)`)
 }
 
@@ -158,14 +165,39 @@ export interface ServerHandle {
 }
 
 /** Start Paper and resolve once it reports "Done (…)". */
+/** Start the configured server and resolve once it accepts connections. */
 export async function startServer (extraArgs: string[] = [], quiet = true): Promise<ServerHandle> {
+  return SERVER_KIND === 'pumpkin' && extraArgs.length === 0
+    ? await startPumpkin(quiet)
+    : await startPaper(extraArgs, quiet)
+}
+
+/** Paper. Also the only backend for --forceUpgrade. */
+async function startPaper (extraArgs: string[], quiet: boolean): Promise<ServerHandle> {
   const proc = spawn('java', [
     `-Xms${SERVER_HEAP}`, `-Xmx${SERVER_HEAP}`,
     '-XX:+UseG1GC', '-XX:MaxGCPauseMillis=50',
     '-Dcom.mojang.eula.agree=true',
     '-jar', JAR_PATH, '--nogui', ...extraArgs
   ], { cwd: RUN_DIR, stdio: ['pipe', 'pipe', 'pipe'] })
+  return await supervise(proc, quiet, /\]: Done \(/)
+}
 
+async function startPumpkin (quiet: boolean): Promise<ServerHandle> {
+  const bin = await downloadPumpkin()
+  await writePumpkinConfig()
+  const proc = spawn(bin, [], { cwd: RUN_DIR, stdio: ['pipe', 'pipe', 'pipe'] })
+  // Pumpkin's ready line is not a stable contract, so readiness is decided by
+  // the port actually accepting a connection — true of any implementation.
+  return await supervise(proc, quiet, null)
+}
+
+/** Shared process supervision: stream logs, detect readiness, expose stop(). */
+async function supervise (
+  proc: ChildProcessWithoutNullStreams,
+  quiet: boolean,
+  readyLine: RegExp | null
+): Promise<ServerHandle> {
   const exited = new Promise<number | null>(resolve => proc.on('exit', code => resolve(code)))
   const send = (command: string): void => { proc.stdin.write(`${command}\n`) }
 
@@ -173,19 +205,28 @@ export async function startServer (extraArgs: string[] = [], quiet = true): Prom
     let settled = false
     let locked = false
     const tail: string[] = []
+    const done = (): void => { if (!settled) { settled = true; resolve() } }
     const onLine = (line: string): void => {
       if (!quiet) process.stdout.write(`[server] ${line}\n`)
-      else if (/Preparing|Done \(|Force|upgrad|ERROR|Exception/i.test(line)) process.stdout.write(`[server] ${line}\n`)
+      else if (/Preparing|Done \(|Force|upgrad|ERROR|Exception|panicked/i.test(line)) process.stdout.write(`[server] ${line}\n`)
       tail.push(line)
       if (tail.length > 8) tail.shift()
       // A previous run that did not shut down still owns the world's
-      // session.lock. Paper reports this as a plain exit(0), which otherwise
+      // session.lock; Paper reports that as a plain exit(0), which otherwise
       // surfaces as a baffling "exited before finishing startup".
       if (/DirectoryLock|Failed to start the minecraft server/i.test(line)) locked = true
-      if (!settled && /\]: Done \(/.test(line)) { settled = true; resolve() }
+      if (readyLine !== null && readyLine.test(line)) done()
     }
     lines(proc.stdout, onLine)
     lines(proc.stderr, onLine)
+
+    if (readyLine === null) {
+      void waitForPort(HOST, PORT, 60_000).then(ok => {
+        if (ok) done()
+        else if (!settled) { settled = true; reject(new Error(`server never opened ${HOST}:${PORT}`)) }
+      })
+    }
+
     proc.on('exit', code => {
       if (settled) return
       settled = true
@@ -200,9 +241,32 @@ export async function startServer (extraArgs: string[] = [], quiet = true): Prom
     send,
     exited,
     stop: async () => {
-      if (proc.exitCode === null) { send('stop'); await exited }
+      if (proc.exitCode === null) {
+        send('stop')
+        // Pumpkin may not take 'stop' on stdin; fall back to a signal.
+        const timer = setTimeout(() => { if (proc.exitCode === null) proc.kill() }, 8000)
+        await exited
+        clearTimeout(timer)
+      }
     }
   }
+}
+
+/** Resolve true once something accepts TCP on host:port. */
+async function waitForPort (host: string, port: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const ok = await new Promise<boolean>(resolve => {
+      const socket = connect({ host, port })
+      const finish = (value: boolean): void => { socket.destroy(); resolve(value) }
+      socket.once('connect', () => finish(true))
+      socket.once('error', () => finish(false))
+      socket.setTimeout(1000, () => finish(false))
+    })
+    if (ok) return true
+    await new Promise(resolve => setTimeout(resolve, 100))
+  }
+  return false
 }
 
 /** One-shot: boot with --forceUpgrade so every chunk is converted up front
