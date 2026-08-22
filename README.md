@@ -1,4 +1,4 @@
-Vibe coded slop. Not recommended for production yet.
+Vibe coded slop. WIP not recommended for production yet.
 ---
 # @bulba/pathfinder
 
