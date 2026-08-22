@@ -151,6 +151,23 @@ export class SolverWorkerHost {
     return this.spawning
   }
 
+  /**
+   * Spawn the worker now rather than on the first solve.
+   *
+   * Thread start, module load and wasm instantiation are a one-time ~150 ms
+   * that otherwise lands entirely inside the first goal — the arena measures
+   * it directly as `1st move`, where the worker engine was 100-250 ms behind
+   * the main-thread one on every route while being faster at everything
+   * afterwards. A bot is idle when it connects and busy when it is asked to
+   * walk somewhere, so the cost belongs at load time. Fire and forget: a
+   * spawn failure is already handled (callers fall back to the main thread),
+   * and the worker is unref()ed so an idle process still exits.
+   */
+  prewarm (): void {
+    if (this.unavailable) return
+    void this.ensureWorker().catch(() => {})
+  }
+
   /** Null when the worker can't be used — caller solves on the main thread. */
   async solve (req: WorkerSolveRequest): Promise<WorkerSolveHandle | null> {
     const aw = await this.ensureWorker()

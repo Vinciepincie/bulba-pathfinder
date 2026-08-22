@@ -12,7 +12,7 @@ import { expect } from 'chai'
 import { Vec3 } from 'vec3'
 import { createRequire } from 'node:module'
 import { PhysicsSim } from '../src/physics.js'
-import { nearWall } from '../src/geometry.js'
+import { nearWall, playerCollides } from '../src/geometry.js'
 import { createPathfinder } from '../src/plugin.js'
 import { GoalBlock } from '../src/goals.js'
 import { Movements } from '../src/movements.js'
@@ -248,5 +248,109 @@ describe('executor: wall-slide steering', () => {
     bot.tick()
     const heading = { x: -Math.sin(bot.entity.yaw), z: -Math.cos(bot.entity.yaw) }
     expect(heading.z, 'still presses into the step it has to climb').to.be.lessThan(-0.9)
+  })
+})
+
+describe('executor: the 1.21.x hitbox-precision fix', () => {
+  /**
+   * A body built from 0.3 / 1.8 comes to rest exactly on block boundaries
+   * after every collision, and on 1.21.x the server's own sweep then computes
+   * exactly 1.0, calls the move blocked and teleports the client back. It
+   * presents as a pathfinder that cannot climb a one-block step: measured on
+   * the arena's climb1 riser, a walking jump from 0.01 clearance produced 19
+   * corrections and no movement with the stock dimensions, and zero
+   * corrections and a clean climb with them nudged.
+   */
+  function physicsHolder (): { physics: { playerHalfWidth: number, playerHeight: number } } {
+    const world = new VoxelWorld({ x0: -4, y0: -2, z0: -4, x1: 4, y1: 6, z1: 4 })
+    world.fill(-4, 0, -4, 4, 0, 4, STONE)
+    const bot = makeDriveableBot(world, new Vec3(0.5, 1, 0.5))
+    return bot as unknown as { physics: { playerHalfWidth: number, playerHeight: number } }
+  }
+
+  it('nudges the player dimensions off their exact boundaries on inject', () => {
+    const bot = physicsHolder()
+    bot.physics.playerHalfWidth = 0.3
+    bot.physics.playerHeight = 1.8
+    ;(createPathfinder({ useWorkerThreads: false }) as unknown as (b: unknown) => void)(bot)
+    expect(bot.physics.playerHalfWidth).to.equal(0.30001)
+    expect(bot.physics.playerHeight).to.equal(1.80001)
+  })
+
+  it('can be turned off, and never doubles up on an already-nudged bot', () => {
+    const off = physicsHolder()
+    off.physics.playerHalfWidth = 0.3
+    ;(createPathfinder({ useWorkerThreads: false, hitboxPrecisionFix: false }) as unknown as (b: unknown) => void)(off)
+    expect(off.physics.playerHalfWidth).to.equal(0.3)
+
+    // An application that applies its own nudge (bulbastore does) must not be
+    // nudged a second time — the guard is on the exact stock values.
+    const already = physicsHolder()
+    already.physics.playerHalfWidth = 0.30001
+    already.physics.playerHeight = 1.80001
+    ;(createPathfinder({ useWorkerThreads: false }) as unknown as (b: unknown) => void)(already)
+    expect(already.physics.playerHalfWidth).to.equal(0.30001)
+    expect(already.physics.playerHeight).to.equal(1.80001)
+  })
+
+  it('body probes measure the dimensions the physics actually uses', () => {
+    const world = new VoxelWorld({ x0: -8, y0: -2, z0: -8, x1: 8, y1: 6, z1: 8 })
+    world.fill(-8, 0, -8, 8, 0, 8, STONE)
+    world.fill(-8, 1, -1, 8, 2, -1, STONE) // wall along z = -1, face at z = 0
+
+    // Exactly one half-width off the face. With the stock 0.3 the body only
+    // touches; nudged, it overlaps — and playerCollides has to agree with
+    // whichever one the engine is going to simulate.
+    const bot = makeDriveableBot(world, new Vec3(0.5, 1, 0.3)) as unknown as {
+      physics: { playerHalfWidth: number, playerHeight: number }
+    }
+    // playerCollides insets by 0.02, so it reports an overlap below
+    // z = half - 0.02 — 0.28 stock, 0.28001 nudged. A probe between the two
+    // answers differently depending on which body it measured, and it has to
+    // be the one the engine will simulate.
+    const between = 0.280005
+    bot.physics.playerHalfWidth = 0.3
+    expect(playerCollides(bot as never, 0.5, 1, between)).to.equal(false)
+    bot.physics.playerHalfWidth = 0.30001
+    expect(playerCollides(bot as never, 0.5, 1, between)).to.equal(true)
+  })
+})
+
+describe('executor: rollout honesty after a lagback', () => {
+  /**
+   * mineflayer sets `entity.onGround = false` on every server position
+   * correction, so a bot standing on solid ground reads as airborne for a
+   * tick. The one-jump latch used to take that at face value: it latched
+   * "airborne" before the sim had run a step, called the first simulated tick
+   * a LANDING, and released the jump it was being asked about — so every jump
+   * gate answered "no" for as long as the corrections kept coming, which is
+   * exactly when the bot most needs one.
+   */
+  it('still approves a jump when onGround is falsely false', () => {
+    const w = new VoxelWorld({ x0: -6, y0: -8, z0: -4, x1: 10, y1: 8, z1: 4 })
+    w.set(0, 0, 0, STONE)
+    w.set(-1, 0, 0, STONE)
+    w.set(3, 0, 0, STONE)
+    const node = { x: 3.5, y: 1, z: 0.5 }
+
+    const honest = physicsBot(w, new Vec3(0.5, 1, 0.5)) as { entity: { onGround: boolean } }
+    expect(new PhysicsSim(honest as never).canSprintJump([node])).to.equal(true)
+
+    const lagged = physicsBot(w, new Vec3(0.5, 1, 0.5)) as { entity: { onGround: boolean } }
+    lagged.entity.onGround = false // what a correction leaves behind
+    expect(new PhysicsSim(lagged as never).canSprintJump([node])).to.equal(true)
+  })
+
+  it('still refuses a second jump once the rollout has actually landed', () => {
+    // The one-jump rule is the reason the latch exists: a take-off that lands
+    // short must not "reach" the node by bouncing on from wherever it came
+    // down. Nudging onGround must not cost that.
+    const world = new VoxelWorld({ x0: -6, y0: -8, z0: -4, x1: 10, y1: 8, z1: 4 })
+    world.set(0, 0, 0, STONE)
+    world.set(-1, 0, 0, STONE)
+    world.set(3, 0, 0, STONE)
+    world.fill(4, 0, 0, 4, 1, 0, STONE)
+    const sim = new PhysicsSim(physicsBot(world, new Vec3(0.5, 1, 0.5)) as never)
+    expect(sim.canSprintJump([{ x: 4.5, y: 2, z: 0.5 }])).to.equal(false)
   })
 })

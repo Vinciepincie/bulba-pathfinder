@@ -216,6 +216,19 @@ export interface PathfinderOptions {
   /** Hard cap on snapshot cells before giving up growth (memory bound). */
   maxSnapshotCells?: number
   /**
+   * Nudge prismarine-physics' player dimensions off their exact block
+   * boundaries (0.3/1.8 → 0.30001/1.80001) on inject. Default TRUE.
+   *
+   * On 1.21.x a body resting exactly on a boundary makes the SERVER's
+   * collision sweep compute exactly 1.0, call the move blocked, and teleport
+   * the client back — silently, every tick, for as long as the bot keeps
+   * producing that position. It is a physics bug, but it presents as a
+   * pathfinder that cannot climb a one-block step. See the measurements at
+   * the injection site. Turn it off if the application already applies the
+   * same nudge (harmless either way — it is guarded on the stock values).
+   */
+  hitboxPrecisionFix?: boolean
+  /**
    * Injectable movement-simulation backend (tests). Defaults to the
    * prismarine-physics-driven PhysicsSim, exactly like upstream.
    */
@@ -248,6 +261,16 @@ export interface PhysicsLike {
   canSprintJump (path: XYZ[], jumpAfter?: number): boolean
   canWalkJump (path: XYZ[], jumpAfter?: number): boolean
   canStraightLineBetween (n1: Vec3, n2: Vec3): boolean
+  /** Pressed into a face with no headway — the wedge the server refuses. */
+  isGrinding (path: XYZ[], ticks?: number): boolean
+  /** Is there ground behind to step back onto? */
+  canBackOff (ticks?: number): boolean
+  /** Would this control combination actually move the body, safely? */
+  canNudge (control: { forward?: boolean, back?: boolean, left?: boolean, right?: boolean, jump?: boolean, sneak?: boolean }, ticks?: number): boolean
+  /** A take-off heading offset that lands this jump, or null. */
+  bestHeading (path: XYZ[], jump: boolean, sprint: boolean): number | null
+  /** Does holding jump while sprinting get further down this path, safely? */
+  sprintHopBetter (path: XYZ[], horizon?: number): boolean
 }
 
 export type { Vec3 }

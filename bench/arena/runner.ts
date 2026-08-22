@@ -53,8 +53,13 @@ function readProperties (b: BlockLike | null): Record<string, unknown> {
  * Both are the same algorithm and are pinned bit-identical by the package's
  * differential suite, so racing them apart measures the engine room, not the
  * search.
+ *
+ * `bulba-nohop` is `bulba` with `allowSprintHop` off and nothing else. The
+ * sprint-hop gait is worth ~25% of ground speed in isolation but costs
+ * airtime on stepped terrain, so it is raced against its own twin rather than
+ * argued about: same route, same tick, same server.
  */
-export type Impl = 'upstream' | 'bulba' | 'bulba-wasm'
+export type Impl = 'upstream' | 'bulba' | 'bulba-wasm' | 'bulba-nohop'
 
 export type Outcome =
   | 'arrived'
@@ -231,9 +236,16 @@ export function applyProfile (
   movements.dontCreateFlow = true
   movements.infiniteLiquidDropdownDistance = true
   movements.maxDropDown = profile.maxDropDown
-  // The extended repertoire is the thing under test; upstream has no such
-  // flag, so this is where the engines are allowed to differ.
-  if (impl !== 'upstream') movements.allowParkourExtended = profile.extendedParkour
+  // The extended repertoire and the sprint-hop gait are the things under
+  // test; upstream has no such flags, so this is where the engines are
+  // allowed to differ. `--parity` turns both off for an apples-to-apples run.
+  if (impl !== 'upstream') {
+    movements.allowParkourExtended = profile.extendedParkour
+    // `bulba-nohop` is `bulba` with the sprint-hop gait off and nothing else.
+    // Racing them side by side is how the gait is measured — same terrain,
+    // same tick, same server hitch — instead of across two runs.
+    movements.allowSprintHop = profile.extendedParkour && impl !== 'bulba-nohop'
+  }
 }
 
 export class Racer {
@@ -254,6 +266,17 @@ export class Racer {
   static async attach (bot: Bot, impl: Impl, profile: MovementProfile): Promise<Racer> {
     const loaded = await loadImpl(impl)
     bot.loadPlugin(loaded.plugin as never)
+      // The 1.21.x exact-boundary collision bug is a mineflayer PHYSICS bug,
+    // not a pathfinding one: a body resting exactly on a block boundary makes
+    // the server refuse the move and teleport the client back. @bulba/
+    // pathfinder applies the nudge itself on inject, so applying it here too
+    // for UPSTREAM keeps the race measuring pathfinding rather than handing
+    // us a client fix upstream never got. Idempotent — the package's own fix
+    // is guarded on the stock values.
+    const ph = (bot as unknown as { physics: { playerHalfWidth: number, playerHeight: number } }).physics
+    if (ph.playerHalfWidth === 0.3) ph.playerHalfWidth = 0.30001
+    if (ph.playerHeight === 1.8) ph.playerHeight = 1.80001
+
     const racer = new Racer(bot, impl, loaded, profile)
     const pf = (bot as unknown as { pathfinder: Record<string, unknown> }).pathfinder
     pf.thinkTimeout = profile.thinkTimeout

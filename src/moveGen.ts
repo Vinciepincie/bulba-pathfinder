@@ -78,17 +78,41 @@ export interface DigContext {
   breakExclusion: BreakExclusionFn
 }
 
+/**
+ * Upper bound on neighbours from one expansion, derived rather than guessed.
+ *
+ * Base moveset: 4 cardinals x {forward, jumpUp, dropDown} + 4 diagonals +
+ * moveDown + moveUp + the two bubble rides = 20. Extended parkour adds the
+ * whole table: every diagonal entry in 4 quadrants, every pure-x entry in 2
+ * directions, every pure-z entry in 2.
+ *
+ * The old fixed 160 was 8 short of today's table (32*4 + 5*2 + 5*2 + 20 =
+ * 168). Overflowing a typed array does not throw — the writes are silently
+ * dropped while `outCount` keeps counting — so the solver read undefined
+ * coordinates for the last neighbours of a fully-loaded node and relaxed
+ * them as NaN. Deriving the size means enlarging the table can never
+ * reintroduce that.
+ */
+function outCapacity (extended: boolean): number {
+  // Without the table, upstream's cardinal parkour runs instead, and its
+  // "down" branch can push a landing at each of d = 2, 3 and 4 in the same
+  // direction — 12 more than the 20 above.
+  const base = extended ? 20 : 32
+  if (!extended) return base
+  const t = getParkourExtTable()
+  return t.diag.length * 4 + t.cardX.length * 2 + t.cardZ.length * 2 + base
+}
+
 export class MoveGen {
-  // Output arrays for one expansion (max ~80 with extended parkour on; 160 is
-  // generous headroom).
-  readonly outIdx = new Int32Array(160)
-  readonly outX = new Int32Array(160)
-  readonly outY = new Int32Array(160)
-  readonly outZ = new Int32Array(160)
-  readonly outCost = new Float64Array(160)
-  readonly outMeta = new Uint8Array(160)
+  /** Output arrays for one expansion — see outCapacity(). */
+  readonly outIdx: Int32Array
+  readonly outX: Int32Array
+  readonly outY: Int32Array
+  readonly outZ: Int32Array
+  readonly outCost: Float64Array
+  readonly outMeta: Uint8Array
   /** toBreak per neighbor: outBreaks[i] is null or an array of cell indices. */
-  readonly outBreaks: Array<number[] | null> = new Array(160).fill(null)
+  readonly outBreaks: Array<number[] | null>
   outCount = 0
 
   /** Set when any probe left the snapshot — a noPath may be growth-fixable. */
@@ -159,6 +183,14 @@ export class MoveGen {
     this.allowSprinting = cfg.allowSprinting
     this.parkourExtended = cfg.allowParkour && cfg.allowSprinting && cfg.allowParkourExtended
     this.extTable = this.parkourExtended ? getParkourExtTable() : null
+    const cap = outCapacity(this.parkourExtended)
+    this.outIdx = new Int32Array(cap)
+    this.outX = new Int32Array(cap)
+    this.outY = new Int32Array(cap)
+    this.outZ = new Int32Array(cap)
+    this.outCost = new Float64Array(cap)
+    this.outMeta = new Uint8Array(cap)
+    this.outBreaks = new Array(cap).fill(null)
     this.canOpenDoors = cfg.canOpenDoors
     this.doorMode = cfg.canOpenDoors && cfg.canOpenRealDoors
     this.maxDropDown = cfg.maxDropDown

@@ -6,8 +6,16 @@ designed to be walkable: **2b2t spawn**, on a real Paper server, with
 `@bulba/pathfinder` and upstream `mineflayer-pathfinder` racing the same
 routes side by side.
 
-Two bots, two Node processes, one start block, released together. You can join
-and watch.
+One bot per engine, one OS process each, one start block, released together.
+You can join and watch.
+
+Four engines are available (`--engines` picks a subset): `upstream`, `bulba`
+(the JavaScript solver on the main thread), `bulba-wasm` (the Rust core in a
+worker — what production runs) and `bulba-nohop`, which is `bulba` with the
+sprint-hop gait switched off. Racing a feature against its own twin on the
+same terrain in the same tick is the only way to price it honestly; on the
+route book that gait is worth ~0.6 s on a flat 54-block run and roughly
+nothing on a staircase.
 
 ## Requirements
 
@@ -189,9 +197,18 @@ running", and that only exists across runs.
   what production runs (worker thread, wasm core). Loading `src/` through tsx
   silently falls back to main-thread solving.
 - **Identical movement rules**: no digging, no block placement, no scaffolding,
-  same `maxDropDown`, same think timeout. The single deliberate difference is
-  `allowParkourExtended`, which is the feature under test — `--parity` turns
-  it off for an apples-to-apples run.
+  same `maxDropDown`, same think timeout. The deliberate differences are
+  `allowParkourExtended` and `allowSprintHop`, the features under test —
+  `--parity` turns both off for an apples-to-apples run.
+- **The 1.21.x hitbox nudge goes to BOTH engines.** A body built from exactly
+  0.3 / 1.8 comes to rest on block boundaries, and on 1.21.x the server's own
+  collision sweep then refuses the next move and teleports the client back —
+  silently, every tick, for as long as the bot keeps producing that position.
+  It is a mineflayer physics bug rather than a pathfinding one, and
+  `@bulba/pathfinder` applies the nudge itself on inject, so the harness
+  applies it to upstream too. It is not a small effect: without it upstream
+  finished 4 of 16 route runs and ours 10, with it upstream finishes 12 and
+  ours 16. Measuring pathfinding means neither engine racing the bug.
 - **Identical start state**: same block, same facing, hunger topped up with a
   saturation effect (sprint-jumps need food > 6, and a long benchmark would
   otherwise starve the bots into a walk halfway through).
@@ -336,7 +353,7 @@ translation layer.
 | --- | --- | --- |
 | `--edit` | off | author routes in-world with signs instead of racing |
 | `--signs` | off | race the `!PF` signs in the world, not `routes.json` |
-| `--engines upstream,bulba-wasm` | all three | pick which engines race |
+| `--engines upstream,bulba-wasm` | all four | pick which engines race: `upstream`, `bulba` (JS solver), `bulba-wasm` (Rust core in the worker — production), `bulba-nohop` (`bulba` with the sprint-hop gait off, the A/B for it) |
 | `--from x,y,z --to x,y,z` | — | race one ad-hoc route, no route book needed |
 | `--save-route <id>` | — | also append that ad-hoc route to `routes.json` |
 | `--routes r01,r02` | all | pick routes by id |

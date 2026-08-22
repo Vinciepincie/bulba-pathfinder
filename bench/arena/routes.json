@@ -27,7 +27,7 @@
     {
       "id": "simple1",
       "name": "simple1",
-      "scenario": "walk",
+      "scenario": "mixed",
       "start": [
         7,
         132,
@@ -37,6 +37,102 @@
         -2,
         132,
         112
+      ],
+      "notes": "defined by in-world !PF signs"
+    },
+    {
+      "id": "simple3",
+      "name": "simple3",
+      "scenario": "mixed",
+      "start": [
+        52,
+        132,
+        85
+      ],
+      "end": [
+        54,
+        132,
+        35
+      ],
+      "notes": "defined by in-world !PF signs"
+    },
+    {
+      "id": "climb1",
+      "name": "climb1",
+      "scenario": "mixed",
+      "start": [
+        45,
+        139,
+        94
+      ],
+      "end": [
+        32,
+        185,
+        98
+      ],
+      "notes": "defined by in-world !PF signs"
+    },
+    {
+      "id": "climb2",
+      "name": "climb2",
+      "scenario": "mixed",
+      "start": [
+        31,
+        147,
+        152
+      ],
+      "end": [
+        6,
+        174,
+        170
+      ],
+      "notes": "defined by in-world !PF signs"
+    },
+    {
+      "id": "basic1",
+      "name": "basic1",
+      "scenario": "mixed",
+      "start": [
+        79,
+        136,
+        150
+      ],
+      "end": [
+        25,
+        132,
+        152
+      ],
+      "notes": "defined by in-world !PF signs"
+    },
+    {
+      "id": "basic2",
+      "name": "basic2",
+      "scenario": "mixed",
+      "start": [
+        -21,
+        133,
+        189
+      ],
+      "end": [
+        -103,
+        133,
+        145
+      ],
+      "notes": "defined by in-world !PF signs"
+    },
+    {
+      "id": "parkour1",
+      "name": "parkour1",
+      "scenario": "mixed",
+      "start": [
+        -153,
+        132,
+        168
+      ],
+      "end": [
+        -146,
+        133,
+        205
       ],
       "notes": "defined by in-world !PF signs"
     }

@@ -30,7 +30,7 @@ import type { Impl, MovementProfile, RunResult } from './runner.js'
 import { analyse, appendHistory, focusPoints, historyEntry, judge, writeBundle } from './diagnose.js'
 import { pairSigns, scanSigns } from './signs.js'
 import { EDIT_HELP, equipEditor, equipEditorsOnJoin, persistSignRoutes, scanWorld } from './edit.js'
-import { ARENA_RADIUS, BOT_BULBA, BOT_BULBA_WASM, BOT_UPSTREAM, HOST, PORT, RESULTS_DIR, WORLD_DIR } from './config.js'
+import { ARENA_RADIUS, BOT_BULBA, BOT_BULBA_NOHOP, BOT_BULBA_WASM, BOT_UPSTREAM, HOST, PORT, RESULTS_DIR, WORLD_DIR } from './config.js'
 
 const { values } = parseArgs({
   options: {
@@ -400,7 +400,8 @@ async function main (): Promise<void> {
     const lineup = ([
       ['upstream', BOT_UPSTREAM],
       ['bulba', BOT_BULBA],
-      ['bulba-wasm', BOT_BULBA_WASM]
+      ['bulba-wasm', BOT_BULBA_WASM],
+      ['bulba-nohop', BOT_BULBA_NOHOP]
     ] as Array<[Impl, string]>).filter(([impl]) => values.engines === '' || values.engines.split(',').includes(impl))
     for (const [impl, username] of lineup) {
       const child = new Child(impl, username)

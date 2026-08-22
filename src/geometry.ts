@@ -8,8 +8,29 @@ import { Vec3 } from 'vec3'
 import type { Bot } from 'mineflayer'
 
 const EPS = 0.02
+/** Fallback body half-width / height — see bodyHalf/bodyTall. */
 const HALF = 0.3
 const TALL = 1.8
+
+/**
+ * The body dimensions the PHYSICS is actually using, not the nominal ones.
+ *
+ * The 1.21.x hitbox-precision fix (plugin.ts hitboxPrecisionFix) nudges
+ * prismarine-physics to 0.30001 / 1.80001 so collision resolutions stop
+ * landing exactly on block boundaries. Every probe in this file exists to
+ * predict what that engine will do, so they have to measure the same body it
+ * does — otherwise the checks are 1e-5 optimistic about exactly the contacts
+ * the nudge was added to disambiguate.
+ */
+function bodyHalf (bot: Bot): number {
+  const ph = (bot as unknown as { physics?: { playerHalfWidth?: number } }).physics
+  return ph?.playerHalfWidth ?? HALF
+}
+
+function bodyTall (bot: Bot): number {
+  const ph = (bot as unknown as { physics?: { playerHeight?: number } }).physics
+  return ph?.playerHeight ?? TALL
+}
 
 interface ShapedBlock {
   shapes?: number[][]
@@ -27,12 +48,13 @@ export function blockShapes (bot: Bot, pos: Vec3): number[][] {
 
 /** Does a player standing at (x, feetY, z) overlap any block collision box? */
 export function playerCollides (bot: Bot, x: number, feetY: number, z: number): boolean {
-  const minX = x - HALF + EPS
-  const maxX = x + HALF - EPS
+  const half = bodyHalf(bot)
+  const minX = x - half + EPS
+  const maxX = x + half - EPS
   const minY = feetY + EPS
-  const maxY = feetY + TALL - EPS
-  const minZ = z - HALF + EPS
-  const maxZ = z + HALF - EPS
+  const maxY = feetY + bodyTall(bot) - EPS
+  const minZ = z - half + EPS
+  const maxZ = z + half - EPS
 
   for (let bx = Math.floor(minX); bx <= Math.floor(maxX); bx++) {
     for (let by = Math.floor(minY); by <= Math.floor(maxY); by++) {
@@ -59,19 +81,21 @@ export function playerCollides (bot: Bot, x: number, feetY: number, z: number): 
  */
 export function nearWall (bot: Bot, margin = 0.03): boolean {
   const p = bot.entity.position
-  const minX = p.x - HALF - margin
-  const maxX = p.x + HALF + margin
-  const minZ = p.z - HALF - margin
-  const maxZ = p.z + HALF + margin
+  const half = bodyHalf(bot)
+  const tall = bodyTall(bot)
+  const minX = p.x - half - margin
+  const maxX = p.x + half + margin
+  const minZ = p.z - half - margin
+  const maxZ = p.z + half + margin
   // Feet and head cells only: the body is what a wall can touch.
   const y0 = Math.floor(p.y + EPS)
-  const y1 = Math.floor(p.y + TALL - EPS)
+  const y1 = Math.floor(p.y + tall - EPS)
   for (let bx = Math.floor(minX); bx <= Math.floor(maxX); bx++) {
     for (let by = y0; by <= y1; by++) {
       for (let bz = Math.floor(minZ); bz <= Math.floor(maxZ); bz++) {
         for (const sh of blockShapes(bot, new Vec3(bx, by, bz))) {
           if (minX < sh[3] && maxX > sh[0] &&
-              p.y + EPS < sh[4] && p.y + TALL - EPS > sh[1] &&
+              p.y + EPS < sh[4] && p.y + tall - EPS > sh[1] &&
               minZ < sh[5] && maxZ > sh[2]) {
             return true
           }
@@ -80,6 +104,23 @@ export function nearWall (bot: Bot, margin = 0.03): boolean {
     }
   }
   return false
+}
+
+/**
+ * How far the body can travel along (dirX, dirZ) before it touches a block
+ * face, capped at `max`.
+ *
+ * Only faces the body would actually hit count: playerCollides tests the
+ * 1.8-tall box from the FEET up, so the step the bot is standing on top of is
+ * invisible to it and the step in front of it is not. That is exactly the
+ * distinction the riser standoff needs.
+ */
+export function clearanceAhead (bot: Bot, dirX: number, dirZ: number, max = 0.3, step = 0.05): number {
+  const p = bot.entity.position
+  for (let d = step; d <= max + 1e-9; d += step) {
+    if (playerCollides(bot, p.x + dirX * d, p.y, p.z + dirZ * d)) return d - step
+  }
+  return max
 }
 
 /** Is the bot's hitbox intersecting a solid block right now? */

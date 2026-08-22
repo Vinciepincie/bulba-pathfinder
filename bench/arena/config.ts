@@ -47,8 +47,10 @@ export const ARENA_RADIUS = Number(process.env.ARENA_RADIUS ?? 750)
 export const BOT_UPSTREAM = 'PF_Upstream'
 export const BOT_BULBA = 'PF_Bulba'
 export const BOT_BULBA_WASM = 'PF_Bulba_wasm'
+/** Same engine as BOT_BULBA with the sprint-hop gait OFF — the A/B for it. */
+export const BOT_BULBA_NOHOP = 'PF_Bulba_nohop'
 export const BOT_REFEREE = 'PF_Referee'
-export const BOT_NAMES = [BOT_UPSTREAM, BOT_BULBA, BOT_BULBA_WASM, BOT_REFEREE]
+export const BOT_NAMES = [BOT_UPSTREAM, BOT_BULBA, BOT_BULBA_WASM, BOT_BULBA_NOHOP, BOT_REFEREE]
 
 export const JAR_PATH = join(RUN_DIR, `paper-${PAPER_VERSION}.jar`)
 export const SERVER_HEAP = process.env.ARENA_HEAP ?? '4G'

@@ -129,7 +129,14 @@ describe('generated parkour table', () => {
     for (const e of all) {
       expect(e.dist).to.be.at.least(2 - 1e-9)
       expect(Math.max(Math.abs(e.tx), Math.abs(e.tz))).to.be.at.most(6)
-      expect(e.cost).to.be.closeTo(e.dist + 0.5, 1e-12)
+      // Euclidean + the tie-breaking pad, floored at the solver's own octile
+      // heuristic: the pad's 0.5 is not quite the worst deficit at the
+      // enumeration limit, and (2,6)/(3,6)/(6,2)/(6,3) would otherwise price
+      // a jump BELOW the heuristic and make A* inadmissible.
+      const octile = Math.abs(Math.abs(e.tx) - Math.abs(e.tz)) +
+        Math.SQRT2 * Math.min(Math.abs(e.tx), Math.abs(e.tz))
+      expect(e.cost).to.be.closeTo(Math.max(e.dist + 0.5, octile), 1e-12)
+      expect(e.cost).to.be.at.least(octile - 1e-12)
       expect(e.fnRun).to.be.at.most(J_RUNNING[ENVELOPE_BUCKETS - 1] + 1e-9)
       expect(e.runX).to.equal(-e.cells[0])
       expect(e.runZ).to.equal(-e.cells[1])

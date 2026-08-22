@@ -94,6 +94,14 @@ function clipSegment (a: number, b: number, i: number, j: number, m: number): [n
   return t1 - t0 > GRAZE_EPS ? [t0, t1] : null
 }
 
+/** The solver's own XZ heuristic (goals.ts distanceXZ) — the floor a move
+ *  cost may never go under, or A* stops being admissible. */
+function octile (a: number, b: number): number {
+  const dx = Math.abs(a)
+  const dz = Math.abs(b)
+  return Math.abs(dx - dz) + Math.SQRT2 * Math.min(dx, dz)
+}
+
 function buildEntry (a: number, b: number): ParkourExtEntry {
   interface Cell { ax: number, az: number, line: boolean, t: number, tIn: number, tOut: number }
   const found: Cell[] = []
@@ -154,7 +162,20 @@ function buildEntry (a: number, b: number): ParkourExtEntry {
     runX: -cells[0],
     runZ: -cells[1],
     dist,
-    cost: dist + 0.5
+    // `dist + 0.5`: euclidean plus enough pad to clear the worst
+    // octile-minus-euclidean deficit, so every entry stays at or above the
+    // heuristic. Pricing a jump at PAR instead (cost = octile, no pad) was
+    // tried and measured worse: A* then bought jump-heavy lines that were
+    // cheaper by the model but longer on the ground, and the arena's simple3
+    // went 9.51s -> 9.74s. The pad is doing real tie-breaking work — it keeps
+    // a jump from displacing a walk of the same displacement for free.
+    //
+    // The pad is not quite enough at the enumeration limit, though: the
+    // deficit peaks at ~0.082 x major, so (2,6), (3,6), (6,2) and (6,3) come
+    // out BELOW the octile heuristic by up to 0.035 and make it inadmissible.
+    // Floor them at the heuristic rather than lowering MAX_OFFSET_MAJOR,
+    // which would delete real reach (and the entries envelope.test.ts pins).
+    cost: Math.max(dist + 0.5, octile(a, b))
   }
 }
 

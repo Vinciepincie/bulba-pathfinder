@@ -74,12 +74,38 @@ The full upstream surface is provided with identical semantics:
   without thread churn. If worker startup fails (exotic bundler, permissions),
   everything transparently falls back to main-thread tick-sliced solving —
   which is still upstream-identical in scheduling, just much faster per slice.
-- **Walking the server accepts.** prismarine-physics will happily produce
-  positions a real server refuses, and a refused position is a teleport back —
-  every tick, for as long as the bot keeps producing it, which is a livelock
-  the futility timer cannot break because each correction looks like progress.
-  Three rules keep the bot out of that state, all of them measured against a
-  real 1.21.11 server (`bench/arena`, which now counts corrections per engine):
+- **The 1.21.x hitbox-precision fix, applied on inject.** prismarine-physics
+  builds the body from `playerHalfWidth` 0.3 and `playerHeight` 1.8, and every
+  collision resolution leaves it exactly on a block boundary. On 1.21.x the
+  server's own sweep then computes exactly 1.0 for the next move, calls it
+  blocked, and teleports the client back — silently, every tick, for as long
+  as the bot keeps producing that position. It is a physics bug
+  ([mineflayer#3911](https://github.com/PrismarineJS/mineflayer/issues/3911)),
+  but it presents as a pathfinder that cannot climb a one-block step. Measured
+  on the arena's climb1 riser, walking jump, only the starting clearance
+  changed:
+
+  | clearance | stock 0.3 / 1.8 | nudged 0.30001 / 1.80001 |
+  |---|---|---|
+  | 0.01 | stuck, 19 corrections | **climbed, 0** |
+  | 0.15 | stuck, 17 corrections | **climbed, 0** |
+  | 0.20 | climbed, 0 | climbed, 0 |
+  | 0.30, sprinting | stuck, 7 corrections | **climbed, 0** |
+
+  Nudging both dimensions by 1e-5 breaks the alignment and the whole class
+  goes away. On the arena's 46-block cobble climb that is 50.4 s → 24.9 s, and
+  two routes that never finished at all now do. Guarded on the exact stock
+  values (an application that already applies the nudge is not doubled up) and
+  switchable with `hitboxPrecisionFix: false`. `geometry.ts`'s body probes read
+  the same dimensions back off `bot.physics`, so they never disagree with the
+  engine they are predicting.
+- **Walking the server accepts.** Even with that fixed, prismarine-physics
+  will produce positions a real server refuses, and a refused position is a
+  teleport back — every tick, for as long as the bot keeps producing it, which
+  is a livelock the futility timer cannot break because each correction looks
+  like progress. These rules keep the bot out of that state, all of them
+  measured against a real 1.21.11 server (`bench/arena`, which counts
+  corrections per engine):
   - a jump is only taken if **one** jump plus the run-in reaches the node.
     Holding jump for the whole rollout — upstream's model — lets a take-off
     that lands short bounce on and satisfy the node from a cell the planner
@@ -92,11 +118,25 @@ The full upstream surface is provided with identical semantics:
   - a walking step whose straight line runs into a wall **steers along the
     wall** with a hair of standoff, instead of grinding on the block face the
     physics would clamp it onto. Aiming into the corner: 25 corrections and
-    0.01 blocks. Aiming along it: none, and 7.1 blocks.
-
-  On the arena's two routes this is the difference between finishing and not:
-  ours arrives with **0** corrections on both, upstream with 0 on one and 638
-  on the other, which is the one it never finishes.
+    0.01 blocks. Aiming along it: none, and 7.1 blocks. (With nothing to slide
+    along — a step square-on to the face — the steer is skipped rather than
+    replacing the heading with float noise.)
+  - a **wedge recovery** that triggers on the symptom rather than on a
+    prediction. Every gate above answers "does this work?" against
+    prismarine-physics, and prismarine-physics is not the authority; when the
+    two disagree the bot stands still with a plan it believes in, the futility
+    timer replans, the plan comes back identical, and it stands still again.
+    So when the body has stopped moving the executor stops trusting its
+    rollouts and tries the escapes a player would — a step back, a step
+    sideways — each simulated first so it cannot become the fall it was
+    avoiding, and cycled per node so an escape that did not help is not the
+    one tried next time.
+  - a **diagonal squeeze** goes round the corner that is open. A diagonal move
+    is priced on the cheaper of its two corners (upstream's rule, and ours by
+    parity), which is honest only if the walker goes around that corner;
+    aiming at the node centre cuts across both and a 0.6-wide body clips the
+    blocked one. The open corner is inserted as a waypoint and the squeeze
+    becomes the two ordinary moves the planner actually priced.
 - **Much faster compute.** Block classification is precomputed into a
   per-blockstate LUT; the world is snapshotted into flat typed arrays; the A*
   core uses packed integer node ids, epoch-stamped g/parent tables and a
@@ -232,12 +272,20 @@ import { createPathfinder } from '@bulba/pathfinder'
 bot.loadPlugin(createPathfinder({
   useWorkerThreads: true,   // default; false = always main-thread sliced
   maxSnapshotCells: 8_000_000, // snapshot memory cap (× 2 bytes)
+  hitboxPrecisionFix: true, // default; see the 1.21.x note above
 }))
 ```
 
 Runtime knobs on `bot.pathfinder` (beyond the upstream trio):
 `stuckTimeout` (default −1 = off), `executionTimeout` (−1 = off),
 `keepPathDuringRecompute` (default true).
+
+Opt-in `Movements` flags (both default **false**, so the walking outcome
+matches upstream until you ask for more): `allowParkourExtended` (the full
+sprint-jump repertoire, `docs/ExtendedParkour.md`) and `allowSprintHop`
+(hold jump while sprinting across open ground — 6.97 blocks/s against 5.56,
+measured on the arena, taken only where a rollout of both gaits down the same
+path says the hop gets further without losing height).
 
 ## Scope
 

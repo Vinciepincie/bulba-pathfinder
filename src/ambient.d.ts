@@ -33,5 +33,7 @@ declare module 'prismarine-physics' {
     onGround: boolean
     isInWater: boolean
     isInLava: boolean
+    isCollidedHorizontally: boolean
+    isCollidedVertically: boolean
   }
 }

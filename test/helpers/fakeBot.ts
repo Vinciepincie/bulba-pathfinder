@@ -282,6 +282,14 @@ export function makeFakePhysics (world: VoxelWorld, bot: DriveableBot): PhysicsL
     canStraightLine: (path: XYZ[]) => flatTo(path[0]),
     canSprintJump: (path: XYZ[]) => !flatTo(path[0]),
     canWalkJump: (path: XYZ[]) => !flatTo(path[0]),
-    canStraightLineBetween: () => false
+    canStraightLineBetween: () => false,
+    // The wedge recovery and the sprint-hop gait both ask the real engine
+    // whether a move is worth making. A stub that cannot answer says no, so
+    // these tests keep measuring the executor's own logic.
+    isGrinding: () => false,
+    canBackOff: () => false,
+    canNudge: () => false,
+    bestHeading: () => null,
+    sprintHopBetter: () => false
   }
 }

@@ -269,14 +269,24 @@ impl MinHeap {
 }
 
 // ── neighbor output (mirror of MoveGen out*) ──────────────────────────────
+// Capacity, mirroring moveGen.ts outCapacity(): the base moveset can push 20
+// (4 cardinals x forward/jumpUp/dropDown, 4 diagonals, down, up, two bubble
+// rides), upstream's cardinal parkour up to 12 more when the table is off,
+// and the extended table one per entry per applicable direction — 32*4 + 5*2
+// + 5*2 = 148 today, so 168 in the worst case. 160 was 8 short of that, and
+// in Rust the overflow is an index panic inside the wasm core (the solve
+// traps and the host falls back to main-thread JS) rather than the silently
+// dropped write the JS typed arrays give. 192 leaves the table room to grow.
+const OUT_CAP: usize = 192;
+
 struct NeighborOut {
-    idx: [i32; 160],
-    x: [i32; 160],
-    y: [i32; 160],
-    z: [i32; 160],
-    cost: [f64; 160],
-    meta: [u8; 160],
-    breaks: [Option<Vec<i32>>; 160],
+    idx: [i32; OUT_CAP],
+    x: [i32; OUT_CAP],
+    y: [i32; OUT_CAP],
+    z: [i32; OUT_CAP],
+    cost: [f64; OUT_CAP],
+    meta: [u8; OUT_CAP],
+    breaks: [Option<Vec<i32>>; OUT_CAP],
     count: usize,
 }
 
@@ -385,13 +395,13 @@ impl SolverState {
             breaks: Vec::new(),
             heap: MinHeap::new(4096),
             out: NeighborOut {
-                idx: [0; 160],
-                x: [0; 160],
-                y: [0; 160],
-                z: [0; 160],
-                cost: [0.0; 160],
-                meta: [0; 160],
-                breaks: [const { None }; 160],
+                idx: [0; OUT_CAP],
+                x: [0; OUT_CAP],
+                y: [0; OUT_CAP],
+                z: [0; OUT_CAP],
+                cost: [0.0; OUT_CAP],
+                meta: [0; OUT_CAP],
+                breaks: [const { None }; OUT_CAP],
                 count: 0,
             },
             move_breaks: Vec::new(),
