@@ -1,0 +1,74 @@
+{
+  "name": "@bulba/pathfinder",
+  "version": "0.1.0",
+  "description": "Drop-in replacement for mineflayer-pathfinder: same API, same walking outcome, snapshot-based zero-allocation A* that runs off the event loop in a worker thread. Walk-only by design (never digs, never places blocks).",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/cjs/index.js",
+  "module": "./dist/esm/index.js",
+  "types": "./dist/types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/types/index.d.ts",
+      "import": "./dist/esm/index.js",
+      "require": "./dist/cjs/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "src",
+    "bench",
+    "build.mjs",
+    "build-wasm.mjs",
+    "rust/Cargo.toml",
+    "rust/src",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "prepare": "node build.mjs",
+    "prepack": "node build.mjs",
+    "test": "mocha",
+    "test:fuzz": "cross-env PF_FUZZ_CASES=500 mocha test/fuzz.test.ts",
+    "bench": "tsx bench/bench.ts",
+    "arena:world": "tsx bench/arena/trimWorld.ts",
+    "arena:server": "tsx bench/arena/setupServer.ts",
+    "arena:race": "tsx bench/arena/race.ts",
+    "arena:probe": "tsx bench/arena/probe.ts",
+    "arena:edit": "tsx bench/arena/race.ts --edit",
+    "build:wasm": "node build-wasm.mjs"
+  },
+  "keywords": [
+    "mineflayer",
+    "pathfinder",
+    "minecraft",
+    "astar",
+    "navigation",
+    "bot"
+  ],
+  "dependencies": {
+    "prismarine-block": "^1.17.0",
+    "prismarine-nbt": "^2.5.0",
+    "prismarine-physics": "^1.8.0",
+    "vec3": "^0.1.10"
+  },
+  "peerDependencies": {
+    "mineflayer": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.10",
+    "@types/node": "^20.10.0",
+    "chai": "^5.2.0",
+    "cross-env": "^7.0.3",
+    "minecraft-data": "^3.0.0",
+    "mineflayer-pathfinder": "^2.4.5",
+    "mocha": "^11.5.0",
+    "tsx": "^4.19.4",
+    "typescript": "^5.3.0"
+  }
+}

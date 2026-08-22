@@ -1,0 +1,700 @@
+{
+  "world": "2b2t.org spawn, World Downloader 2018-01-28 (1.12.2), trimmed to |x|,|z| <= 750",
+  "worldDigest": "5ff7793511fb800ab8325d961d5a71378a3e2671",
+  "scenarios": [
+    "walk",
+    "parkour-simple",
+    "parkour-advanced",
+    "mixed"
+  ],
+  "routes": [
+    {
+      "id": "r01",
+      "name": "spawn NE towers",
+      "scenario": "mixed",
+      "start": [
+        91,
+        145,
+        150
+      ],
+      "end": [
+        19,
+        132,
+        176
+      ],
+      "notes": "supplied 2026-08-20; the original end (32 184 121) was a pillar top with 20 blocks of air under it, unreachable without placing"
+    },
+    {
+      "id": "p01",
+      "name": "probe 40b",
+      "scenario": "mixed",
+      "start": [
+        91,
+        146,
+        150
+      ],
+      "end": [
+        91,
+        4,
+        110
+      ],
+      "notes": "found by arena:probe; solver cost 47"
+    },
+    {
+      "id": "p02",
+      "name": "probe 40b",
+      "scenario": "mixed",
+      "start": [
+        91,
+        146,
+        150
+      ],
+      "end": [
+        71,
+        3,
+        115
+      ],
+      "notes": "found by arena:probe; solver cost 53"
+    },
+    {
+      "id": "p03",
+      "name": "probe 40b",
+      "scenario": "mixed",
+      "start": [
+        91,
+        146,
+        150
+      ],
+      "end": [
+        56,
+        68,
+        130
+      ],
+      "notes": "found by arena:probe; solver cost 58"
+    },
+    {
+      "id": "p04",
+      "name": "probe 40b",
+      "scenario": "mixed",
+      "start": [
+        91,
+        146,
+        150
+      ],
+      "end": [
+        126,
+        161,
+        170
+      ],
+      "notes": "found by arena:probe; solver cost 58"
+    },
+    {
+      "id": "p05",
+      "name": "probe 40b",
+      "scenario": "mixed",
+      "start": [
+        91,
+        146,
+        150
+      ],
+      "end": [
+        126,
+        161,
+        130
+      ],
+      "notes": "found by arena:probe; solver cost 58"
+    },
+    {
+      "id": "p06",
+      "name": "probe 40b",
+      "scenario": "mixed",
+      "start": [
+        91,
+        146,
+        150
+      ],
+      "end": [
+        71,
+        4,
+        185
+      ],
+      "notes": "found by arena:probe; solver cost 60"
+    },
+    {
+      "id": "p07",
+      "name": "probe 77b",
+      "scenario": "mixed",
+      "start": [
+        91,
+        146,
+        150
+      ],
+      "end": [
+        91,
+        4,
+        73
+      ],
+      "notes": "found by arena:probe; solver cost 68"
+    },
+    {
+      "id": "p08",
+      "name": "probe 40b",
+      "scenario": "mixed",
+      "start": [
+        91,
+        146,
+        150
+      ],
+      "end": [
+        56,
+        68,
+        170
+      ],
+      "notes": "found by arena:probe; solver cost 78"
+    },
+    {
+      "id": "p09",
+      "name": "probe 77b",
+      "scenario": "mixed",
+      "start": [
+        91,
+        146,
+        150
+      ],
+      "end": [
+        129,
+        3,
+        84
+      ],
+      "notes": "found by arena:probe; solver cost 81"
+    },
+    {
+      "id": "p10",
+      "name": "probe 40b",
+      "scenario": "mixed",
+      "start": [
+        91,
+        146,
+        150
+      ],
+      "end": [
+        131,
+        186,
+        150
+      ],
+      "notes": "found by arena:probe; solver cost 87"
+    },
+    {
+      "id": "p11",
+      "name": "probe 77b",
+      "scenario": "mixed",
+      "start": [
+        91,
+        146,
+        150
+      ],
+      "end": [
+        25,
+        131,
+        112
+      ],
+      "notes": "found by arena:probe; solver cost 89"
+    },
+    {
+      "id": "p12",
+      "name": "probe 40b",
+      "scenario": "mixed",
+      "start": [
+        91,
+        146,
+        150
+      ],
+      "end": [
+        91,
+        76,
+        190
+      ],
+      "notes": "found by arena:probe; solver cost 92"
+    },
+    {
+      "id": "p13",
+      "name": "probe 113b",
+      "scenario": "mixed",
+      "start": [
+        91,
+        146,
+        150
+      ],
+      "end": [
+        148,
+        3,
+        52
+      ],
+      "notes": "found by arena:probe; solver cost 96"
+    },
+    {
+      "id": "p14",
+      "name": "probe 40b",
+      "scenario": "mixed",
+      "start": [
+        91,
+        146,
+        150
+      ],
+      "end": [
+        111,
+        87,
+        115
+      ],
+      "notes": "found by arena:probe; solver cost 98"
+    },
+    {
+      "id": "p15",
+      "name": "probe 77b",
+      "scenario": "mixed",
+      "start": [
+        91,
+        146,
+        150
+      ],
+      "end": [
+        25,
+        116,
+        188
+      ],
+      "notes": "found by arena:probe; solver cost 107"
+    },
+    {
+      "id": "p16",
+      "name": "probe 150b",
+      "scenario": "mixed",
+      "start": [
+        91,
+        146,
+        150
+      ],
+      "end": [
+        -59,
+        3,
+        150
+      ],
+      "notes": "found by arena:probe; solver cost 113"
+    },
+    {
+      "id": "p17",
+      "name": "probe 77b",
+      "scenario": "mixed",
+      "start": [
+        91,
+        146,
+        150
+      ],
+      "end": [
+        53,
+        132,
+        84
+      ],
+      "notes": "found by arena:probe; solver cost 114"
+    },
+    {
+      "id": "p18",
+      "name": "probe 150b",
+      "scenario": "mixed",
+      "start": [
+        91,
+        146,
+        150
+      ],
+      "end": [
+        166,
+        4,
+        20
+      ],
+      "notes": "found by arena:probe; solver cost 117"
+    },
+    {
+      "id": "p19",
+      "name": "probe 113b",
+      "scenario": "mixed",
+      "start": [
+        91,
+        146,
+        150
+      ],
+      "end": [
+        -22,
+        81,
+        150
+      ],
+      "notes": "found by arena:probe; solver cost 120"
+    },
+    {
+      "id": "p20",
+      "name": "probe 113b",
+      "scenario": "mixed",
+      "start": [
+        91,
+        146,
+        150
+      ],
+      "end": [
+        -7,
+        129,
+        207
+      ],
+      "notes": "found by arena:probe; solver cost 122"
+    },
+    {
+      "id": "p21",
+      "name": "probe 77b",
+      "scenario": "mixed",
+      "start": [
+        91,
+        146,
+        150
+      ],
+      "end": [
+        53,
+        65,
+        216
+      ],
+      "notes": "found by arena:probe; solver cost 122"
+    },
+    {
+      "id": "p22",
+      "name": "probe 150b",
+      "scenario": "mixed",
+      "start": [
+        91,
+        146,
+        150
+      ],
+      "end": [
+        -39,
+        5,
+        225
+      ],
+      "notes": "found by arena:probe; solver cost 130"
+    },
+    {
+      "id": "p23",
+      "name": "probe 150b",
+      "scenario": "mixed",
+      "start": [
+        91,
+        146,
+        150
+      ],
+      "end": [
+        16,
+        5,
+        20
+      ],
+      "notes": "found by arena:probe; solver cost 130"
+    },
+    {
+      "id": "p24",
+      "name": "probe 150b",
+      "scenario": "mixed",
+      "start": [
+        91,
+        146,
+        150
+      ],
+      "end": [
+        -39,
+        3,
+        75
+      ],
+      "notes": "found by arena:probe; solver cost 130"
+    },
+    {
+      "id": "p25",
+      "name": "probe 77b",
+      "scenario": "mixed",
+      "start": [
+        91,
+        146,
+        150
+      ],
+      "end": [
+        129,
+        69,
+        216
+      ],
+      "notes": "found by arena:probe; solver cost 137"
+    },
+    {
+      "id": "p26",
+      "name": "probe 77b",
+      "scenario": "mixed",
+      "start": [
+        91,
+        146,
+        150
+      ],
+      "end": [
+        157,
+        96,
+        112
+      ],
+      "notes": "found by arena:probe; solver cost 147"
+    },
+    {
+      "id": "p27",
+      "name": "probe 77b",
+      "scenario": "mixed",
+      "start": [
+        91,
+        146,
+        150
+      ],
+      "end": [
+        157,
+        97,
+        188
+      ],
+      "notes": "found by arena:probe; solver cost 153"
+    },
+    {
+      "id": "p28",
+      "name": "probe 77b",
+      "scenario": "mixed",
+      "start": [
+        91,
+        146,
+        150
+      ],
+      "end": [
+        168,
+        223,
+        150
+      ],
+      "notes": "found by arena:probe; solver cost 161"
+    },
+    {
+      "id": "p29",
+      "name": "probe 113b",
+      "scenario": "mixed",
+      "start": [
+        91,
+        146,
+        150
+      ],
+      "end": [
+        189,
+        187,
+        207
+      ],
+      "notes": "found by arena:probe; solver cost 162"
+    },
+    {
+      "id": "p30",
+      "name": "probe 113b",
+      "scenario": "mixed",
+      "start": [
+        91,
+        146,
+        150
+      ],
+      "end": [
+        34,
+        73,
+        248
+      ],
+      "notes": "found by arena:probe; solver cost 163"
+    },
+    {
+      "id": "p31",
+      "name": "probe 113b",
+      "scenario": "mixed",
+      "start": [
+        91,
+        146,
+        150
+      ],
+      "end": [
+        91,
+        70,
+        263
+      ],
+      "notes": "found by arena:probe; solver cost 164"
+    },
+    {
+      "id": "p32",
+      "name": "probe 113b",
+      "scenario": "mixed",
+      "start": [
+        91,
+        146,
+        150
+      ],
+      "end": [
+        189,
+        187,
+        93
+      ],
+      "notes": "found by arena:probe; solver cost 164"
+    },
+    {
+      "id": "p33",
+      "name": "probe 113b",
+      "scenario": "mixed",
+      "start": [
+        91,
+        146,
+        150
+      ],
+      "end": [
+        91,
+        103,
+        37
+      ],
+      "notes": "found by arena:probe; solver cost 193"
+    },
+    {
+      "id": "p34",
+      "name": "probe 150b",
+      "scenario": "mixed",
+      "start": [
+        91,
+        146,
+        150
+      ],
+      "end": [
+        91,
+        74,
+        300
+      ],
+      "notes": "found by arena:probe; solver cost 204"
+    },
+    {
+      "id": "p35",
+      "name": "probe 150b",
+      "scenario": "mixed",
+      "start": [
+        91,
+        146,
+        150
+      ],
+      "end": [
+        166,
+        71,
+        280
+      ],
+      "notes": "found by arena:probe; solver cost 207"
+    },
+    {
+      "id": "p36",
+      "name": "probe 113b",
+      "scenario": "mixed",
+      "start": [
+        91,
+        146,
+        150
+      ],
+      "end": [
+        204,
+        251,
+        150
+      ],
+      "notes": "found by arena:probe; solver cost 222"
+    },
+    {
+      "id": "p37",
+      "name": "probe 150b",
+      "scenario": "mixed",
+      "start": [
+        91,
+        146,
+        150
+      ],
+      "end": [
+        16,
+        82,
+        280
+      ],
+      "notes": "found by arena:probe; solver cost 231"
+    },
+    {
+      "id": "p38",
+      "name": "probe 150b",
+      "scenario": "mixed",
+      "start": [
+        91,
+        146,
+        150
+      ],
+      "end": [
+        241,
+        214,
+        150
+      ],
+      "notes": "found by arena:probe; solver cost 246"
+    },
+    {
+      "id": "p39",
+      "name": "probe 113b",
+      "scenario": "mixed",
+      "start": [
+        91,
+        146,
+        150
+      ],
+      "end": [
+        -7,
+        214,
+        93
+      ],
+      "notes": "found by arena:probe; solver cost 426"
+    },
+    {
+      "id": "cast-1",
+      "name": "cast 1",
+      "scenario": "mixed",
+      "start": [
+        82,
+        137,
+        150
+      ],
+      "end": [
+        31,
+        136,
+        148
+      ],
+      "notes": "defined by in-world !PF signs"
+    },
+    {
+      "id": "simple1",
+      "name": "simple1",
+      "scenario": "mixed",
+      "start": [
+        0,
+        132,
+        160
+      ],
+      "end": [
+        5,
+        133,
+        99
+      ],
+      "notes": "defined by in-world !PF signs"
+    },
+    {
+      "id": "simple2",
+      "name": "simple2",
+      "scenario": "mixed",
+      "start": [
+        2,
+        132,
+        255
+      ],
+      "end": [
+        -17,
+        132,
+        184
+      ],
+      "notes": "defined by in-world !PF signs"
+    }
+  ]
+}

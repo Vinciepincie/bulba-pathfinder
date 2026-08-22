@@ -1,0 +1,253 @@
+import type { Vec3 } from 'vec3'
+
+/**
+ * LUT flag bits, one byte per block state id.
+ *
+ * These mirror the exact pseudo-block classification mineflayer-pathfinder
+ * computes per `getBlock()` probe (movements.js), precomputed once per
+ * (minecraft version × movements profile) so a probe is a single typed-array
+ * read instead of a world hash lookup + object allocation.
+ */
+// A plain const object rather than a `const enum` — const enums poison
+// published .d.ts files for consumers compiling with isolatedModules.
+export const LutFlags = {
+  /**
+   * Walk-through safe: bounding box 'empty' / climbable / carpet type, and
+   * not a blocksToAvoid. NOTE: boundingBox is TYPE-level in prismarine-block
+   * (an open fence gate still reports 'block'), and upstream's classification
+   * inherits that — we mirror it exactly, quirks included.
+   */
+  SAFE: 1 << 0,
+  /** Can stand on: bounding box 'block' and not a fence-like type (top > 1). */
+  PHYSICAL: 1 << 1,
+  LIQUID: 1 << 2,
+  CLIMBABLE: 1 << 3,
+  /**
+   * Upstream `openable` (non-iron fence gates) AND this state has collision
+   * shapes (i.e. the gate is closed): traversable via activate when
+   * canOpenDoors. Upstream checks `openable && shapes.length !== 0` at move
+   * time; we bake the shapes check per state.
+   */
+  OPENABLE_GATE: 1 << 4,
+  /**
+   * Improvement over upstream: a CLOSED non-iron door — traversable via
+   * activate when canOpenDoors && canOpenRealDoors (upstream only ever opens
+   * fence gates).
+   */
+  DOOR_CLOSED: 1 << 5,
+  /**
+   * Improvement over upstream: an OPEN non-iron door — treated as passable
+   * when canOpenDoors && canOpenRealDoors (upstream blocks on it because the
+   * type-level bounding box stays 'block').
+   */
+  DOOR_OPEN: 1 << 6,
+  /**
+   * Improvement over upstream: an OPEN non-iron fence gate (no collision
+   * shapes) — passable when canOpenDoors && canOpenRealDoors. Upstream
+   * blocks on it (type-level bbox again), making gates effectively
+   * one-shot on modern versions.
+   */
+  GATE_OPEN: 1 << 7,
+} as const
+
+/**
+ * Rare-block auxiliary classification, kept OUT of the main flags byte (all
+ * 8 bits are taken) in an optional third grid that exists only when the
+ * profile opts into the feature — zero cost and byte-identical behavior
+ * otherwise. Currently: bubble columns (improvement over upstream, which
+ * treats them as plain air).
+ */
+export const LutSpecial = {
+  /** bubble_column[drag=false] (soul sand below) — pushes entities up. */
+  BUBBLE_UP: 1,
+  /** bubble_column[drag=true] (magma below) — drags entities down. */
+  BUBBLE_DOWN: 2,
+  /** vine — climbable only with an adjacent solid block to press against
+   * (vanilla collision climb; prismarine-physics ascends only on
+   * horizontal collision, so a free-hanging curtain is unclimbable). */
+  VINE: 4
+} as const
+
+/** Snapshot cell = 2 bytes: flags (LutFlags) + height (top of collision, in 1/32 blocks). */
+export interface SnapshotMeta {
+  /** World-space minimum corner of the AABB (inclusive). */
+  x0: number
+  y0: number
+  z0: number
+  /** Grid dimensions. */
+  w: number
+  h: number
+  l: number
+  /** bot.game.minY — getLandingBlock stops scanning below this. */
+  worldMinY: number
+  /** PROCESS-globally unique generation (cache key across consumers). */
+  generation: number
+  /** Bumped on every in-place cell patch — (generation, patchCount)
+   * uniquely identifies snapshot content for residency caches. */
+  patchCount: number
+}
+
+export interface SnapshotBuffers {
+  meta: SnapshotMeta
+  /** flags[idx] — LutFlags byte per cell. SharedArrayBuffer-backed. */
+  flags: Uint8Array
+  /** heights[idx] — collision-top of the cell, in 1/32 blocks above the cell floor. */
+  heights: Uint8Array
+  /**
+   * Sparse entity-intersection grid, mirroring Movements.entityIntersections:
+   * pairs of (cellIdx, weight). Empty when allowEntityDetection is off.
+   */
+  entityIdx: Int32Array
+  entityWeight: Int32Array
+  /** Sparse exclusion-step weights (cellIdx, weight); empty unless exclusionAreasStep set. */
+  exclusionIdx: Int32Array
+  exclusionWeight: Int32Array
+}
+
+/** Serializable subset of a Movements profile — everything the solver core needs. */
+export interface MovementsConfig {
+  allowSprinting: boolean
+  allowParkour: boolean
+  /**
+   * Improvement over upstream: extended parkour — sprint-jumps to diagonal
+   * and long offsets, up (+1) and drop landings, and gap-jumps that catch a
+   * ladder / water / bubble column (docs/ExtendedParkour.md). Default false;
+   * needs allowParkour + allowSprinting.
+   */
+  allowParkourExtended: boolean
+  canOpenDoors: boolean
+  /** Improvement toggle: also open real (non-iron) doors, not just gates. Default true. */
+  canOpenRealDoors: boolean
+  maxDropDown: number
+  infiniteLiquidDropdownDistance: boolean
+  liquidCost: number
+  entityCost: number
+  /** Dig moves enabled (default false). Cost model is upstream-identical. */
+  canDig: boolean
+  digCost: number
+  dontCreateFlow: boolean
+  dontMineUnderFallingBlock: boolean
+  /**
+   * Improvement over upstream: ride bubble-column elevators (soul sand up,
+   * magma down). Default false — upstream treats columns as plain air.
+   */
+  useBubbleColumns: boolean
+  /** Cost per block of column ride (default 1 = admissible vs the |dy|
+   * heuristic; the true ride is faster — ~0.31 up / ~0.72 down). */
+  bubbleCost: number
+}
+
+/** Per-state dig auxiliaries (only consulted when a block is unsafe). */
+export const DigFlags = {
+  /** gravityBlocks type (sand/gravel) — blocks below it can't be mined
+   * under dontMineUnderFallingBlock. */
+  CAN_FALL: 1,
+  /** blocksCantBreak type (non-diggable + chest by default). */
+  CANT_BREAK: 2
+} as const
+
+/**
+ * Per-state dig tables, computed from the bot's CURRENT inventory/effects
+ * (upstream re-evaluates bestHarvestTool per probe — same numbers, computed
+ * once per solve instead of millions of times).
+ */
+export interface DigData {
+  fingerprint: string
+  /** labor[stateId] = 1 + 3 * digTime(bestTool) / 1000 — multiplied by
+   * movements.digCost at move-generation time (upstream formula). */
+  labor: Float32Array
+  /** DigFlags byte per stateId. */
+  flags: Uint8Array
+}
+
+export type SolveStatus = 'success' | 'partial' | 'timeout' | 'noPath'
+
+/** One path step, wire format (before rehydration into Move objects). */
+export interface RawPathNode {
+  x: number
+  y: number
+  z: number
+  cost: number
+  parkour: boolean
+  /** Cell to activate (fence gate / door) before entering this node, if any. */
+  useOne: { x: number, y: number, z: number } | null
+  /** Blocks to dig before entering this node (canDig solves only). */
+  toBreak?: Array<{ x: number, y: number, z: number }>
+}
+
+export interface SolveResult {
+  status: SolveStatus
+  cost: number
+  /** Milliseconds of think time for this compute (parity with upstream `time`). */
+  time: number
+  visitedNodes: number
+  generatedNodes: number
+  path: RawPathNode[]
+  /** Packed (cx & 0xffff) | (cz << 16) chunk keys the search expanded into. */
+  touchedChunks: number[]
+  /**
+   * True when the search pruned nodes at the snapshot boundary — the host
+   * should retry with a larger snapshot before trusting a noPath.
+   */
+  boundaryLimited: boolean
+}
+
+export interface GoalDescriptor {
+  type: string
+  [key: string]: unknown
+}
+
+/** Minimal node shape our goals read — upstream passes Move (a Vec3 subclass). */
+export interface XYZ {
+  x: number
+  y: number
+  z: number
+}
+
+export interface PathfinderOptions {
+  /**
+   * Run the A* solver in a worker_thread (default true). Falls back to
+   * main-thread tick-sliced solving (upstream-identical scheduling) when
+   * worker startup fails or the goal isn't serializable (custom goal class).
+   */
+  useWorkerThreads?: boolean
+  /** Override the worker entry file (tests / exotic bundlers). */
+  workerEntryPath?: string
+  /** Hard cap on snapshot cells before giving up growth (memory bound). */
+  maxSnapshotCells?: number
+  /**
+   * Injectable movement-simulation backend (tests). Defaults to the
+   * prismarine-physics-driven PhysicsSim, exactly like upstream.
+   */
+  physicsFactory?: (bot: unknown) => PhysicsLike
+  /**
+   * Called on every terminal no-path solve (after growth retries) with the
+   * exact snapshot the solver saw — the capture side of the offline replay
+   * loop for "the bot says No path in a room it should cross". The dump's
+   * shape matches the upstream-mode PF_DUMP_SNAPSHOTS corpus lines.
+   */
+  onNoPath?: (dump: NoPathDump) => void
+}
+
+/** Payload of PathfinderOptions.onNoPath — serializable solver inputs. */
+export interface NoPathDump {
+  meta: SnapshotMeta
+  flags: Uint8Array
+  heights: Uint8Array
+  start: XYZ
+  /** serializeGoal() descriptor (JSON-able). */
+  goal: unknown
+  /** The solve's movements profile (Movements.toConfig()). */
+  cfg: MovementsConfig
+  visitedNodes: number
+}
+
+/** The sprint/jump decision surface the executor consumes. */
+export interface PhysicsLike {
+  canStraightLine (path: XYZ[], sprint?: boolean): boolean
+  canSprintJump (path: XYZ[], jumpAfter?: number): boolean
+  canWalkJump (path: XYZ[], jumpAfter?: number): boolean
+  canStraightLineBetween (n1: Vec3, n2: Vec3): boolean
+}
+
+export type { Vec3 }

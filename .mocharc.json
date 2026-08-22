@@ -1,0 +1,8 @@
+{
+  "require": ["tsx/esm"],
+  "extensions": ["ts"],
+  "spec": "test/**/*.test.ts",
+  "timeout": 30000,
+  "recursive": true,
+  "exit": true
+}
