@@ -1,3 +1,5 @@
+Vibe coded slop. Not recommended for production yet.
+---
 # @bulba/pathfinder
 
 A drop-in replacement for [`mineflayer-pathfinder`](https://github.com/PrismarineJS/mineflayer-pathfinder):
