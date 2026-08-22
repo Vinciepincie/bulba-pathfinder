@@ -79,6 +79,45 @@ interface BlockLike {
  */
 const FORCED_MOVE_GRACE_MS = 3000
 
+/**
+ * How far from a wall the body has to be for sprinting to be safe. Any
+ * positive margin makes exact contact — what prismarine-physics leaves after
+ * every horizontal collision — count as "against the wall".
+ */
+const SPRINT_WALL_MARGIN = 0.03
+
+/**
+ * A walking step is at most a diagonal; anything longer is a jump and must
+ * not be re-steered along a wall.
+ */
+const WALK_STEP_REACH = 1.8
+
+/** How far ahead the wall-slide probe looks — over one tick of sprinting. */
+const SLIDE_PROBE = 0.35
+
+/**
+ * Steering bias AWAY from a wall we are sliding along, as a fraction of the
+ * along-wall component. Sliding with a heading exactly parallel is not enough:
+ * whatever momentum the bot still carries into the wall gets clamped, and a
+ * clamped position sits EXACTLY on the block face — the one value the server
+ * disagrees with us about, because prismarine-physics reconstructs the body
+ * from `minZ + halfWidth` while the server reconstructs it from the centre,
+ * and the two round to opposite sides of the boundary (the 1.21 hitbox
+ * precision class again — see geometry.ts). A hair of standoff keeps every
+ * position we claim unambiguously outside the block.
+ */
+const WALL_STANDOFF = 0.25
+
+/**
+ * Above this, the next node is something to climb ONTO, not a wall to walk
+ * around: a shelf, a step, a ladder exit. Steering away from it there is how a
+ * wall-slide turns a one-block step-up into an unreachable node.
+ */
+const STEP_UP_MIN = 0.1
+
+/** Ground distance one sprinting tick covers, the sprint gate's look-ahead. */
+const SPRINT_TICK = 0.3
+
 const DEFAULT_OPTIONS: Required<Omit<PathfinderOptions, 'physicsFactory' | 'onNoPath'>> = {
   useWorkerThreads: true,
   workerEntryPath: '',
@@ -1168,7 +1207,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       }
 
       let dx = nextPoint.x - p.x
-      const dy = nextPoint.y - p.y
+      let dy = nextPoint.y - p.y
       let dz = nextPoint.z - p.z
       // Improvement: never finish a path mid-air. The arrival box has no
       // ground requirement, so a goal satisfied at jump apex would cut
@@ -1206,6 +1245,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
           return
         }
         dx = nextPoint.x - p.x
+        dy = nextPoint.y - p.y
         dz = nextPoint.z - p.z
       }
 
@@ -1214,6 +1254,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       // so 'forward' presses against it. Both vanilla and prismarine-physics
       // ascend climbables via horizontal collision, so without a wall to
       // press the bot would drift off a ladder/vine column.
+      let climbing = false
       if (nextPoint.y > p.y + 0.1 && Math.abs(dx) < 0.2 && Math.abs(dz) < 0.2) {
         const feet = bot.blockAt(p) as BlockLike | null
         if (feet && (feet.type === ladderId || feet.type === vineId)) {
@@ -1225,10 +1266,59 @@ export function createPathfinder (options: PathfinderOptions = {}) {
             if (nb && nb.boundingBox === 'block') {
               dx = ox
               dz = oz
+              climbing = true
               break
             }
           }
         }
+      }
+
+      // Sprint gate. A vanilla client cancels sprinting the moment a
+      // collision deflects it (LocalPlayer.aiStep). Holding sprint against a
+      // wall is not cosmetic: the server REFUSES every position a sprinting
+      // client claims there and teleports the bot back — measured, back to
+      // back, on the same block: walking along the wall covered 7.1 blocks
+      // with zero corrections, sprinting covered 0.0 with 26. Because the bot
+      // cannot move it never stops touching the wall, so this is a livelock,
+      // and the futility timer cannot break it either: every correction
+      // re-arms the forced-move grace.
+      //
+      // The probe is geometric, and looks a sprinting tick AHEAD as well as at
+      // the body, because reacting to isCollidedHorizontally is two ticks too
+      // late: by then the server already has the bot down as sprinting, and
+      // the touching position it refuses has already been sent. Reacting
+      // instead of predicting was worth 7 corrections on this route; looking
+      // ahead took it to none.
+      const slideLen = Math.hypot(dx, dz)
+      const againstWall = !climbing && (geometry.nearWall(bot, SPRINT_WALL_MARGIN) ||
+        (slideLen > 0.01 && geometry.playerCollides(
+          bot, p.x + dx / slideLen * SPRINT_TICK, p.y, p.z + dz / slideLen * SPRINT_TICK)))
+      // The one exception is a parkour jump already in flight: it was
+      // approved on a rollout that held sprint the whole way, and a corner
+      // nick mid-arc is exactly what that model tolerates. Cutting sprint
+      // there would land the bot short of a node the planner routed through.
+      const flyingParkour = (nextPoint as { parkour?: boolean }).parkour === true &&
+        (bot.entity as { onGround?: boolean }).onGround !== true
+      const maySprint = stateMovements.allowSprinting && (flyingParkour || !againstWall)
+
+      // Wall-slide steering. Aiming straight at the next node when a wall is
+      // in the way makes the physics clamp the move, and the server refuses a
+      // clamped position that also slid along the wall: on the same corner,
+      // aiming diagonally into it produced 25 corrections and 0.01 blocks of
+      // travel, while aiming along the wall produced none and 7.1 blocks. A
+      // player walks along the wall and turns at the corner; so do we.
+      //
+      // Walking steps only. A jump is flown on the heading the physics
+      // rollout approved, and re-steering it mid-flight would land the bot
+      // somewhere the planner never routed through.
+      if (!climbing && (nextPoint as { parkour?: boolean }).parkour !== true &&
+          dy <= STEP_UP_MIN && Math.hypot(dx, dz) <= WALK_STEP_REACH) {
+        const sx = Math.sign(dx)
+        const sz = Math.sign(dz)
+        const xBlocked = sx !== 0 && geometry.playerCollides(bot, p.x + sx * SLIDE_PROBE, p.y, p.z)
+        const zBlocked = sz !== 0 && geometry.playerCollides(bot, p.x, p.y, p.z + sz * SLIDE_PROBE)
+        if (zBlocked && !xBlocked) dz = -sz * Math.abs(dx) * WALL_STANDOFF
+        else if (xBlocked && !zBlocked) dx = -sx * Math.abs(dz) * WALL_STANDOFF
       }
 
       bot.look(Math.atan2(-dx, -dz), 0)
@@ -1249,10 +1339,10 @@ export function createPathfinder (options: PathfinderOptions = {}) {
           bot.setControlState('jump', true)
         }
         bot.setControlState('sprint', false)
-      } else if (stateMovements.allowSprinting && physics.canStraightLine(path, true)) {
+      } else if (maySprint && physics.canStraightLine(path, true)) {
         bot.setControlState('jump', false)
         bot.setControlState('sprint', true)
-      } else if (stateMovements.allowSprinting && physics.canSprintJump(path)) {
+      } else if (maySprint && physics.canSprintJump(path)) {
         bot.setControlState('jump', true)
         bot.setControlState('sprint', true)
       } else if (physics.canStraightLine(path)) {

@@ -118,14 +118,43 @@ export class PhysicsSim {
     }
   }
 
+  /**
+   * ONE jump per rollout, then walk it in.
+   *
+   * Upstream holds jump for the whole rollout, which means a jump that lands
+   * short does not fail the test — the sim simply jumps again from wherever it
+   * came down and satisfies the node many ticks later, from a cell the planner
+   * never routed through. The executor then commits to a take-off whose real
+   * landing is somewhere else entirely: on 2b2t spawn the residual cross-axis
+   * velocity of a 4-block drop-jump carried the next take-off two cells short
+   * into a 1-block pit, and the rollout still said yes because it reached the
+   * node 9 ticks after landing in that pit — where the bot then sat for the
+   * rest of the run. Upstream's 20-tick budget hid this by accident; ours is
+   * 45 so deep drops fit, so the rule has to be explicit.
+   *
+   * Releasing jump on touchdown is also just what the executor does: it
+   * re-decides every tick, and after a landing nothing is holding jump unless
+   * a fresh decision asks for one. So the rollout now answers the question
+   * actually being asked — does ONE jump from here, plus the run-in, reach
+   * the node? — and a landing short of the node fails it unless the bot can
+   * walk the rest, which is a real landing rather than a bounce.
+   */
   private getController (nextPoint: { x: number, y: number, z: number }, jump: boolean, sprint: boolean, jumpAfter = 0): Controller {
+    let airborne = false
+    let landed = false
     return (state: PlayerState, tick: number) => {
       const dx = nextPoint.x - state.pos.x
       const dz = nextPoint.z - state.pos.z
       state.yaw = Math.atan2(-dx, -dz)
 
+      // Latch on the state left by the previous tick: airborne first, so a
+      // jump still on cooldown (prismarine-physics holds one for 10 ticks
+      // after the last) is never mistaken for a landing.
+      if (state.onGround !== true) airborne = true
+      else if (airborne) landed = true
+
       state.control.forward = true
-      state.control.jump = jump && tick >= jumpAfter
+      state.control.jump = jump && tick >= jumpAfter && !landed
       state.control.sprint = sprint
     }
   }

@@ -14,7 +14,15 @@ export const RUN_DIR = process.env.ARENA_RUN_DIR
 export const WORLD_NAME = 'arena'
 export const WORLD_DIR = join(RUN_DIR, WORLD_NAME)
 export const RESULTS_DIR = join(RUN_DIR, 'results')
+/** One directory per flagged route run: NOTES.md plus the raw bundle. */
+export const DEBUG_DIR = join(RUN_DIR, 'debug')
 export const ROUTES_FILE = join(ARENA_DIR, 'routes.json')
+/**
+ * Per-route running record, kept beside the route book rather than under the
+ * gitignored `.run/`: "wedged in the same spot four runs running" is the
+ * signal, and it only exists across runs.
+ */
+export const HISTORY_FILE = join(ARENA_DIR, 'history.json')
 
 /**
  * Server version. 1.21.11 is the newest protocol mineflayer speaks

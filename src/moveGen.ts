@@ -331,7 +331,21 @@ export class MoveGen {
       this.moveForward(x, y, z, dx, dz)
       this.moveJumpUp(x, y, z, dx, dz)
       this.moveDropDown(x, y, z, dx, dz)
-      if (this.allowParkour) this.moveParkourForward(x, y, z, dx, dz)
+      // Upstream's cardinal parkour is SUPERSEDED by the extended table, not
+      // complemented by it. It charges a flat 1 for a jump covering up to four
+      // blocks — less than a single walking step, which makes the octile
+      // heuristic inadmissible and lets A* buy distance with jumps (2b2t
+      // spawn: a plan costing 74.1 against upstream's 76.6 that was 3.5 blocks
+      // LONGER to walk) — and it applies neither the reach envelope nor the
+      // swept-corridor clearance, so it re-offers, at a cheaper price, exactly
+      // the jumps parkourExtTarget just vetoed. Nor is coverage a reason to
+      // keep it: over 120 seeded worlds and 108k parkour-bearing nodes it
+      // reaches 22.5k targets the table does not, and a prismarine-physics
+      // rollout — from the cell centre, the take-off corner, and one and two
+      // blocks of run-up — can fly 1.1% of them. The rest are jumps the bot
+      // cannot make, each one a planned stall. docs/ExtendedParkour.md, and
+      // test/movegen.test.ts pins the supersession.
+      if (this.allowParkour && !ext) this.moveParkourForward(x, y, z, dx, dz)
       if (ext) {
         const tab = this.extTable as ParkourExtTable
         if (dx !== 0) {

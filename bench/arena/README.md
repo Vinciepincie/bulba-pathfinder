@@ -62,6 +62,12 @@ the setup and buy nothing.
 read out of that same run (the `1st solve` column). Nothing is solved before
 the start.
 
+`1st solve` is each engine's own `time` field, and the two do not cover the
+same window: upstream's runs from the start of the search, the wasm core's
+starts inside the worker, after the snapshot is built and shipped. `1st move`
+is the wall clock from launch to the bot leaving the start block, so it counts
+everything either engine does first, whoever does it and wherever.
+
 **Planning phase** (`--mode both`, no movement) — each engine plans from the
 start block N times: best/median/worst solve time, nodes visited, path
 length, path cost.
@@ -95,7 +101,8 @@ the goal, held through a countdown, then released in the same instant:
 | --- | --- |
 | `outcome` | `arrived`, `no-path`, `think-timeout`, `timeout`, `died`, `gave-up` |
 | `wall` | the headline: start to arrival |
-| `1st solve` | how long the first complete plan took |
+| `1st solve` | how long the first complete plan took, as the engine reports it |
+| `1st move` | launch to the bot actually leaving the start block |
 | `solves` / `replans` | how often the engine had to think again mid-walk |
 | `visited` | total nodes expanded across every solve |
 | `blocks` | distance actually travelled |
@@ -104,6 +111,73 @@ the goal, held through a countdown, then released in the same instant:
 | `left` | distance still to the goal when the run ended |
 
 Results are printed as tables and written to `.run/results/arena-*.json`.
+
+## Auto-debug
+
+A route that ends `timeout, 29.2 blocks left` is a score, not a bug report. So
+when a route goes badly the arena stops and collects the evidence before
+anything moves the bots again, and writes it to
+`.run/debug/<stamp>-<route>-a<attempt>/NOTES.md`.
+
+It triggers (`--debug auto`, the default) when any of these is true:
+
+- one of our engines did not arrive,
+- one of our engines stalled for 3 s or more, even on a route it won,
+- upstream arrived where we did not, or beat us by more than `--faster-by`
+  (10% by default).
+
+`--debug always` writes a bundle for every route, `--debug off` writes none,
+and `!debug` in the interactive session writes one for the last race on
+demand.
+
+**Why it runs inside the route.** The two facts that actually explain a loss
+have a short shelf life. The path the executor was still holding is gone the
+moment the goal is cleared, and the blocks around the failure can only be read
+from the racer that failed — the referee sits at the finish on a 2-chunk view
+distance and has never loaded them. Both are captured in place, at the stall.
+
+A bundle contains:
+
+| | |
+| --- | --- |
+| why it was flagged | the verdict lines, worst engine first |
+| what each engine did | one row per engine: solve, first move, plan size, blocks walked, jumps, replans, worst stall |
+| plan vs practice | where the two engines' *plans* first differ, how far apart their *lines* ever got, and whether we left upstream's corridor at all |
+| where it got stuck | every stall over 2.5 s: the position, how long, how many nodes were still queued, and the next nodes the executor was trying to reach with their parkour flags and costs |
+| the blocks it was stuck against | an ASCII slice per Y layer around the stall with the bot and the path nodes marked, plus full state (`properties`, collision `shapes`) for the feet/under/head blocks and each node ahead |
+| where to look | source files chosen from the failure's shape, not a generic checklist |
+| reproduce | two ready-to-run commands: the whole route, and just the segment it failed on |
+
+`bundle.json` next to it carries the raw `RouteReport`: the per-tick trace,
+every `path_update`, reset reasons, stalls and the terrain probe.
+
+Read `shapes` rather than `boundingBox` when a bot comes to rest at a
+fractional Y — `boundingBox` reports `block` for carpets, slabs and snow
+layers alike, so only the collision shapes explain it.
+
+### The loop
+
+The arena server is the slow part, so keep it up and iterate against it:
+
+```sh
+npm run arena:race -- --routes simple2 --timeout 25 --keep   # race, flag, bundle
+# read .run/debug/<stamp>-simple2-a1/NOTES.md, change src/, then:
+npm run build                                                # the racers load dist/
+npm run arena:race -- --attach --routes simple2 --timeout 25 --keep
+```
+
+`--debug-cmd` hooks an agent into that loop: it runs the given command with
+the bundle's `NOTES.md` path appended, e.g. `--debug-cmd "claude -p"`. It is
+off by default, and the racers keep running while it works — a fix still needs
+`npm run build` and a re-race before it is in play.
+
+### Route history
+
+Every flagged run also appends to `history.json`, next to the route book:
+verdict, both engines' numbers, whether the plans matched, and where we got
+stuck. It is committed rather than left under the gitignored `.run/`, because
+the signal worth having is "this route has wedged in the same spot four runs
+running", and that only exists across runs.
 
 ## How the comparison is kept fair
 
@@ -164,6 +238,10 @@ block in each column, and asks the custom engine whether it can get there. It
 is a fast oracle for this: on a genuinely unreachable goal it returns
 `noPath` in a fraction of a second where upstream just burns its whole think
 budget.
+
+It is a scouting tool, not a route source. The 39 probe-generated routes it
+had filled `routes.json` with were all spokes off the same start block and
+told us little; the book is hand-authored now.
 
 ### Defining routes with signs
 
@@ -275,6 +353,9 @@ translation layer.
 | `--parity` | off | disable extended parkour (upstream-equivalent rules) |
 | `--attach` | off | use a server that is already running |
 | `--keep` | off | leave the server up after the run |
+| `--debug auto\|off\|always` | `auto` | write a debug bundle for a flagged route |
+| `--faster-by N` | 0.10 | upstream lead that counts as a loss for us |
+| `--debug-cmd "<cmd>"` | — | run this with the bundle's `NOTES.md` appended |
 
 `arena:world`: `--src`, `--out`, `--radius`, `--spawn x,y,z`, `--force`.
 `arena:server`: `--upgrade`, `--via`.

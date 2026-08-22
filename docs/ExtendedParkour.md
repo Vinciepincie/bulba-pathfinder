@@ -146,6 +146,21 @@ the same speed with it on.
   the flag on.
 - Rust adds no exclusion-area cost: exclusion areas force the JS solver path
   (existing divergence, same as every other move).
-- Upstream's own parkour quirks are preserved verbatim where they overlap
-  (e.g. it jump-ups onto ladder *tops* for cost 1 — kept; our catch move
-  coexists and A* picks the cheaper).
+- With the flag on the table **supersedes** `moveParkourForward` rather than
+  coexisting with it: that generator is skipped entirely (JS and Rust alike).
+  It charges a flat 1 for a jump covering up to four blocks — cheaper than a
+  single walking step — so beside the table it wins every tie, which means it
+  re-offers at a lower price exactly the jumps the corridor and envelope just
+  vetoed, and lets A* buy distance with jumps (2b2t spawn: a plan costing 74.1
+  against upstream's 76.6 that was 3.5 blocks *longer* to walk, and lost the
+  race it should have won). The flat cost also makes the octile heuristic
+  inadmissible (h = 4 over a cost-1 edge), so the search is not optimal under
+  its own model either.
+
+  Coverage is not a reason to keep it. Over 120 seeded worlds and 108k
+  parkour-bearing nodes it reaches 22.5k targets the table does not, and a
+  prismarine-physics rollout of a sample of those — tried from the cell
+  centre, from the take-off corner, and with one and two blocks of run-up —
+  can fly **1.1%** of them. The rest are jumps the bot cannot make, each one a
+  planned stall. With the flag off it is still the bit-exact upstream port and
+  the differential fuzz pins it. `test/movegen.test.ts` pins the supersession.

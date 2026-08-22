@@ -12,6 +12,41 @@ import { Vec3 } from 'vec3'
 
 const require2 = createRequire(import.meta.url)
 
+/** No progress for this long counts as stuck, and gets snapshotted. */
+export const STUCK_MS = 2500
+
+interface BlockLike {
+  name: string
+  boundingBox: string
+  shapes?: number[][]
+  getProperties?: () => Record<string, unknown>
+  _properties?: Record<string, unknown>
+}
+
+/** The terrain a failure happened on. Air is implied by absence. */
+export interface WorldProbe {
+  blocks: Array<[number, number, number, string]>
+  /** Read through an unloaded chunk — absence here means "unknown", not air. */
+  unloaded: Array<[number, number, number]>
+  focus: Array<{
+    pos: [number, number, number]
+    label: string
+    name: string
+    boundingBox: string
+    properties: Record<string, unknown>
+    shapes: number[][]
+  }>
+}
+
+function readProperties (b: BlockLike | null): Record<string, unknown> {
+  if (b === null) return {}
+  try {
+    return typeof b.getProperties === 'function' ? b.getProperties() : (b._properties ?? {})
+  } catch {
+    return {}
+  }
+}
+
 /**
  * `bulba` runs the reference JavaScript solver on the main thread;
  * `bulba-wasm` runs the production path — the Rust core in a worker thread.
@@ -31,6 +66,21 @@ export type Outcome =
   | 'stopped'
   | 'error'
 
+/**
+ * A bot that stopped making progress, caught in the act: where it was, and
+ * what the executor was still trying to walk. The path nodes are the useful
+ * half — "stalled at x y z" says nothing on its own, "stalled at x y z with a
+ * 3-block parkour jump as the next node" is a bug report.
+ */
+export interface StuckSnapshot {
+  atMs: number
+  stalledMs: number
+  pos: [number, number, number]
+  /** Nodes still queued in the live path, nearest first. */
+  ahead: Array<{ x: number, y: number, z: number, parkour: boolean, cost: number }>
+  remaining: number
+}
+
 export interface RunResult {
   impl: Impl
   routeId: string
@@ -42,6 +92,24 @@ export interface RunResult {
   wallMs: number
   /** Time the first complete solve took, and the sum over every (re)solve. */
   firstSolveMs: number | null
+  /**
+   * Wall clock from launch to the bot leaving the start block — the
+   * engine-agnostic `firstSolveMs`. The engines time different windows
+   * (upstream from search start, the wasm core from inside the worker), so
+   * only this one covers everything that happens before the bot moves. It is
+   * NOT additive with firstSolveMs: the solve happens inside this window.
+   *
+   * ⚠ Reading the two together, `bulba-wasm` looks contradictory — the better
+   * solve number and the worse first move. A race is a COLD benchmark: one
+   * solve per fresh process, and the worker path pays a one-time ~140 ms
+   * (worker spawn, module load in the worker, wasm instantiate, first LUT and
+   * parkour-table upload) that main-thread JS never pays. That cost lands
+   * here and in wallMs but not in firstSolveMs, which the core measures from
+   * inside the worker. Warm — which is what a long-lived bot and `npm run
+   * bench` both see — it inverts: ~1.2 ms for the worker against ~1.6 ms for
+   * main-thread JS on a 107-node solve, and far wider on big searches.
+   */
+  firstMoveMs: number | null
   solveMsTotal: number
   solves: number
   visitedNodes: number
@@ -51,10 +119,23 @@ export interface RunResult {
   replans: number
   travelled: number
   jumps: number
+  /**
+   * Server position corrections. A bot that scrapes along geometry the server
+   * disagrees about gets teleported back, and a bot that does it in a way the
+   * server refuses outright gets teleported back EVERY tick — the difference
+   * between "a bit of rubber-banding" and a livelock is a number, so measure
+   * it. Upstream is the control: whatever it scores here is the terrain's
+   * fault, not the engine's.
+   */
+  lagbacks: number
   damage: number
   deaths: number
   worstStallMs: number
+  /** Every stall past `STUCK_MS`, in order. The auto-debug reads these. */
+  stalls: StuckSnapshot[]
   endDistance: number
+  /** Where the run actually ended (the death spot, if it died there). */
+  endPos: [number, number, number]
   /** Wall clock (ms) at which this racer actually called goto(). */
   startedAt: number
   /** Diagnostics for a run that did not arrive: what the engine kept saying. */
@@ -72,6 +153,8 @@ export interface RunResult {
    * travelled — which is a very different bug from failing a jump.
    */
   firstPath?: Array<[number, number, number]>
+  /** Indices into `firstPath` that the engine flagged as parkour jumps. */
+  firstPathParkour?: number[]
   drainedAt?: [number, number, number]
   drainedAfterMs?: number
   /**
@@ -300,6 +383,7 @@ export class Racer {
       promiseOutcome: 'error',
       wallMs: 0,
       firstSolveMs: null,
+      firstMoveMs: null,
       solveMsTotal: 0,
       solves: 0,
       visitedNodes: 0,
@@ -309,10 +393,13 @@ export class Racer {
       replans: 0,
       travelled: 0,
       jumps: 0,
+      lagbacks: 0,
       damage: 0,
       deaths: 0,
       worstStallMs: 0,
+      stalls: [],
       endDistance: 0,
+      endPos: [0, 0, 0],
       startedAt: 0,
       statuses: {},
       resetReasons: {},
@@ -325,6 +412,11 @@ export class Racer {
     let lastMoveAt = performance.now()
     let lastHealth = bot.health
     let wasOnGround = bot.entity.onGround
+    // Filled at the launch instant, not here: the spin-down must not count.
+    let launchAt = 0
+    let launchPos: Vec3 | null = null
+    /** True while the current stall has already been snapshotted. */
+    let stalled = false
 
     const onPathUpdate = (r: PathUpdate): void => {
       result.statuses[r.status] = (result.statuses[r.status] ?? 0) + 1
@@ -345,6 +437,9 @@ export class Racer {
         if (r.status === 'success' && Array.isArray(r.path)) {
           const nodes = r.path as Array<{ x: number, y: number, z: number }>
           result.firstPath = nodes.slice(0, 400).map(n => [n.x, n.y, n.z])
+          result.firstPathParkour = nodes
+            .slice(0, 400)
+            .flatMap((n, i) => (n as { parkour?: boolean }).parkour === true ? [i] : [])
           livePath = nodes // the same array the executor drains
           pathRef = nodes
         }
@@ -367,13 +462,38 @@ export class Racer {
       const d = p.distanceTo(lastPos)
       const now = performance.now()
       if (d > 0.02) { result.travelled += d; lastPos = p.clone() }
+      // 0.3 blocks clears the jitter of a bot the server keeps nudging, and a
+      // real first step covers it inside two ticks.
+      if (result.firstMoveMs === null && launchPos !== null && p.distanceTo(launchPos) > 0.3) {
+        result.firstMoveMs = now - launchAt
+      }
       // Stall means "made no PROGRESS", not "did not twitch". A wedged bot
       // that the server keeps nudging jitters constantly: measured against a
       // per-tick delta it looked like a 0.9 s stall while it sat in the same
       // spot for 46 s. Anchor on a position and only move the anchor once the
       // bot has genuinely left it.
-      if (p.distanceTo(anchor) > 0.75) { anchor = p.clone(); lastMoveAt = now } else {
-        result.worstStallMs = Math.max(result.worstStallMs, now - lastMoveAt)
+      if (p.distanceTo(anchor) > 0.75) { anchor = p.clone(); lastMoveAt = now; stalled = false } else {
+        const stalledMs = now - lastMoveAt
+        result.worstStallMs = Math.max(result.worstStallMs, stalledMs)
+        // Caught in the act, once per stall: the remaining path is the half
+        // that says what the bot was failing to do, and it is gone by the
+        // time the run ends.
+        if (!stalled && stalledMs > STUCK_MS && result.stalls.length < 8) {
+          stalled = true
+          result.stalls.push({
+            atMs: Math.round(now - raceStart),
+            stalledMs: Math.round(stalledMs),
+            pos: [Number(p.x.toFixed(2)), Number(p.y.toFixed(2)), Number(p.z.toFixed(2))],
+            ahead: (pathRef ?? []).slice(0, 6).map(n => ({
+              x: n.x,
+              y: n.y,
+              z: n.z,
+              parkour: (n as { parkour?: boolean }).parkour === true,
+              cost: (n as { cost?: number }).cost ?? 0
+            })),
+            remaining: pathRef?.length ?? -1
+          })
+        }
       }
       if (wasOnGround && !bot.entity.onGround && bot.entity.velocity.y > 0.3) result.jumps++
       wasOnGround = bot.entity.onGround
@@ -391,6 +511,7 @@ export class Racer {
         ])
       }
     }
+    const onForced = (): void => { result.lagbacks++ }
     const onHealth = (): void => {
       if (bot.health < lastHealth) result.damage += lastHealth - bot.health
       lastHealth = bot.health
@@ -409,6 +530,7 @@ export class Racer {
     bot.on('path_update' as never, onPathUpdate as never)
     bot.on('path_reset' as never, onReset as never)
     bot.on('physicsTick', onTick)
+    bot.on('forcedMove', onForced)
     bot.on('health', onHealth)
     bot.on('death', onDeath)
 
@@ -423,6 +545,8 @@ export class Racer {
 
     result.startedAt = Date.now()
     const t0 = performance.now()
+    launchAt = t0
+    launchPos = bot.entity.position.clone()
     try {
       const goto = (pf.goto as (g: unknown) => Promise<void>)(goal)
       let timer: NodeJS.Timeout | undefined
@@ -460,10 +584,13 @@ export class Racer {
       result.error = (error as Error).message
     } finally {
       result.wallMs = performance.now() - t0
-      result.endDistance = (deathPos ?? bot.entity.position).distanceTo(goalCentre)
+      const last = deathPos ?? bot.entity.position
+      result.endDistance = last.distanceTo(goalCentre)
+      result.endPos = [Number(last.x.toFixed(2)), Number(last.y.toFixed(2)), Number(last.z.toFixed(2))]
       bot.removeListener('path_update' as never, onPathUpdate as never)
       bot.removeListener('path_reset' as never, onReset as never)
       bot.removeListener('physicsTick', onTick)
+      bot.removeListener('forcedMove', onForced)
       bot.removeListener('health', onHealth)
       bot.removeListener('death', onDeath)
       bot.clearControlStates()
@@ -486,6 +613,56 @@ export class Racer {
         : (result.statuses.timeout ?? 0) > 0 ? 'think-timeout' : 'gave-up'
     }
     return result
+  }
+
+  /**
+   * Read the terrain the run actually failed on, from the bot that failed on
+   * it. The referee cannot do this: it sits at the finish on a 2-chunk view
+   * distance, so the blocks around a stall halfway down the route are simply
+   * not loaded for it. The racer still has them.
+   *
+   * `shapes` is carried for the focus blocks on purpose. `boundingBox` says
+   * `block` for carpets, slabs and snow layers alike, so it cannot explain a
+   * bot resting at y .4; the collision shapes can.
+   */
+  probeWorld (focus: Array<{ pos: [number, number, number], label: string }>, radius = 3, below = 2, above = 3): WorldProbe {
+    const probe: WorldProbe = { blocks: [], unloaded: [], focus: [] }
+    const seen = new Set<string>()
+    const air = new Set(['air', 'cave_air', 'void_air'])
+    const read = (x: number, y: number, z: number): BlockLike | null =>
+      this.bot.blockAt(new Vec3(x, y, z)) as BlockLike | null
+
+    for (const { pos, label } of focus) {
+      const [cx, cy, cz] = pos.map(Math.floor) as [number, number, number]
+      for (const [dy, role] of [[-1, `${label}: under`], [0, `${label}: feet`], [1, `${label}: head`]] as const) {
+        const b = read(cx, cy + dy, cz)
+        probe.focus.push({
+          pos: [cx, cy + dy, cz],
+          label: role,
+          name: b?.name ?? 'unloaded',
+          boundingBox: b?.boundingBox ?? 'unknown',
+          properties: readProperties(b),
+          shapes: b?.shapes ?? []
+        })
+      }
+      for (let dx = -radius; dx <= radius; dx++) {
+        for (let dz = -radius; dz <= radius; dz++) {
+          for (let dy = -below; dy <= above; dy++) {
+            const x = cx + dx
+            const y = cy + dy
+            const z = cz + dz
+            const key = `${x},${y},${z}`
+            if (seen.has(key)) continue
+            seen.add(key)
+            const b = read(x, y, z)
+            if (b === null) { probe.unloaded.push([x, y, z]); continue }
+            if (air.has(b.name)) continue
+            probe.blocks.push([x, y, z, b.name])
+          }
+        }
+      }
+    }
+    return probe
   }
 
   stop (): void {

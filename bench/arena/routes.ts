@@ -48,6 +48,29 @@ export async function saveRoutes (book: RouteBook): Promise<void> {
   await writeFile(ROUTES_FILE, `${JSON.stringify(book, null, 2)}\n`)
 }
 
+/**
+ * Fold freshly scanned sign routes into the book, by id.
+ *
+ * Deliberately a merge, not a replace. Every sign-defined route carries the
+ * same note, so dropping everything with that note and writing back only what
+ * this scan found deletes any route whose signs were out of the scan — and
+ * every one of them if the scan came back empty. A route the signs no longer
+ * define lingers instead, and `!drop` removes it.
+ */
+export function mergeSignRoutes (existing: Route[], found: Route[], note: string): Route[] {
+  const byId = new Map(existing.map(r => [r.id, r]))
+  for (const route of found) {
+    byId.set(route.id, {
+      ...route,
+      // The sign is the authority on where; a tolerance set by hand survives
+      // a sign that says nothing about it.
+      tolerance: route.tolerance ?? byId.get(route.id)?.tolerance,
+      notes: note
+    })
+  }
+  return [...byId.values()]
+}
+
 /** `--routes r01,r02` / `--scenario parkour-advanced`; empty selects all.
  *  Sign-defined routes are named by hand, so ids and names both match, and
  *  capitalisation never matters. */

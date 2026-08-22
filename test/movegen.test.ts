@@ -396,12 +396,39 @@ describe('MoveGen', () => {
         w.set(fenceX, 0, 0, OAK_FENCE)
         return w
       }
-      // Upstream's own cardinal parkour also reaches (4,1,0) for cost 1 —
-      // the extended move is the one costing dist + 0.5.
-      const ext = (w: VoxelWorld): unknown[] =>
-        at(movesOf(makeGen(w, FLAG), 0, 1, 0), 4, 1, 0).filter(mv => mv.cost > 2)
+      const ext = (w: VoxelWorld): unknown[] => at(movesOf(makeGen(w, FLAG), 0, 1, 0), 4, 1, 0)
       expect(ext(build(2)), 'apex clears the fence').to.have.length(1)
       expect(ext(build(1)), 'fence right after takeoff vetoes').to.have.length(0)
+    })
+
+    it('supersedes upstream\'s cardinal parkour rather than coexisting with it', () => {
+      // Upstream's generator charges a flat 1 for a jump covering up to four
+      // blocks — less than one walking step — and applies neither the reach
+      // envelope nor the swept-corridor clearance. Left switched on beside the
+      // table it wins every tie, so it re-offers, at a cheaper price, exactly
+      // the jumps parkourExtTarget just vetoed (the fence case above), and A*
+      // buys distance with jumps: on 2b2t spawn that produced a plan costing
+      // 74.1 against upstream's 76.6 that was 3.5 blocks LONGER to walk. It
+      // also makes the octile heuristic inadmissible (h = 4 over a cost-1
+      // edge), so the search is not optimal under its own model either.
+      //
+      // Keeping it is not a reachability argument: over 120 seeded worlds and
+      // 108k parkour-bearing nodes it reached 22.5k targets the table does
+      // not, and a prismarine-physics rollout of a sample of those — from the
+      // cell centre, the take-off corner, and one and two blocks of run-up —
+      // could fly 1.1% of them. The rest are jumps the bot cannot make, each
+      // one a planned stall.
+      // A plain cardinal gap: take-off, three empty cells, landing.
+      const world = new VoxelWorld({ x0: -4, y0: -2, z0: -4, x1: 8, y1: 7, z1: 4 })
+      world.set(0, 0, 0, STONE)
+      world.set(-1, 0, 0, STONE) // run-up cell
+      world.set(4, 0, 0, STONE)
+      const withTable = movesOf(makeGen(world, FLAG), 0, 1, 0).filter(mv => (mv.meta & META_PARKOUR) !== 0)
+      const upstreamOnly = movesOf(makeGen(world), 0, 1, 0).filter(mv => (mv.meta & META_PARKOUR) !== 0)
+
+      expect(upstreamOnly.some(mv => mv.cost === 1), 'upstream prices a jump at one walking step').to.equal(true)
+      expect(withTable.some(mv => mv.cost === 1), 'the table never does').to.equal(false)
+      for (const mv of withTable) expect(mv.cost).to.be.greaterThan(2)
     })
 
     it('walkable floor on the flight line: not a gap, all vetoed', () => {

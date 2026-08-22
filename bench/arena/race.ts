@@ -15,7 +15,7 @@
 // first would hand it a pre-loaded first solve in the race it never earned,
 // while upstream has no cache to warm — a free head start on the wall
 // clock. `--mode solve` skips the race entirely.
-import { fork, type ChildProcess } from 'node:child_process'
+import { fork, spawn, type ChildProcess } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
 import type { Bot } from 'mineflayer'
@@ -27,9 +27,10 @@ import { loadRoutes, saveRoutes, selectRoutes, type Route } from './routes.js'
 import { raceTable, solveTable, summarise, writeResults, type RouteReport } from './report.js'
 import type { FromChild } from './racerProcess.js'
 import type { Impl, MovementProfile, RunResult } from './runner.js'
+import { analyse, appendHistory, focusPoints, historyEntry, judge, writeBundle } from './diagnose.js'
 import { pairSigns, scanSigns } from './signs.js'
-import { EDIT_HELP, equipEditorsOnJoin, persistSignRoutes, scanWorld } from './edit.js'
-import { ARENA_RADIUS, BOT_BULBA, BOT_BULBA_WASM, BOT_UPSTREAM, HOST, PORT, WORLD_DIR } from './config.js'
+import { EDIT_HELP, equipEditor, equipEditorsOnJoin, persistSignRoutes, scanWorld } from './edit.js'
+import { ARENA_RADIUS, BOT_BULBA, BOT_BULBA_WASM, BOT_UPSTREAM, HOST, PORT, RESULTS_DIR, WORLD_DIR } from './config.js'
 
 const { values } = parseArgs({
   options: {
@@ -52,7 +53,10 @@ const { values } = parseArgs({
     engines: { type: 'string', default: '' }, // subset of upstream,bulba,bulba-wasm
     parity: { type: 'boolean', default: false }, // disable extended parkour
     attach: { type: 'boolean', default: false }, // use an already-running server
-    keep: { type: 'boolean', default: false } // leave the server up afterwards
+    keep: { type: 'boolean', default: false }, // leave the server up afterwards
+    debug: { type: 'string', default: 'auto' }, // auto | off | always — see runDebug
+    'debug-cmd': { type: 'string', default: '' }, // run this with the bundle path appended
+    'faster-by': { type: 'string', default: '0.10' } // upstream lead that counts as a loss
   }
 })
 
@@ -66,8 +70,13 @@ const tolerance = Number(values.tolerance)
 const repeats = Number(values.repeat)
 const solveRepeats = Number(values['solve-repeats'])
 const mode = values.mode as 'both' | 'solve' | 'race'
+const debugMode = values.debug as 'auto' | 'off' | 'always'
+const fasterBy = Number(values['faster-by'])
 
 const sleep = async (ms: number): Promise<void> => await new Promise(resolve => setTimeout(resolve, ms))
+
+/** One stamp per process, so a batch's debug bundles sort together. */
+const runStamp = new Date().toISOString().replace(/[:.]/g, '-')
 
 /** Set once the referee is connected; maps racer name -> vanilla death message. */
 let deathsSince: (since: number) => Map<string, string> = () => new Map()
@@ -224,6 +233,7 @@ async function runRoute (
     for (const r of results) {
       console.log(`   race  ${r.impl.padEnd(8)} ${r.outcome.padEnd(8)} ${(r.wallMs / 1000).toFixed(2)}s  ` +
         `1st solve ${r.firstSolveMs === null ? '—' : `${r.firstSolveMs.toFixed(0)}ms`}  ` +
+        `1st move ${r.firstMoveMs === null ? '—' : `${r.firstMoveMs.toFixed(0)}ms`}  ` +
         `replans ${r.replans}  ${r.travelled.toFixed(0)} blocks  ${r.endDistance.toFixed(1)} left`)
       if (r.outcome !== 'arrived') {
         const fmt = (o: Record<string, number>): string =>
@@ -234,10 +244,69 @@ async function runRoute (
       }
     }
     announce(ref, results)
+    await runDebug(children, report)
   }
 
   if (mode !== 'race') await runSolvePhase()
   return report
+}
+
+/**
+ * Auto-debug, run before anything moves the bots again.
+ *
+ * The two facts that explain a loss have a short shelf life: the path the
+ * executor was still holding is gone once the goal is cleared, and the blocks
+ * around the failure are only readable from the racer that failed, while its
+ * chunks are still loaded. So this runs inside the route, immediately after
+ * the race, not from the results file afterwards.
+ *
+ * `--debug auto` (the default) writes a bundle only for a flagged route,
+ * `always` writes one for every route, `off` skips it.
+ */
+async function runDebug (children: Child[], report: RouteReport, force = false): Promise<void> {
+  if (debugMode === 'off' && !force) return
+  const verdict = judge(report, { fasterBy })
+  if (!verdict.interesting && debugMode !== 'always' && !force) return
+
+  const subject = verdict.subject
+  let probe = null
+  if (subject !== null) {
+    const child = children.find(c => c.impl === subject.impl)
+    if (child !== undefined) {
+      try {
+        const reply = await child.request(
+          { t: 'probeWorld', focus: focusPoints(subject), radius: 3 }, 'worldProbe'
+        )
+        probe = reply.probe
+      } catch (error) {
+        console.warn(`   ! could not read the terrain: ${(error as Error).message}`)
+      }
+    }
+  }
+
+  const diagnosis = analyse({ report, probe, opts: { fasterBy } })
+  const bundle = await writeBundle(diagnosis, report, {
+    resultsFile: RESULTS_DIR,
+    timeoutMs,
+    stamp: runStamp
+  })
+  await appendHistory(report.route.id, historyEntry(diagnosis, bundle.dir))
+
+  console.log(`\n   ⚑ flagged: ${verdict.reasons[0] ?? 'debug always'}`)
+  for (const reason of verdict.reasons.slice(1)) console.log(`     ${reason}`)
+  if (diagnosis.planIdentical) console.log('     both engines planned the identical path, so this is execution, not search')
+  for (const lead of diagnosis.leads.slice(0, 2)) console.log(`     → ${lead.replace(/`/g, '')}`)
+  console.log(`     ${bundle.notes}`)
+
+  if (values['debug-cmd'] !== '') {
+    const cmd = `${values['debug-cmd']} ${JSON.stringify(bundle.notes)}`
+    console.log(`     running: ${cmd}`)
+    await new Promise<void>(resolve => {
+      const proc = spawn(cmd, { shell: true, stdio: 'inherit' })
+      proc.on('exit', () => resolve())
+      proc.on('error', error => { console.warn(`     debug-cmd failed: ${error.message}`); resolve() })
+    })
+  }
 }
 
 /** Tell the world which route is about to run, and who is in it. */
@@ -453,11 +522,22 @@ async function interactive (
         say(`${route.id} tolerance = ${value}`)
         return
       }
+      case 'edit': {
+        // Any session can become an editing session. Without this the only
+        // way to get out of spectator was to stop the run and restart it with
+        // --edit, and a spectator's attempts to place a sign just vanish.
+        equipEditor(ref, username)
+        say(`${username} is in creative with signs — place a Start and a Finish, then !scan`)
+        return
+      }
       case 'scan': {
         say('scanning for !PF signs ...')
         const { routes: found, problems } = await scanWorld(ref)
         for (const p of problems) say(`! ${p}`)
-        if (found.length === 0) { say('no complete !PF routes found'); return }
+        if (found.length === 0) {
+          say('no complete !PF routes found — if your signs vanished as you placed them, you are a spectator: say !edit')
+          return
+        }
         for (const r of found) say(`${r.id} [${r.scenario}] ${r.start.join(' ')} -> ${r.end.join(' ')}`)
         say(`${found.length} route(s) — !save to keep, !race <name> to run one`)
         return
@@ -465,6 +545,7 @@ async function interactive (
       case 'save': {
         const { routes: found, problems } = await scanWorld(ref)
         for (const p of problems) say(`! ${p}`)
+        if (found.length === 0) { say('no !PF routes in the world — nothing saved, routes.json untouched'); return }
         say(`saved ${await persistSignRoutes(found)} sign route(s) to routes.json`)
         return
       }
@@ -491,6 +572,21 @@ async function interactive (
         if (current.routes.length === before) { say(`no route ${key}`); return }
         await saveRoutes(current)
         say(`dropped ${key}`)
+        return
+      }
+      case 'debug': {
+        // The terrain probe reads from the racer where it stands now, so this
+        // is only truthful straight after a race — say so rather than quietly
+        // filling the map with '?'.
+        const last = reports[reports.length - 1]
+        if (last === undefined) { say('nothing has raced yet'); return }
+        if (busy) { say('a race is running'); return }
+        busy = true
+        try {
+          say(`writing a debug bundle for ${last.route.id} ...`)
+          await runDebug(children, last, true)
+          say('bundle written, see the console')
+        } finally { busy = false }
         return
       }
       case 'stop':

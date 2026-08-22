@@ -7,7 +7,7 @@
 // harness instead of the engines.
 import { Vec3 } from 'vec3'
 import { connectBot } from './arena.js'
-import { Racer, type Impl, type MovementProfile, type RunResult } from './runner.js'
+import { Racer, type Impl, type MovementProfile, type RunResult, type WorldProbe } from './runner.js'
 
 type Block3 = [number, number, number]
 
@@ -18,6 +18,7 @@ type FromParent =
   | { t: 'solveWarm', end: [number, number, number], repeats: number }
   | { t: 'awaitStaged', start: Block3, end: Block3, timeoutMs: number, parked: boolean }
   | { t: 'race', routeId: string, end: Block3, tolerance: number, timeoutMs: number, startAt: number }
+  | { t: 'probeWorld', focus: Array<{ pos: Block3, label: string }>, radius: number }
   | { t: 'stop' }
 
 export type FromChild =
@@ -36,6 +37,7 @@ export type FromChild =
     health: number
   }
   | { t: 'raceResult', result: RunResult }
+  | { t: 'worldProbe', probe: WorldProbe }
   | { t: 'failed', message: string }
 
 const send = (msg: FromChild): void => { process.send?.(msg) }
@@ -118,6 +120,10 @@ async function handle (msg: FromParent): Promise<void> {
     case 'race': {
       const result = await must().race(msg.routeId, msg.end, msg.tolerance, msg.timeoutMs, msg.startAt)
       send({ t: 'raceResult', result })
+      return
+    }
+    case 'probeWorld': {
+      send({ t: 'worldProbe', probe: must().probeWorld(msg.focus, msg.radius) })
       return
     }
     case 'stop': {

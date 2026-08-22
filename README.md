@@ -54,7 +54,8 @@ The full upstream surface is provided with identical semantics:
   main thread, tick-sliced exactly like upstream).
 - **Path following** is a port of upstream's tick loop, driven by the same
   prismarine-physics simulations for sprint/jump decisions — movement on the
-  server is indistinguishable.
+  server is indistinguishable (see *Walking the server accepts* below for the
+  three places it is deliberately more careful).
 
 ### Deliberate divergences (all walk-only-safety or strict improvements)
 
@@ -73,6 +74,29 @@ The full upstream surface is provided with identical semantics:
   without thread churn. If worker startup fails (exotic bundler, permissions),
   everything transparently falls back to main-thread tick-sliced solving —
   which is still upstream-identical in scheduling, just much faster per slice.
+- **Walking the server accepts.** prismarine-physics will happily produce
+  positions a real server refuses, and a refused position is a teleport back —
+  every tick, for as long as the bot keeps producing it, which is a livelock
+  the futility timer cannot break because each correction looks like progress.
+  Three rules keep the bot out of that state, all of them measured against a
+  real 1.21.11 server (`bench/arena`, which now counts corrections per engine):
+  - a jump is only taken if **one** jump plus the run-in reaches the node.
+    Holding jump for the whole rollout — upstream's model — lets a take-off
+    that lands short bounce on and satisfy the node from a cell the planner
+    never routed through; on 2b2t spawn that put the bot in a 1-block pit two
+    cells short of its landing, where it sat for the rest of the run.
+  - **sprint is dropped against a wall**, the way a vanilla client drops it on
+    any collision that deflects it. Measured back to back on one block:
+    walking along the wall covered 7.1 blocks with zero corrections, sprinting
+    covered 0.0 with 26.
+  - a walking step whose straight line runs into a wall **steers along the
+    wall** with a hair of standoff, instead of grinding on the block face the
+    physics would clamp it onto. Aiming into the corner: 25 corrections and
+    0.01 blocks. Aiming along it: none, and 7.1 blocks.
+
+  On the arena's two routes this is the difference between finishing and not:
+  ours arrives with **0** corrections on both, upstream with 0 on one and 638
+  on the other, which is the one it never finishes.
 - **Much faster compute.** Block classification is precomputed into a
   per-blockstate LUT; the world is snapshotted into flat typed arrays; the A*
   core uses packed integer node ids, epoch-stamped g/parent tables and a

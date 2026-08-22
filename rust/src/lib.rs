@@ -1310,7 +1310,10 @@ impl SolverState {
             self.move_forward(x, y, z, dx, dz);
             self.move_jump_up(x, y, z, dx, dz);
             self.move_drop_down(x, y, z, dx, dz);
-            if self.cfg.allow_parkour {
+            // Superseded by the extended table when that is on — see the note
+            // in moveGen.ts generate(): flat-1 pricing, no reach envelope and
+            // no corridor check, for extra targets that are 98.9% unflyable.
+            if self.cfg.allow_parkour && !ext {
                 self.move_parkour_forward(x, y, z, dx, dz);
             }
             if ext {

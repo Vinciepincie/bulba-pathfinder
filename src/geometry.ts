@@ -50,6 +50,38 @@ export function playerCollides (bot: Bot, x: number, feetY: number, z: number): 
   return false
 }
 
+/**
+ * Is the body within `margin` of a solid block sideways — touching a wall,
+ * standing in a doorway, wedged in a corner? Unlike playerCollides this counts
+ * EXACT contact, which is the state prismarine-physics leaves the bot in after
+ * every horizontal collision (it clamps to the block face), and the state the
+ * server refuses to accept a sprinting client in.
+ */
+export function nearWall (bot: Bot, margin = 0.03): boolean {
+  const p = bot.entity.position
+  const minX = p.x - HALF - margin
+  const maxX = p.x + HALF + margin
+  const minZ = p.z - HALF - margin
+  const maxZ = p.z + HALF + margin
+  // Feet and head cells only: the body is what a wall can touch.
+  const y0 = Math.floor(p.y + EPS)
+  const y1 = Math.floor(p.y + TALL - EPS)
+  for (let bx = Math.floor(minX); bx <= Math.floor(maxX); bx++) {
+    for (let by = y0; by <= y1; by++) {
+      for (let bz = Math.floor(minZ); bz <= Math.floor(maxZ); bz++) {
+        for (const sh of blockShapes(bot, new Vec3(bx, by, bz))) {
+          if (minX < sh[3] && maxX > sh[0] &&
+              p.y + EPS < sh[4] && p.y + TALL - EPS > sh[1] &&
+              minZ < sh[5] && maxZ > sh[2]) {
+            return true
+          }
+        }
+      }
+    }
+  }
+  return false
+}
+
 /** Is the bot's hitbox intersecting a solid block right now? */
 export function isStuck (bot: Bot): boolean {
   const p = bot.entity.position

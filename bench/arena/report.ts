@@ -81,18 +81,20 @@ export function raceTable (reports: RouteReport[]): string {
         run.outcome,
         ms(run.wallMs),
         ms(run.firstSolveMs),
+        ms(run.firstMoveMs),
         String(run.solves),
         String(run.replans),
         num(run.visitedNodes),
         run.travelled.toFixed(1),
         String(run.jumps),
+        String(run.lagbacks),
         run.damage.toFixed(1),
         run.endDistance.toFixed(1)
       ])
     }
   }
   return table(
-    ['route / engine', 'outcome', 'wall', '1st solve', 'solves', 'replans', 'visited', 'blocks', 'jumps', 'dmg', 'left'],
+    ['route / engine', 'outcome', 'wall', '1st solve', '1st move', 'solves', 'replans', 'visited', 'blocks', 'jumps', 'lagback', 'dmg', 'left'],
     rows
   )
 }
