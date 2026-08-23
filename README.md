@@ -137,6 +137,90 @@ The full upstream surface is provided with identical semantics:
     aiming at the node centre cuts across both and a 0.6-wide body clips the
     blocked one. The open corner is inserted as a waypoint and the squeeze
     becomes the two ordinary moves the planner actually priced.
+- **The sprint-hop gait** (opt-in, `Movements.allowSprintHop`). Hopping while
+  sprinting is how a player crosses open ground, and it is not a small
+  difference — the jump keeps the sprint boost that ground friction eats:
+
+  | gait | open sky | under a 2-high roof |
+  |---|---|---|
+  | walk | 4.30 | 4.30 |
+  | sprint | 5.59 | 5.59 |
+  | sprint + **hold** jump | 7.05 | 6.50 |
+  | sprint + **press on landing** | **7.05** | **9.68** |
+
+  The cadence is the interesting half. prismarine-physics charges a held jump
+  key a 10-tick re-jump cooldown (`autojumpCooldown`) and clears it the moment
+  the key comes up, so a bonked arc — one that lands after five ticks because
+  the ceiling is low — spends the rest of the cooldown standing still, bleeding
+  the boost into friction. Pressing on each landing instead makes a 2-block
+  roof the **fastest ground in the game**, quicker than bunny-hopping under
+  open sky, and where the arc already outlasts the cooldown the two cadences
+  are identical tick for tick (34 jumps each). So it is never the slower
+  choice, and it is not behind a flag.
+
+  `Movements.allowLowCeilingHop` (opt-in, needs `allowSprintHop`) is what lets
+  the bot go and find that ground. It changes only how far ahead a DROP in the
+  ceiling vetoes a take-off: off, that is the whole comparison horizon, which
+  is safe and also switches the gait off for a passage that is mostly 2-high,
+  because every 3-high pocket has a low section within six nodes; on, the veto
+  spans the arc's own footprint, so the bot sprints the last step into a low
+  section and hops the moment it is under it — and still never takes off from
+  high ground into a ceiling it would hit side-on, which is the case that jams.
+
+  Nothing hard-codes any of that, though — both
+  gaits are driven down the SAME path for the same horizon and the faster one
+  wins, so the bot declines the hop from a standstill (no boost to keep yet)
+  and takes it once it is moving, all from the same comparison. It is refused
+  outright when the rollout would leave the ground the path stays on, when the
+  ground rises, on the last stretch before the goal, when the roof drops
+  within a hop's reach (the body is already up at 1.25 when the low section
+  arrives, which jams rather than bonks), and when there is water or lava in
+  the airspace three blocks up — which the planner never looks at, because
+  walking never goes there. Worth 0.5–1.9 s per route on the arena's flat
+  routes; `bulba-nohop` races the same engine with it off, so the number is
+  measured rather than argued.
+- **Ice, slime and potions are already in the answer, because the gates are
+  rollouts.** Nothing in the executor knows what ice is. Every gate simulates
+  the LIVE `PlayerState`, so block slipperiness and the server's
+  `movementSpeed` attribute are inputs to the comparison rather than special
+  cases — and they point opposite ways, which is why it matters that it is
+  measured and not assumed:
+
+  | surface | walk | sprint | sprint-hop |
+  |---|---|---|---|
+  | stone | 4.30 | 5.60 | 7.07 |
+  | ice / packed ice | 4.10 | 5.33 | **9.11** |
+  | blue ice | 4.31 | 5.60 | **9.19** |
+  | slime | 3.20 | 4.16 | 7.89 |
+  | stone, Speed II | 6.03 | **7.83** | 7.58 |
+
+  Ice is *slower* to walk and sprint on and 29% faster to hop on, so the bot
+  hops there without being told to. Under Speed II plain sprinting overtakes
+  the hop, so it stops hopping — again without being told. Two gaps are worth
+  knowing about: the SEARCH prices every surface the same (it will not seek
+  out an ice highway or route around slime), and prismarine-physics gates its
+  soul-sand/honey slowdown on a `velocityBlocksOnTop` feature whose version
+  list stops at 1.20, so on 1.21 the rollouts believe soul sand is ordinary
+  ground.
+- **Parkour take-offs are decided on the ground.** Asked while the bot is
+  still falling out of the previous jump, the rollout has to guess the speed
+  it will land with, and a marginal jump is decided entirely by that number.
+  On the arena's `basic1` — a 5-block drop-jump immediately followed by a
+  4-block flat one across a waterfall chasm — that guess was right about two
+  runs in three and cost a 40-block fall the rest of the time. Waiting costs
+  nothing: a jump can only start from the ground anyway, the gates re-run
+  every tick, and the in-flight branch keeps the current jump flying. 5/5
+  clean afterwards, from 4/5 with a death.
+- **Turning to make a jump, before shuffling to make room for it.** When a
+  node cannot be reached, the executor searches take-off headings (±30°, 0
+  first, cached per node) for one that lands it — the idea behind
+  [ParkourCalculatorMod](https://github.com/Leg0shii/ParkourCalculatorMod)'s
+  angle solver, at a hundredth the scope. Only then does it fall back to
+  stepping back or sideways, one tick at a time and each simulated first,
+  because a heading that works costs nothing while ground given up has to be
+  walked again. A fixed four-tick back-off instead of per-tick nudges was
+  worth a 0.9-block sideways wobble on every step of a staircase — 14 blocks
+  of extra ground and 3.5 s on one arena route.
 - **Much faster compute.** Block classification is precomputed into a
   per-blockstate LUT; the world is snapshotted into flat typed arrays; the A*
   core uses packed integer node ids, epoch-stamped g/parent tables and a
@@ -294,6 +378,43 @@ avoidance and (opt-in) digging are all supported — the full upstream moveset
 except block placement, which is permanently out of scope; the package
 writes zero place packets by construction, and zero dig packets unless
 `canDig` is explicitly enabled.
+
+**Water**, specifically, is where upstream's executor and its own planner
+disagree, and the executor is fixed here rather than the search:
+
+- The swim branch is keyed on the **head** cell, not on `isInWater`. Upstream
+  bobs across a one-deep ford with sprint cancelled because the body is merely
+  touching water; wading and swimming are different things.
+- Jump is held only while the node is **at or above** the body. Upstream holds
+  it for as long as the bot is wet, which climbs a column the search never
+  routed through — there is no vertical water move in the move generator at
+  all (`moveUp` refuses a liquid feet cell, `moveDown` refuses to go under),
+  so every water node sits at one planned level. On the arena's `basic1` that
+  was the difference between crossing a waterfall and riding it upward.
+- The bot **surfaces for air** below a third of its lungs, and does not sink
+  while it thinks: a bot with no path sets no controls, which in water is two
+  blocks a second downward for the whole re-solve, so every retry started
+  deeper than the last. The futility budget is 8 s in water rather than 3.5,
+  because swimming covers 2 blocks a second against 4.3 walking and a reset
+  that releases jump is worse than the stall it was called for.
+
+What is **not** modelled, and the executor only survives rather than solves:
+
+- No breath budget and no flowing-water direction in the search, so it can
+  still ask for a swim the bot has to abandon part-way.
+- **No fall-risk model, and it cannot live in the executor.** Nothing anywhere
+  consults `bot.health`: `maxDropDown` bounds a drop the planner *chose*, not
+  the void a jump crosses. Refusing a fatal-miss take-off was tried and
+  measured WORSE — on terrain like 2b2t spawn nearly every jump is over a
+  void, so the veto refuses the route the planner insists on, the bot has no
+  alternative to fall back to, and it wanders off an edge instead (arena
+  `basic1`: 5/5 clean without it, 0/2 with it). It belongs in the search,
+  where a fatal-miss edge can be priced against a safer line, not in the
+  executor, which has only "yes" and "stand still".
+- **No vertical water move at all.** `moveUp` refuses a liquid feet cell and
+  `moveDown` refuses to go under, so the planner cannot express "ride this
+  column down and climb out lower" — the obvious line for a player at a
+  waterfall, and one the bot therefore never takes.
 
 ## Testing
 

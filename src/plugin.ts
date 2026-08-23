@@ -126,6 +126,45 @@ const SPRINT_TICK = 0.3
 const HOP_ARRIVE_DY = 1.45
 
 /**
+ * How many nodes ahead the corner cut will look. One hop covers about four
+ * blocks and the nodes are a block apart, so five is a whole arc's worth of
+ * line to aim down — past that the scan costs more than the zig it saves,
+ * and a cut that long is usually stopped by terrain anyway.
+ */
+const CUT_LOOKAHEAD = 5
+
+/**
+ * How far off the cut line a node may sit and still count as gone by. An
+ * eight-direction path approximating a straight run leaves its nodes up to
+ * half a block off the line the body actually takes; 0.9 covers that and a
+ * hop's landing scatter without reaching sideways for a node on a branch the
+ * bot never went down.
+ */
+const CUT_RETIRE = 0.9
+
+/**
+ * How far ABOVE a parkour node the body may be and still retire it in the
+ * air. Roughly one tick of fall: at that height the landing is committed, so
+ * holding the node buys nothing and costs the momentum the next move wants.
+ */
+const PARKOUR_LAND_DY = 0.5
+
+/** Horizontal distance from a point to a segment, in the XZ plane. */
+function pointToSegment (
+  q: { x: number, z: number },
+  a: { x: number, z: number },
+  b: { x: number, z: number }
+): number {
+  const abx = b.x - a.x
+  const abz = b.z - a.z
+  const len2 = abx * abx + abz * abz
+  if (len2 < 1e-9) return Math.hypot(q.x - a.x, q.z - a.z)
+  let t = ((q.x - a.x) * abx + (q.z - a.z) * abz) / len2
+  t = Math.max(0, Math.min(1, t))
+  return Math.hypot(q.x - (a.x + abx * t), q.z - (a.z + abz * t))
+}
+
+/**
  * Air (of mineflayer's 0..20) below which the executor abandons the node and
  * surfaces. Vanilla's lung is 300 ticks and refills at 4 air-ticks per tick,
  * so a third of it is comfortably more than the time to swim up out of
@@ -150,6 +189,13 @@ const WEDGE_TICKS = 12
  * chance.
  */
 const ESCAPE_PATIENCE = 6
+
+/**
+ * Ticks an angled take-off is driven before the node is handed to the blind
+ * escapes. A jump leaves the ground on the first tick, so anything past a
+ * jump's worth of them means the angle was not the problem.
+ */
+const ANGLE_PATIENCE = 14
 
 /**
  * Escapes, cheapest first. Cycled per node: an escape that did not help is
@@ -198,8 +244,10 @@ export function createPathfinder (options: PathfinderOptions = {}) {
     let placing = false
     let placingBlock: { x: number, y: number, z: number, useOne?: boolean } | null = null
     let digging = false
-    /** Sprint-hop latched at take-off, held for the flight (allowSprintHop). */
+    /** Sprint-hop latched at take-off, re-pressed on each landing (allowSprintHop). */
     let hopHold = false
+    /** The node the corner cut is steering at, held until reached or invalid. */
+    let cutTarget: Move | null = null
     // Wedge recovery state — see the tick loop's recovery block.
     let wedgeAnchor: Vec3 | null = null
     let wedgeTicks = 0
@@ -212,6 +260,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
     let headingBias: number | null = null
     let headingSprint = false
     let biasFlight = false
+    let biasTicks = 0
     /** Cell the parkour corner-creep started from (see the creep branch). */
     let creepCell: { x: number, z: number } | null = null
     let lastNodeTime = performance.now()
@@ -812,6 +861,35 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       return false
     }
 
+    /**
+     * Is there a hole just past this landing, in the direction the body is
+     * travelling? A cell it can move into with nothing to stand on — a wall
+     * is not a hole, because a wall stops the overrun instead of swallowing
+     * it. Sampled a block and two blocks out, which is as far as the rest of
+     * a descent carries.
+     */
+    function holeBeyond (node: Move, from: Vec3): boolean {
+      const v = bot.entity.velocity
+      let ux = v.x
+      let uz = v.z
+      let len = Math.hypot(ux, uz)
+      if (len < 0.05) {
+        ux = node.x - from.x
+        uz = node.z - from.z
+        len = Math.hypot(ux, uz)
+        if (len < 1e-6) return false
+      }
+      ux /= len
+      uz /= len
+      for (const d of [1, 2]) {
+        const x = node.x + ux * d
+        const z = node.z + uz * d
+        if (!geometry.playerCollides(bot, x, node.y, z) &&
+            !geometry.playerCollides(bot, x, node.y - 0.55, z)) return true
+      }
+      return false
+    }
+
     function closestPointOnLineSegment (point: Vec3, segmentStart: Vec3, segmentEnd: Vec3): Vec3 {
       const segmentLength = segmentEnd.minus(segmentStart).norm()
       if (segmentLength === 0) return segmentStart
@@ -824,6 +902,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
 
     function fullStop (): void {
       hopHold = false
+      cutTarget = null
       clearWedge()
       bot.clearControlStates()
 
@@ -905,6 +984,28 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       return false
     }
 
+    /**
+     * The futility check, and it has to be reachable from every path through
+     * the tick.
+     *
+     * Upstream's flat 3.5 s is a WALKING budget: swimming covers 2 blocks a
+     * second against 4.3 walking, so a legitimate in-water crossing trips it
+     * routinely — and the reset then releases jump and lets the bot sink for
+     * the whole re-solve, which is worse than the stall it was called for.
+     * Water gets the same distance, not the same time, and keeps swimming
+     * while it thinks.
+     *
+     * Called from the end of the tick AND before every early return, because
+     * the recovery branches return without falling through: an escape that
+     * never works would otherwise hold the tick loop forever with the timer
+     * that exists to break exactly that never once being read.
+     */
+    function futile (swimming: boolean): boolean {
+      if (performance.now() - lastNodeTime <= (swimming ? 8000 : 3500)) return false
+      resetPath('stuck', !swimming)
+      return true
+    }
+
     function clearWedge (): void {
       wedgeAnchor = null
       wedgeTicks = 0
@@ -915,6 +1016,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       headingBias = null
       headingSprint = false
       biasFlight = false
+      biasTicks = 0
     }
 
     /**
@@ -937,6 +1039,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       if (headingNode !== nextPoint.hash) {
         headingNode = nextPoint.hash
         biasFlight = false
+        biasTicks = 0
         headingSprint = false
         headingBias = physics.bestHeading(path, true, false)
         if (headingBias === null && stateMovements.allowSprinting) {
@@ -948,6 +1051,14 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         if (headingBias === 0) headingBias = null
       }
       if (headingBias === null) return false
+      // Bounded, because this branch returns without falling through to the
+      // gates: an angle the server will not honour would otherwise be driven
+      // forever. If the bot has not left the ground within a jump's worth of
+      // ticks, the angle is not the answer — hand the node to the escapes.
+      if (++biasTicks > ANGLE_PATIENCE) {
+        headingBias = null
+        return false
+      }
       biasFlight = true
       bot.look(Math.atan2(-dx, -dz) + headingBias, 0)
       bot.setControlState('forward', true)
@@ -996,6 +1107,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
     function resetPath (reason: string, clearStates = true): void {
       if (!stopPathing && path.length > 0) bot.emit('path_reset' as never, reason as never)
       path = []
+      cutTarget = null
       stopDiggingIfNeeded()
       placing = false
       placingBlock = null
@@ -1477,6 +1589,17 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         return
       }
 
+      // SWIMMING, not merely wet (improvement). Upstream keys its water
+      // branch on `isInWater`, which mineflayer sets for a body touching
+      // water anywhere — so one waterlogged step, a puddle, or a splash at
+      // head height cancels sprint and holds jump for the whole crossing, and
+      // the bot bobs across a ford it could have run through. What actually
+      // distinguishes swimming from wading is whether the HEAD cell is water:
+      // there the bot has to swim up, and below it, it can walk.
+      const head = bot.blockAt(bot.entity.position.offset(0, 1, 0)) as { type: number } | null
+      const swimming = (bot.entity as { isInWater?: boolean }).isInWater === true &&
+        head !== null && (head.type === waterType || head.type === bubbleColumnId)
+
       let dx = nextPoint.x - p.x
       let dy = nextPoint.y - p.y
       let dz = nextPoint.z - p.z
@@ -1504,8 +1627,65 @@ export function createPathfinder (options: PathfinderOptions = {}) {
             airborneHold = feet === null || (feet.type !== ladderId && feet.type !== vineId)
           }
         }
+        // A PARKOUR node is landed on, never flown over (improvement).
+        //
+        // The arrival box has no ground requirement, so a jump that passes
+        // over its node on the way down satisfies it in mid-air — and the
+        // executor then starts flying at the node AFTER it, which on the far
+        // side of a gap means steering into the gap. On the arena's basic1 a
+        // 4-block drop onto a 2-cell shelf was retired 0.9 blocks above the
+        // shelf, and the bot spent the rest of its fall thrusting toward a
+        // node across the chasm beyond it: 40 blocks down, one run in eight,
+        // on either gait. `landsThere` already refuses to AUTHORISE a jump
+        // that only passes through its node; this is the same rule on the
+        // other side of the flight.
+        //
+        // Held back, the node stays the thing being steered at, so the bot
+        // spends the descent aiming at the shelf — which is also the fastest
+        // way to be standing on it.
+        // The threshold is a LANDING's worth of height, not zero. Holding all
+        // the way to touchdown also works and is safe, but it costs about a
+        // tick per jump across the route book — while the node is held the
+        // bot keeps steering at it, which means steering backwards once it is
+        // underneath, and that sheds the momentum the next move wants. A body
+        // within half a block of the node is committed to it; a body 0.9 up,
+        // which is where the arena retired it, is not.
+        //
+        // And only where flying past would actually cost something. A landing
+        // with more ground beyond it is one the bot can overrun harmlessly,
+        // which is most of them — holding those too is safe but costs about a
+        // tick a jump across the route book (basic2 +0.8 s, 15 jumps). So the
+        // hold is spent on the case it was written for: a shelf with a hole
+        // after it.
+        if ((nextPoint as { parkour?: boolean }).parkour === true &&
+            p.y - nextPoint.y > PARKOUR_LAND_DY) {
+          const ent = bot.entity as { onGround?: boolean, isInWater?: boolean }
+          if (ent.onGround !== true && ent.isInWater !== true && holeBeyond(nextPoint, p)) break
+        }
         if (airborneHold) break
-        if (!(Math.abs(dx) <= 0.35 && Math.abs(dz) <= 0.35 && Math.abs(dy) < arriveDy)) break
+        // Inside the box, or simply GONE BY. The corner cut does not steer
+        // through every node centre by design, so a node the body has passed
+        // is done even though it was never inside its 0.7-wide box; left in
+        // place it turns the bot round to collect it, and the bot then cuts
+        // forward again — the vibrating-on-flat-ground shuffle.
+        //
+        // "Passed" is measured against the path's own next leg, not against
+        // the body's velocity: a body being nudged backwards by the wedge
+        // recovery has velocity pointing away from a node it has NOT passed,
+        // and would retire it. Projecting onto the leg cannot be fooled that
+        // way — it only reads true once the body is genuinely on the far side
+        // of the node. Never the last node: the goal is always arrived at.
+        let passed = false
+        if (stateMovements.allowCornerCut && !swimming && path.length > 1 && Math.abs(dy) < arriveDy &&
+            (nextPoint as { parkour?: boolean }).parkour !== true &&
+            nextPoint.toBreak.length === 0 && nextPoint.toPlace.length === 0) {
+          const leg = path[1]
+          const abx = leg.x - nextPoint.x
+          const abz = leg.z - nextPoint.z
+          passed = ((p.x - nextPoint.x) * abx + (p.z - nextPoint.z) * abz) > 0 &&
+            Math.hypot(dx, dz) <= CUT_RETIRE
+        }
+        if (!passed && !(Math.abs(dx) <= 0.35 && Math.abs(dz) <= 0.35 && Math.abs(dy) < arriveDy)) break
 
         // arrived at next point
         lastNodeTime = performance.now()
@@ -1534,6 +1714,85 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         dz = nextPoint.z - p.z
       }
 
+
+      // Corner cut (improvement): walk the line, not the staircase.
+      //
+      // The planner routes cell centre to cell centre over eight directions,
+      // so a run a few degrees off a cardinal comes back as an alternating
+      // zig-zag — and a follower that steers at each centre in turn walks
+      // every zig, and swings its heading ±45° at every one. Sprinting that
+      // is merely wasteful; HOPPING it is expensive, because each arc is
+      // committed at take-off and the yaw swing happens with only air control
+      // to answer it. Measured on the arena's simple1, same plan and same
+      // gait: 88.8 blocks walked for a 74.6-block line.
+      //
+      // So the executor pulls the string: it STEERS at the furthest node it
+      // can reach in a straight line the body fits down — full hitbox sampled
+      // every quarter block, floor under every sample — and the nodes in
+      // between retire as the body goes by them (see the arrival loop). Only
+      // across flat plain walking, and only what geometry can vouch for: a
+      // rise, a parkour node, anything to break or place, or a profile with
+      // exclusion zones stops the scan, because those carry planner reasoning
+      // a swept box cannot re-derive.
+      //
+      // The nodes are STEERED PAST, not spliced out. Dropping them ahead of
+      // time leaves the body behind its own path[0], and upstream's lagback
+      // recovery reads exactly that — `isPositionNearPath` compares against
+      // the first node directly — so a routine sub-block correction stopped
+      // splicing and forced a full replan instead.
+      // Kept pointing at path[0] whatever the cut does below. The angle
+      // solver's offset is measured from the heading to path[0], so adding it
+      // to a heading aimed several nodes further on would fly the jump at
+      // something nobody solved for.
+      const nodeDx = dx
+      const nodeDz = dz
+      const mayCut = stateMovements.allowCornerCut && !swimming && path.length > 1 &&
+        stateMovements.exclusionAreasStep.length === 0 &&
+        (nextPoint as { parkour?: boolean }).parkour !== true &&
+        nextPoint.toBreak.length === 0 && nextPoint.toPlace.length === 0 &&
+        Math.abs(nextPoint.y - p.y) <= HOP_ARRIVE_DY
+      /** Is this node still a legal thing to be steering at from here? */
+      const cuttableTo = (n: Move & { parkour?: boolean }, upTo: number): boolean => {
+        if (n.parkour === true || n.toBreak.length > 0 || n.toPlace.length > 0) return false
+        if (Math.abs(n.y - nextPoint.y) > 0.1) return false
+        // Only cut a corner whose skipped nodes can still be COLLECTED. They
+        // retire by being gone by rather than by being stood on, and that
+        // test has a reach; a node further off the new line than that reach
+        // is never reached and never retired, so the bot turns round for it.
+        // Cutting without this check made every route LONGER and added
+        // replans — simple2 went from 105 blocks and 15.7 s to 111 and 19.9.
+        for (let j = 1; j < upTo; j++) {
+          if (pointToSegment(path[j], p, n) > CUT_RETIRE) return false
+        }
+        return geometry.walkableLine(bot, p.x, p.z, n.x, n.z, nextPoint.y, stateMovements.blocksToAvoid)
+      }
+      if (!mayCut) cutTarget = null
+      else {
+        // COMMIT to a target. Re-picking the furthest legal node every tick
+        // makes the heading flick between path[1] and path[4] as the line
+        // scan flickers on and off near terrain, which is a wobble on the
+        // screen and a waste of momentum. The target is kept until the body
+        // reaches it (it retires like any other node) or it stops being
+        // legal, and only then is a new one chosen.
+        if (cutTarget !== null) {
+          const at = path.indexOf(cutTarget)
+          if (at < 1 || !cuttableTo(cutTarget as Move & { parkour?: boolean }, at)) cutTarget = null
+        }
+        if (cutTarget === null) {
+          for (let k = 1; k < Math.min(CUT_LOOKAHEAD, path.length); k++) {
+            if (!cuttableTo(path[k] as Move & { parkour?: boolean }, k)) break
+            cutTarget = path[k]
+          }
+        }
+        if (cutTarget !== null) {
+          // Steer at it; the gates below still reason about path[0], which is
+          // on this same line and closer, so nothing is authorised that the
+          // node-by-node follower would not have authorised.
+          dx = cutTarget.x - p.x
+          dz = cutTarget.z - p.z
+        }
+      }
+
       // Is the bot getting anywhere? Two triggers, because waiting is only
       // cheap when it is rare. The generic one is slow on purpose (a sharp
       // turn or a landing can hold the body still for a few ticks and neither
@@ -1543,7 +1802,8 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       // ticks there cost ~1.4 s PER STEP on the arena's 46-block climb.
       const stillTicks = updateWedge(p)
       const wedged = stillTicks > WEDGE_TICKS ||
-        ((bot.entity as { onGround?: boolean }).onGround === true && physics.isGrinding(path))
+        (stillTicks >= 1 && (bot.entity as { onGround?: boolean }).onGround === true &&
+         physics.isGrinding(path))
 
       // Diagonal squeeze: go round the corner that is actually open
       // (improvement).
@@ -1687,37 +1947,55 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         else if (xBlocked && !zBlocked && Math.abs(dz) >= 0.15) dx = -sx * Math.abs(dz) * WALL_STANDOFF
       }
 
-      // Wedge recovery (improvement): when the bot has stopped moving, stop
-      // trusting the gates and try something.
+      // Air, before anything else can spend it. Vanilla gives 300 ticks of it
+      // and then 2 HP a second, and the planner has no idea — it will happily
+      // route 40 blocks of submerged corridor, which at swim speed is 20 s
+      // against a 15 s lung. Nothing downstream can rescue that, so the
+      // executor watches its own breath: below a third of it, the goal stops
+      // mattering until the bot has surfaced. Straight up is always the
+      // fastest way out (3.5 blocks/s against 2 swimming sideways), and the
+      // futility timer is held off because surfacing IS progress even though
+      // no node is being reached. It outranks the wedge recovery: a bot both
+      // stuck and out of air needs the air first.
+      const air = (bot as { oxygenLevel?: number }).oxygenLevel
+      if (swimming && air !== undefined && air <= AIR_RESERVE) {
+        bot.clearControlStates()
+        bot.setControlState('jump', true)
+        lastNodeTime = performance.now()
+        return
+      }
+
+      // ── when the plan and the world disagree ─────────────────────────────
       //
       // Every rollout above answers "does this work?" against
-      // prismarine-physics, and prismarine-physics is not the authority — the
-      // SERVER is, and it silently refuses whole classes of position the sim
-      // is happy with (see physics.ts grindGuard). When the two disagree the
-      // bot stands still with a plan it believes in, the futility timer
-      // replans, the plan comes back identical, and it stands still again:
-      // measured on the arena's climb1 staircase, 55 s in one spot across
-      // sixteen `stuck` resets, one cell from a node it was right to want.
+      // prismarine-physics, and prismarine-physics is not the authority. When
+      // the two disagree the bot stands still holding a plan it believes in,
+      // the futility timer replans, the identical plan comes back, and it
+      // stands still again: measured on the arena's climb1 staircase, 55 s in
+      // one spot across sixteen `stuck` resets, one cell from a node it was
+      // right to want.
       //
-      // So this triggers on the SYMPTOM — the body has not moved — rather
-      // than on any prediction about why. It then tries the escapes a player
-      // would, cheapest first, and each is simulated before it is used so it
-      // cannot become the fall it was trying to avoid. Escapes are cycled per
-      // node, so an escape that does not help is not the one tried next time.
+      // So the recovery triggers on the SYMPTOM — the body has not moved —
+      // rather than on any prediction about why, and then works down a ladder
+      // of increasingly expensive answers: turn to make the jump, go round
+      // the open corner, make room. Each is simulated before it is used, and
+      // none of them run while the bot is making progress.
+      //
       // A jump taken at an angle is flown at that angle: re-homing on the
       // node mid-arc would undo the very thing that made it possible.
       if (biasFlight && (bot.entity as { onGround?: boolean }).onGround !== true &&
           headingBias !== null) {
-        bot.look(Math.atan2(-dx, -dz) + headingBias, 0)
+        bot.look(Math.atan2(-nodeDx, -nodeDz) + headingBias, 0)
         bot.setControlState('forward', true)
         bot.setControlState('sprint', headingSprint)
+        futile(swimming)
         return
       }
       if (biasFlight && (bot.entity as { onGround?: boolean }).onGround === true) biasFlight = false
 
       if (!squeezed && wedged) {
-        if (driveAngledJump(nextPoint, dx, dz)) return
-        if (driveRecovery(nextPoint)) return
+        if (driveAngledJump(nextPoint, nodeDx, nodeDz)) { futile(swimming); return }
+        if (driveRecovery(nextPoint)) { futile(swimming); return }
       }
 
       bot.look(Math.atan2(-dx, -dz), 0)
@@ -1731,32 +2009,6 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       bot.setControlState('left', false)
       bot.setControlState('right', false)
 
-      // SWIMMING, not merely wet (improvement). Upstream keys its water
-      // branch on `isInWater`, which mineflayer sets for a body touching
-      // water anywhere — so one waterlogged step, a puddle, or a splash at
-      // head height cancels sprint and holds jump for the whole crossing, and
-      // the bot bobs across a ford it could have run through. What actually
-      // distinguishes swimming from wading is whether the HEAD cell is water:
-      // there the bot has to swim up, and below it, it can walk.
-      const head = bot.blockAt(bot.entity.position.offset(0, 1, 0)) as { type: number } | null
-      const swimming = (bot.entity as { isInWater?: boolean }).isInWater === true &&
-        head !== null && (head.type === waterType || head.type === bubbleColumnId)
-
-      // Air. Vanilla gives 300 ticks of it and then 2 HP a second, and the
-      // planner has no idea — it will happily route 40 blocks of submerged
-      // corridor, which at swim speed is 20 s against a 15 s lung. Nothing
-      // downstream can rescue that, so the executor watches its own breath:
-      // below a third of it, the goal stops mattering until the bot has
-      // surfaced. Straight up is always the fastest way out (3.5 blocks/s
-      // against 2 swimming sideways), and the futility timer is held off
-      // because surfacing is progress even though no node is being reached.
-      const air = (bot as { oxygenLevel?: number }).oxygenLevel
-      if (swimming && air !== undefined && air <= AIR_RESERVE) {
-        bot.clearControlStates()
-        bot.setControlState('jump', true)
-        lastNodeTime = performance.now()
-        return
-      }
 
       if (swimming) {
         // Swim to the level the plan is on, and STAY there.
@@ -1794,9 +2046,20 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         // gaits down this same path: the hop has to actually get further,
         // without losing height, or the bot keeps its feet.
         if ((bot.entity as { onGround?: boolean }).onGround === true) {
-          hopHold = stateMovements.allowSprintHop && physics.sprintHopBetter(path)
+          hopHold = stateMovements.allowSprintHop &&
+            physics.sprintHopBetter(path, stateMovements.allowLowCeilingHop)
         }
-        bot.setControlState('jump', hopHold)
+        // PRESS on the landing tick, never hold. prismarine-physics charges a
+        // held jump key a 10-tick re-jump cooldown (`autojumpCooldown`) and
+        // clears it the instant the key comes up, so a bonked arc — one that
+        // lands after 5 ticks because the ceiling is low — spends the rest of
+        // the cooldown on the ground, bleeding the sprint boost into friction.
+        // Measured on flat stone with the same physics: under a 2-block roof,
+        // sprint 5.59 b/s, hold-jump 6.50, press-on-landing 9.68 — faster than
+        // bunny-hopping under open sky. Where the arc already outlasts the
+        // cooldown the two cadences are identical tick for tick (7.05 both, 34
+        // jumps each), so this is never the slower choice and is not optional.
+        bot.setControlState('jump', hopHold && (bot.entity as { onGround?: boolean }).onGround === true)
         bot.setControlState('sprint', true)
       } else if (maySprint && physics.canSprintJump(path)) {
         hopHold = false
@@ -1876,16 +2139,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         bot.setControlState('sprint', flyingParkour)
       }
 
-      // Check for futility. Upstream's flat 3.5 s is a WALKING budget:
-      // swimming covers 2 blocks a second against 4.3 walking, so a
-      // legitimate in-water crossing trips it routinely — and the reset then
-      // releases jump and lets the bot sink for the whole re-solve, which is
-      // worse than the stall it was called for. Give water the same distance,
-      // not the same time, and let it keep swimming while it thinks.
-      if (performance.now() - lastNodeTime > (swimming ? 8000 : 3500)) {
-        // should never take this long to go to the next node
-        resetPath('stuck', !swimming)
-      }
+      futile(swimming)
     }
 
     bot.on('physicsTick', monitorMovement)

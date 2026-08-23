@@ -245,6 +245,15 @@ export function applyProfile (
     // Racing them side by side is how the gait is measured — same terrain,
     // same tick, same server hitch — instead of across two runs.
     movements.allowSprintHop = profile.extendedParkour && impl !== 'bulba-nohop'
+    // Rides with the gait: it only changes how far ahead a ceiling drop
+    // vetoes a take-off, so a route with open sky over it cannot tell the
+    // difference. 2b2t spawn is mostly open sky — the gait's own numbers come
+    // from the offline corridor measurement, and the route book's job here is
+    // to show it costs nothing where it does not apply.
+    movements.allowLowCeilingHop = movements.allowSprintHop === true
+    // Bisect switch: ARENA_NO_CUT=1 races the same build with node-by-node
+    // following, which is the only honest way to price the corner cut.
+    if (process.env.ARENA_NO_CUT === '1') movements.allowCornerCut = false
   }
 }
 

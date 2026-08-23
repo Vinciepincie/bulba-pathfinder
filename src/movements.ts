@@ -81,6 +81,41 @@ export class Movements {
    * more.
    */
   allowSprintHop: boolean
+  /**
+   * Improvement (opt-in, needs allowSprintHop): hop through LOW-headroom
+   * ground instead of walking round or under it — a tunnel, an overhang, a
+   * single block in the way overhead.
+   *
+   * A 2-block roof is the fastest ground in the game for a bot that re-presses
+   * jump on each landing: the arc bonks off the ceiling and lands in ~5 ticks,
+   * so the sprint boost is renewed four times as often as it is under open
+   * sky. Measured on flat stone, same physics the executor rolls out against:
+   * sprint 5.59 blocks/s, hold-jump 6.50, press-on-landing 9.68.
+   *
+   * What it changes is only how far ahead a DROP in the ceiling vetoes a
+   * take-off. Off, that is the whole comparison horizon, which is safe and
+   * also switches the gait off for an entire passage — in a mostly-2-high
+   * tunnel every 3-high pocket has a low section within six nodes. On, the
+   * veto spans the arc's own footprint, so the bot sprints the last step into
+   * a low section and hops the moment it is under it, and never takes off
+   * from high ground into a ceiling it would hit side-on.
+   */
+  allowLowCeilingHop: boolean
+  /**
+   * Improvement: steer at the furthest node reachable in a straight line the
+   * body fits down, instead of visiting every cell centre in turn.
+   *
+   * The planner routes over eight directions, so a run a few degrees off a
+   * cardinal comes back as an alternating zig-zag; a follower that aims at
+   * each centre walks every zig and swings its heading at every one. Skipped
+   * nodes retire by being gone by rather than by being stood on, and only
+   * where a swept hitbox says the line is walkable and the skipped nodes stay
+   * within collecting range of it.
+   *
+   * Executor-only: the plan is unchanged, and turning this off restores
+   * node-by-node following exactly.
+   */
+  allowCornerCut: boolean
   allowEntityDetection: boolean
 
   entitiesToAvoid: Set<string>
@@ -138,6 +173,8 @@ export class Movements {
     this.allowParkourExtended = false // improvement, opt-in (upstream only jumps straight and flat)
     this.allowSprinting = true
     this.allowSprintHop = false // improvement, opt-in (executor gait only)
+    this.allowLowCeilingHop = false // improvement, opt-in (executor gait only)
+    this.allowCornerCut = true // improvement, on (executor steering only; plan unchanged)
     this.allowEntityDetection = true
 
     this.entitiesToAvoid = new Set()

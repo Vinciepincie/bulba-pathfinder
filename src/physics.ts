@@ -38,6 +38,17 @@ const HOP_MAX_DIP = 0.5
  */
 const HEADING_OFFSETS = [0, 0.13, -0.13, 0.26, -0.26, 0.39, -0.39, 0.52, -0.52]
 
+/**
+ * Blocks a sprint-hop must not lift the head into. Walking never reaches this
+ * airspace, so the planner has no opinion about it — but a hop puts the head
+ * three blocks above the node, and finding a floating water block up there
+ * costs the crossing (swim drag, and the breath clock starts) while finding
+ * lava costs the bot.
+ */
+const OVERHEAD_HAZARDS = new Set([
+  'water', 'flowing_water', 'bubble_column', 'lava', 'flowing_lava'
+])
+
 export class PhysicsSim {
   private readonly bot: Bot
   private readonly world: { getBlock: (pos: Vec3) => unknown }
@@ -171,15 +182,77 @@ export class PhysicsSim {
   // ~18 ticks airborne and then run in to the node center — at 20 the sim
   // budget expired mid-flight and legal deep drops were never attempted.
   canSprintJump (path: Array<{ x: number, y: number, z: number }>, jumpAfter = 0): boolean {
+    if (!this.takeoffReady(path[0])) return false
     const reached = this.getReached(path)
     const state = this.simulateUntil(reached, this.getController(path[0], true, true, jumpAfter), 45)
-    return reached(state)
+    return reached(state) && this.landsThere(path[0], state, true)
   }
 
   canWalkJump (path: Array<{ x: number, y: number, z: number }>, jumpAfter = 0): boolean {
+    if (!this.takeoffReady(path[0])) return false
     const reached = this.getReached(path)
     const state = this.simulateUntil(reached, this.getController(path[0], true, false, jumpAfter), 45)
-    return reached(state)
+    return reached(state) && this.landsThere(path[0], state, false)
+  }
+
+  /**
+   * A parkour take-off is committed to from the GROUND, never mid-air.
+   *
+   * Asked while the bot is still falling out of the previous jump, the
+   * rollout has to guess the speed it will land with — and a marginal jump is
+   * decided entirely by that number. On the arena's basic1 the plan ends with
+   * a 5-block drop-jump immediately followed by a 4-block flat one across a
+   * chasm: authorised in the air, the second take-off happened with whatever
+   * speed the landing happened to leave, made it about one run in three, and
+   * fell 40 blocks the rest of the time — on both gaits, so it was the timing
+   * and not the hop.
+   *
+   * Nothing is lost by waiting: a jump can only start from the ground anyway,
+   * and the executor re-decides every tick, so the same rollout runs again on
+   * the landing tick with the speed it actually has. Meanwhile the in-flight
+   * branch keeps forward held, so the current jump is still flown out.
+   */
+  private takeoffReady (node: { x: number, y: number, z: number, parkour?: boolean }): boolean {
+    if (node.parkour !== true) return true
+    return (this.bot.entity as { onGround?: boolean }).onGround === true
+  }
+
+  /**
+   * Did the jump ARRIVE, or merely pass through?
+   *
+   * `getReached` is upstream's box: |dx|,|dz| <= 0.35 and |dy| < 1, with no
+   * requirement to be standing on anything. That is fine for a walk, where
+   * satisfying the box means being there — but a jump can satisfy it in
+   * mid-air on the way past, and over a gap "on the way past" means on the
+   * way down. On the arena's basic1 the plan ends with a 5-block drop-jump
+   * followed immediately by a 4-block flat jump across a chasm; the take-off
+   * was authorised by a box the bot clipped while falling, and it fell 40
+   * blocks to its death having "reached" its node.
+   *
+   * So a PARKOUR node has to be landed on: the rollout carries on from the
+   * moment it was satisfied, controls as the executor would hold them, and
+   * the bot has to be on the ground near the node within a jump's worth of
+   * ticks. Walking nodes keep upstream's box exactly — nothing about a walk
+   * is transient.
+   */
+  private landsThere (
+    node: { x: number, y: number, z: number, parkour?: boolean },
+    state: PlayerState,
+    sprint: boolean
+  ): boolean {
+    if (node.parkour !== true) return true
+    if (state.onGround === true) return true
+    const settled = this.simulateUntil(s => s.onGround === true, (s: PlayerState) => {
+      const dx = node.x - s.pos.x
+      const dz = node.z - s.pos.z
+      s.yaw = Math.atan2(-dx, -dz)
+      s.control.forward = true
+      s.control.jump = false
+      s.control.sprint = sprint
+    }, 12, state)
+    return settled.onGround === true &&
+      Math.hypot(node.x - settled.pos.x, node.z - settled.pos.z) <= 1 &&
+      Math.abs(node.y - settled.pos.y) < 1
   }
 
   /**
@@ -211,36 +284,118 @@ export class PhysicsSim {
    * decision can be acted on), so the cost is one pair of short rollouts per
    * take-off, not per tick.
    */
-  sprintHopBetter (path: Array<{ x: number, y: number, z: number }>, horizon = 16): boolean {
-    // Level ground only, and only where the planner is walking rather than
-    // jumping. This is a cheap precondition, but it is also the honest scope
-    // of the gain: the 25% is what a sprint-hop buys on a plain. On anything
-    // stepped, the arc is doing the planner's job for it — and it is exactly
-    // there that a hop can leave a ledge that a sprint would have stopped at.
+  sprintHopBetter (
+    path: Array<{ x: number, y: number, z: number }>,
+    lowCeilingHop = false,
+    horizon = 16
+  ): boolean {
+    // The whole horizon has to be backed by real path. A hop covers ~5.6
+    // blocks before it lands, so with less than that ahead the rollout scores
+    // a flight off the end of the plan — and near the goal that is an
+    // overshoot of the goal itself. On the arena's basic1 the last few nodes
+    // sit on the far side of a chasm; there is nothing to hop toward there.
+    const look = Math.min(6, path.length)
+    if (path.length < 6) return false
+
+    // Ground that is level or falling away, and only where the planner is
+    // walking rather than jumping. A rise is the planner's business — the
+    // jump gates own step-ups, and a hop into one lands on the riser's face.
+    // Descents are allowed: a hop downhill covers more ground per tick than a
+    // sprint and lands lower, which is where it was going anyway.
     const y0 = this.bot.entity.position.y
-    const look = Math.min(3, path.length)
+    let floor = y0
     for (let i = 0; i < look; i++) {
       const n = path[i] as { y: number, parkour?: boolean }
-      if (n.parkour === true || Math.abs(n.y - y0) > 0.1) return false
+      if (n.parkour === true || n.y > y0 + 0.1) return false
+      floor = Math.min(floor, n.y)
+    }
+
+    // Nothing to swim into or burn in overhead.
+    //
+    // A hop lifts the feet 1.25, so the head sweeps up to about three blocks
+    // above the node level — airspace the planner never looks at, because
+    // walking never goes there. A floating water block in it turns a sprint
+    // into a swim and starts the breath clock; lava in it is simply death.
+    // The gait must not be the thing that finds them.
+    //
+    // A solid ceiling up there is NOT a reason to stay down. The bonked arc
+    // is shorter, and with the press-on-landing cadence a low roof is the
+    // FASTEST ground there is: measured on flat stone, under a 2-block roof,
+    // 9.68 blocks/s against 5.59 sprinting and 7.05 hopping under open sky.
+    // What jams is the roof DROPPING mid-arc — the body is already up at 1.25
+    // when the low section arrives and stops dead against its side instead of
+    // bonking cleanly off its underside — so a take-off is only taken when
+    // nothing lower than the roof it is already under lies within the arc.
+    //
+    // Capped at 4, because that is as high as the hop can reach: the peak
+    // puts the head 3.05 above the take-off, so any roof at 4 or above does
+    // not constrain it at all and a "drop" from 5 to 4 is not a drop. Without
+    // the cap, open sky here plus any overhang ahead refuses the gait for the
+    // rest of the route.
+    const roofHere = Math.min(4, this.ceilingAbove(
+      Math.floor(this.bot.entity.position.x), Math.floor(y0 + 0.001), Math.floor(this.bot.entity.position.z)))
+    // How far the BODY is above bonking height, and therefore how far ahead a
+    // lower roof still matters, is set by the roof this take-off is under: a
+    // free arc is airborne ~12 ticks and covers ~4 blocks, a 2-high bonk
+    // lands in ~5 and covers under one. Scanning the free-arc distance from
+    // under a low roof is what makes a bot refuse to enter a tunnel at all —
+    // in a mostly-2-high passage every 3-high pocket has a 2-high section
+    // within six nodes, so the gait switches off for the whole passage. The
+    // scan is the arc's own footprint, so the bot sprints the last step into
+    // a low section and hops the moment it is under it.
+    const reach = lowCeilingHop ? (roofHere >= 3 ? 4 : 1) : look
+    for (let i = 0; i < look; i++) {
+      const n = path[i]
+      const nx = Math.floor(n.x)
+      const ny = Math.floor(n.y + 0.001)
+      const nz = Math.floor(n.z)
+      for (let dy = 2; dy <= 3; dy++) {
+        const b = this.bot.blockAt(new Vec3(nx, ny + dy, nz), false) as { name?: string } | null
+        if (b === null) return false // unloaded: assume the worst
+        if (OVERHEAD_HAZARDS.has(b.name ?? '')) return false
+      }
+      if (i < reach && this.ceilingAbove(nx, ny, nz) < roofHere) return false
     }
 
     const run = this.followPath(path, false, horizon)
     const hop = this.followPath(path, true, horizon)
     if (hop === null || run === null) return false
-    // Absolute, not relative. Comparing the two gaits' heights was not enough:
-    // on the arena's climb1 tower BOTH of them fell off a 1-wide pillar, the
-    // hop was still "no worse", and the bot flew off the side of a 46-block
-    // climb it had been walking correctly (91.8 blocks travelled, y 141 to
-    // 102, 15 damage). A hop is only allowed to keep its feet at the level it
-    // started on and put them back down there.
-    if (hop.minY < y0 - HOP_MAX_DIP || !hop.endedOnGround) return false
+    // Absolute, and measured against the PATH's own floor rather than the two
+    // gaits' relative heights. Comparing the gaits was not enough: on the
+    // arena's climb1 tower both of them fell off a 1-wide pillar, so the hop
+    // was "no worse", and the bot flew off the side of a 46-block climb it
+    // had been walking correctly (91.8 blocks travelled, y 141 down to 102,
+    // 15 damage). A hop may follow the path down; it may not leave it.
+    if (hop.minY < floor - HOP_MAX_DIP || !hop.endedOnGround) return false
     return hop.score > run.score + HOP_MARGIN
+  }
+
+  /**
+   * Blocks of headroom over a standing body at (x, y, z): the offset of the
+   * first non-empty cell at or above the head, capped. Cells 0 and 1 are the
+   * body itself and are clear by construction on any node worth walking to.
+   * An unloaded read is reported as low, not high — the hop guard reads this
+   * to decide whether the roof drops ahead, and guessing high is the answer
+   * that jams.
+   */
+  private ceilingAbove (x: number, y: number, z: number, cap = 4): number {
+    for (let dy = 2; dy <= cap; dy++) {
+      const b = this.bot.blockAt(new Vec3(x, y + dy, z), false) as { boundingBox?: string } | null
+      if (b === null || b.boundingBox !== 'empty') return dy
+    }
+    return cap + 1
   }
 
   /**
    * Drive `path` for `horizon` ticks with one gait and score how far along it
    * got. Nodes are consumed the way the executor consumes them, with the
    * apex tolerance a hop needs (see HOP_ARRIVE_DY in plugin.ts).
+   *
+   * The hop is driven with the executor's cadence — jump PRESSED on grounded
+   * ticks only, never held — because the two are not the same gait under a
+   * low ceiling: a held key cannot re-fire for 10 ticks and a bonked arc
+   * lands in 5. Scoring a held hop and then running a pressed one would price
+   * the wrong thing by half.
    */
   private followPath (
     path: Array<{ x: number, y: number, z: number }>,
@@ -257,7 +412,7 @@ export class PhysicsSim {
       const target = path[Math.min(i, path.length - 1)]
       state.yaw = Math.atan2(-(target.x - state.pos.x), -(target.z - state.pos.z))
       state.control.forward = true
-      state.control.jump = jump
+      state.control.jump = jump && state.onGround === true
       state.control.sprint = true
       simulatePlayer.call(this.bot.physics, state, this.world)
       if (state.isInLava) return null

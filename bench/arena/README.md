@@ -179,6 +179,27 @@ the bundle's `NOTES.md` path appended, e.g. `--debug-cmd "claude -p"`. It is
 off by default, and the racers keep running while it works — a fix still needs
 `npm run build` and a re-race before it is in play.
 
+### Asking the server directly
+
+A race says a route was lost. `arena:controls` says why: it drops one bot on
+an exact position, holds a fixed set of controls, and reports how far it got
+and how many times the server silently teleported it back.
+
+```bash
+npm run arena:controls -- --at 46.5,141,97.7 --face 46,142,98 \
+  --controls walk,sprint --sweep 0,0.05,0.15,0.2,0.3
+```
+
+`--sweep` backs the start off along the approach line, which is how a single
+question ("how much clearance does this step need?") becomes a table.
+`--nudge=false` turns off the 1.21.x hitbox fix for the run — that comparison
+is what turned "the server refuses positions prismarine-physics produces"
+from a law of nature into a one-line physics bug.
+
+⚠ After a livelock the connection stays in a sticky refusing state, so the
+probe parks in spectator and waits for a quiet window between cases. Without
+that only the first case in a batch is trustworthy — it cost an hour once.
+
 ### Route history
 
 Every flagged run also appends to `history.json`, next to the route book:

@@ -17,7 +17,7 @@ import { createPathfinder } from '../src/plugin.js'
 import { GoalBlock } from '../src/goals.js'
 import { Movements } from '../src/movements.js'
 import {
-  VoxelWorld, STONE, mcData, Block, TEST_VERSION, makeFakeBot, makeOurMovements
+  VoxelWorld, STONE, AIR, WATER, LAVA, mcData, Block, TEST_VERSION, makeFakeBot, makeOurMovements
 } from './helpers/voxelWorld.js'
 import { makeDriveableBot, makeFakePhysics } from './helpers/fakeBot.js'
 import type { DriveableBot } from './helpers/fakeBot.js'
@@ -352,5 +352,221 @@ describe('executor: rollout honesty after a lagback', () => {
     world.fill(4, 0, 0, 4, 1, 0, STONE)
     const sim = new PhysicsSim(physicsBot(world, new Vec3(0.5, 1, 0.5)) as never)
     expect(sim.canSprintJump([{ x: 4.5, y: 2, z: 0.5 }])).to.equal(false)
+  })
+})
+
+describe('executor: the sprint-hop gait', () => {
+  /**
+   * Holding jump while sprinting is the fastest way across open ground —
+   * measured on the arena's own server at 6.97 blocks/s against 5.56 — but it
+   * is also the easiest way to leave the ground somewhere there is nothing to
+   * land on. The gait is therefore never taken on faith: both gaits are driven
+   * down the SAME path for the same horizon and the faster one wins, provided
+   * it keeps its feet.
+   */
+  function plain (mut?: (w: VoxelWorld) => void, moving = true): { sim: PhysicsSim, path: Array<{ x: number, y: number, z: number }> } {
+    const w = new VoxelWorld({ x0: -6, y0: -4, z0: -6, x1: 6, y1: 12, z1: 40 })
+    w.fill(-6, 0, -6, 6, 0, 40, STONE)
+    mut?.(w)
+    const bot = physicsBot(w, new Vec3(0.5, 1, 0.5)) as { entity: { velocity: Vec3 } }
+    // At sprint speed, which is when the executor actually asks: the decision
+    // is taken on a grounded tick mid-run, not from a standstill.
+    if (moving) bot.entity.velocity = new Vec3(0, 0, 0.28)
+    const sim = new PhysicsSim(bot as never)
+    const path = []
+    for (let z = 1; z <= 12; z++) path.push({ x: 0.5, y: 1, z: z + 0.5 })
+    return { sim, path }
+  }
+
+  it('takes the hop across open flat ground', () => {
+    const { sim, path } = plain()
+    expect(sim.sprintHopBetter(path)).to.equal(true)
+  })
+
+  it('declines from a standstill — there is no boost to keep yet', () => {
+    // Jumping before you have speed is slower than running up to it, which is
+    // why players sprint first and start hopping once they are moving. The
+    // comparison finds that on its own; nothing hard-codes it.
+    const { sim, path } = plain(undefined, false)
+    expect(sim.sprintHopBetter(path)).to.equal(false)
+  })
+
+  it('takes it under a 2-high roof too — the bonked arc is still faster', () => {
+    // Bonking cuts the airtime but keeps the take-off boost: 6.47 blocks/s
+    // against 5.56 sprinting, measured. A ceiling is not a reason to walk.
+    const { sim, path } = plain(w => w.fill(-6, 3, -6, 6, 3, 40, STONE))
+    expect(sim.sprintHopBetter(path)).to.equal(true)
+  })
+
+  it('refuses when the roof DROPS ahead — that is the one that jams', () => {
+    // 3-high here (ceiling at y = 4), 2-high from z = 4 on (ceiling at y = 3).
+    // Taking off under the high part puts the body at 1.25 exactly as the low
+    // part arrives, and it stops dead in the air against it instead of
+    // bonking cleanly off it.
+    const { sim, path } = plain(w => {
+      w.fill(-6, 4, -6, 6, 4, 3, STONE) // 3-high up to z = 3
+      w.fill(-6, 3, 4, 6, 3, 40, STONE) // 2-high from z = 4 on
+    })
+    expect(sim.sprintHopBetter(path)).to.equal(false)
+  })
+
+  it('refuses over water or lava overhead — the planner never looks up there', () => {
+    for (const hazard of [WATER, LAVA]) {
+      const { sim, path } = plain(w => { w.set(0, 3, 5, hazard) })
+      expect(sim.sprintHopBetter(path)).to.equal(false)
+    }
+  })
+
+  it('refuses when the hop would leave the ground the path stays on', () => {
+    // A one-block-wide causeway with void either side of z = 6: sprinting
+    // stops at the edge, hopping sails off it.
+    const { sim, path } = plain(w => {
+      for (let z = 6; z <= 40; z++) for (let x = -6; x <= 6; x++) w.set(x, 0, z, AIR)
+    })
+    expect(sim.sprintHopBetter(path)).to.equal(false)
+  })
+
+  it('refuses on rising ground and on the last stretch', () => {
+    const rising = plain()
+    for (const [i, n] of rising.path.entries()) n.y = 1 + i * 0.5
+    expect(rising.sim.sprintHopBetter(rising.path)).to.equal(false)
+
+    const { sim, path } = plain()
+    expect(sim.sprintHopBetter(path.slice(0, 2))).to.equal(false)
+  })
+
+  /**
+   * Nothing in the executor knows what ice is, or what a potion is. Every
+   * gate rolls the LIVE PlayerState forward, so block slipperiness and the
+   * server's movementSpeed attribute are already in the answer — and the two
+   * point opposite ways, which is why this is worth pinning:
+   *
+   *   surface       walk   sprint   sprint-hop
+   *   stone         4.30   5.60     7.07
+   *   ice           4.10   5.33     9.11   ← hop 29% up, sprint DOWN
+   *   blue ice      4.31   5.60     9.19
+   *   slime         3.20   4.16     7.89
+   *   speed II      6.03   7.83     7.58   ← sprint now beats the hop
+   */
+  function surfaced (block: string, mut?: (bot: Record<string, unknown>) => void): {
+    sim: PhysicsSim, path: Array<{ x: number, y: number, z: number }>
+  } {
+    const w = new VoxelWorld({ x0: -6, y0: -4, z0: -6, x1: 6, y1: 12, z1: 40 })
+    w.fill(-6, 0, -6, 6, 0, 40, mcData.blocksByName[block].minStateId as number)
+    const bot = physicsBot(w, new Vec3(0.5, 1, 0.5)) as { entity: { velocity: Vec3 } }
+    bot.entity.velocity = new Vec3(0, 0, 0.28)
+    mut?.(bot as unknown as Record<string, unknown>)
+    const path = []
+    for (let z = 1; z <= 12; z++) path.push({ x: 0.5, y: 1, z: z + 0.5 })
+    return { sim: new PhysicsSim(bot as never), path }
+  }
+
+  it('takes the hop on ice, where it is worth far more than on stone', () => {
+    for (const ice of ['ice', 'packed_ice', 'blue_ice']) {
+      expect(surfaced(ice).sim.sprintHopBetter(surfaced(ice).path), ice).to.equal(true)
+    }
+  })
+
+  it('declines the hop under Speed II, where plain sprinting is faster', () => {
+    // Vanilla delivers a speed potion as a movementSpeed attribute modifier,
+    // which prismarine-physics reads — so the comparison simply comes out the
+    // other way and the bot keeps its feet. Nothing tests for a potion.
+    const { sim, path } = surfaced('stone', bot => {
+      const phys = (bot as { physics: { movementSpeedAttribute: string } }).physics
+      ;(bot as { entity: { attributes: Record<string, unknown> } }).entity.attributes = {
+        [phys.movementSpeedAttribute]: {
+          value: 0.1,
+          modifiers: [{ uuid: '00000000-0000-0000-0000-0000000000ff', amount: 0.4, operation: 2 }]
+        }
+      }
+    })
+    expect(sim.sprintHopBetter(path)).to.equal(false)
+  })
+
+  it('scores the hop with the cadence the executor actually drives', () => {
+    // A held jump key cannot re-fire for 10 ticks; a pressed one re-fires the
+    // tick the body lands. Under a 2-high roof the arc lands in 5, so the two
+    // are different gaits — 6.50 blocks/s against 9.68 — and scoring the held
+    // one while running the pressed one would price the wrong thing by half.
+    // The check is that the rollout REALLY re-jumps: over 16 ticks under a
+    // roof, a held gait fits one take-off and a pressed gait fits three.
+    const { sim, path } = plain(w => w.fill(-6, 3, -6, 6, 3, 40, STONE))
+    const follow = (sim as unknown as {
+      followPath: (p: typeof path, jump: boolean, horizon: number) => { score: number } | null
+    }).followPath.bind(sim)
+    const hop = follow(path, true, 16)
+    const run = follow(path, false, 16)
+    expect(hop).to.not.equal(null)
+    expect(run).to.not.equal(null)
+    // Three nodes of lead over the same 16 ticks is the bonk cadence working;
+    // a held key manages about one.
+    expect((hop as { score: number }).score).to.be.greaterThan((run as { score: number }).score + 2)
+  })
+})
+
+describe('executor: the low-ceiling gait (allowLowCeilingHop)', () => {
+  /**
+   * Off, a ceiling that drops anywhere in the comparison horizon vetoes the
+   * take-off — safe, and also enough to switch the gait off for a whole
+   * passage, because in a mostly-2-high tunnel every 3-high pocket has a low
+   * section within six nodes. On, the veto spans the arc's own footprint
+   * instead: high ground next to a low roof still refuses (that is the one
+   * that jams), but standing UNDER the low roof hops.
+   */
+  function tunnel (
+    mut: (w: VoxelWorld) => void,
+    at = new Vec3(0.5, 1, 0.5)
+  ): { sim: PhysicsSim, path: Array<{ x: number, y: number, z: number }> } {
+    const w = new VoxelWorld({ x0: -6, y0: -4, z0: -6, x1: 6, y1: 12, z1: 40 })
+    w.fill(-6, 0, -6, 6, 0, 40, STONE)
+    mut(w)
+    const bot = physicsBot(w, at) as { entity: { velocity: Vec3 } }
+    bot.entity.velocity = new Vec3(0, 0, 0.28)
+    const sim = new PhysicsSim(bot as never)
+    const path = []
+    for (let z = Math.floor(at.z) + 1; z <= Math.floor(at.z) + 12; z++) path.push({ x: 0.5, y: 1, z: z + 0.5 })
+    return { sim, path }
+  }
+
+  /** 2-high everywhere except a 3-high pocket over z = 0..3. */
+  const pocket = (w: VoxelWorld): void => {
+    w.fill(-6, 3, -6, 6, 3, 40, STONE)
+    for (let z = 0; z <= 3; z++) for (let x = -6; x <= 6; x++) w.set(x, 3, z, AIR)
+    for (let z = 0; z <= 3; z++) for (let x = -6; x <= 6; x++) w.set(x, 4, z, STONE)
+  }
+
+  it('still refuses to take off from high ground into a low roof', () => {
+    // Standing IN the pocket with the 2-high section one node away: the arc
+    // would be at 1.25 exactly as the low part arrives. This is the case the
+    // user called "slamming its head", and it is refused either way.
+    const { sim, path } = tunnel(pocket, new Vec3(0.5, 1, 2.5))
+    expect(sim.sprintHopBetter(path, true)).to.equal(false)
+    expect(sim.sprintHopBetter(path, false)).to.equal(false)
+  })
+
+  it('hops once it is under the low roof, where the plain gait gives up', () => {
+    // One node further on, under the 2-high section: the arc bonks at 0.2 and
+    // meets nothing lower than what it is already under. The 6-node veto is
+    // still looking at the pocket behind and the tunnel ahead and refusing.
+    const { sim, path } = tunnel(pocket, new Vec3(0.5, 1, 5.5))
+    expect(sim.sprintHopBetter(path, true)).to.equal(true)
+  })
+
+  it('leaves open ground exactly as it was', () => {
+    const w = new VoxelWorld({ x0: -6, y0: -4, z0: -6, x1: 6, y1: 12, z1: 40 })
+    w.fill(-6, 0, -6, 6, 0, 40, STONE)
+    const bot = physicsBot(w, new Vec3(0.5, 1, 0.5)) as { entity: { velocity: Vec3 } }
+    bot.entity.velocity = new Vec3(0, 0, 0.28)
+    const sim = new PhysicsSim(bot as never)
+    const path = []
+    for (let z = 1; z <= 12; z++) path.push({ x: 0.5, y: 1, z: z + 0.5 })
+    expect(sim.sprintHopBetter(path, true)).to.equal(sim.sprintHopBetter(path, false))
+  })
+
+  it('never overrides the overhead hazard scan', () => {
+    for (const hazard of [WATER, LAVA]) {
+      const { sim, path } = tunnel(w => { w.set(0, 3, 5, hazard) })
+      expect(sim.sprintHopBetter(path, true)).to.equal(false)
+    }
   })
 })

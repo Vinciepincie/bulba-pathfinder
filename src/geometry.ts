@@ -143,6 +143,53 @@ export function canStandAt (bot: Bot, pos: Vec3): boolean {
   return isStandable(bot, pos.floored())
 }
 
+/**
+ * Could a walking body go from (x0,z0) to (x1,z1) in a STRAIGHT line at floor
+ * level `y`, with something under its feet the whole way?
+ *
+ * This is the corner cut's safety check. The planner routes cell centre to
+ * cell centre, so a run that drifts a few degrees off a cardinal comes back as
+ * a zig-zag of alternating steps, and a follower that visits every centre
+ * walks every zig. Skipping them is only sound if the line the body would
+ * actually sweep is checked, which is what this does: the full body box at
+ * samples along the segment, plus a support probe half a block down.
+ *
+ * The support probe is the same box dropped by 0.55. Anything it newly hits is
+ * below the feet by construction — a head-height obstruction would already
+ * have failed the first test — so "no new contact" means "no floor", which is
+ * how a gap, a lava pool or an open ledge is refused: none of them have
+ * anything to stand on. `avoid` catches what geometry cannot see, the blocks
+ * the profile says not to walk on (magma, cactus, fire).
+ */
+export function walkableLine (
+  bot: Bot,
+  x0: number, z0: number,
+  x1: number, z1: number,
+  y: number,
+  avoid: Set<number> | null = null,
+  step = 0.25
+): boolean {
+  const dx = x1 - x0
+  const dz = z1 - z0
+  const len = Math.hypot(dx, dz)
+  if (len < 1e-6) return true
+  const n = Math.ceil(len / step)
+  for (let i = 1; i <= n; i++) {
+    const t = i / n
+    const x = x0 + dx * t
+    const z = z0 + dz * t
+    if (playerCollides(bot, x, y, z)) return false
+    if (!playerCollides(bot, x, y - 0.55, z)) return false
+    if (avoid !== null && avoid.size > 0) {
+      const under = bot.blockAt(new Vec3(Math.floor(x), Math.floor(y) - 1, Math.floor(z))) as { type?: number } | null
+      if (under !== null && under.type !== undefined && avoid.has(under.type)) return false
+      const at = bot.blockAt(new Vec3(Math.floor(x), Math.floor(y), Math.floor(z))) as { type?: number } | null
+      if (at !== null && at.type !== undefined && avoid.has(at.type)) return false
+    }
+  }
+  return true
+}
+
 /** Nearest standable cell to the bot, nearest-first. */
 export function findEscape (bot: Bot, radius = 4): Vec3 | null {
   const origin = bot.entity.position.floored()

@@ -175,6 +175,16 @@ function buildEntry (a: number, b: number): ParkourExtEntry {
     // out BELOW the octile heuristic by up to 0.035 and make it inadmissible.
     // Floor them at the heuristic rather than lowering MAX_OFFSET_MAJOR,
     // which would delete real reach (and the entries envelope.test.ts pins).
+    //
+    // NOT DONE, but the obvious next question: distance is a poor proxy for
+    // TIME on a SHORT jump. The arc takes ~11 ticks whatever it covers, and
+    // 11 ticks of sprinting covers 3.1 blocks (3.8 sprint-hopping), so a
+    // 2-block hop priced at 2.5 reads cheaper than the three walking steps
+    // that would go round it and is in fact slower. Flooring the cost at ~3.1
+    // would stop A* buying those — it stays admissible, and a jump over a
+    // real gap is unaffected because it has no alternative to lose to. It is
+    // left alone because it re-prices four table entries and moves plans, and
+    // this route book gave no evidence either way: measure before landing it.
     cost: Math.max(dist + 0.5, octile(a, b))
   }
 }

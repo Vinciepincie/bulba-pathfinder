@@ -35,8 +35,13 @@ carries a running jump ~5.7 blocks). The executor's jump simulation budget is
 ## The generated table (`src/parkourTable.ts`)
 
 Offsets are enumerated, not listed: every integer landing (a, b) with
-2 ≤ distance ≤ 5.66 (the cap keeps cost = dist + 0.5 at or above the octile
-heuristic, and matches the deepest default-profile drop). For each offset the
+2 ≤ distance ≤ 5.66 (matching the deepest default-profile drop). The cost is
+`max(dist + 0.5, octile(a, b))`: euclidean plus a tie-breaking pad, floored at
+the solver's own heuristic. The pad alone is not quite enough at the
+enumeration limit — the octile-minus-euclidean deficit peaks at ~0.082 × major,
+so (2,6), (3,6), (6,2) and (6,3) came out **below** the heuristic by up to
+0.035 and made A* inadmissible. Flooring those four is preferable to lowering
+`MAX_OFFSET_MAJOR`, which would delete real reach. For each offset the
 **swept corridor** is computed by clipping the flight segment against each
 cell rect Minkowski-inflated by the hitbox half-width **minus a 0.15
 corner-nick tolerance**: cells the center line crosses are *line* cells
@@ -122,6 +127,32 @@ reach — 2-high tunnel gap-hops and drops off ledges under an overhang, like
 real players. The executor needs no change: it holds jump and the per-tick
 rollout simulates the bonk against the real world. Neos and momentum chains
 remain out of scope — the executor only holds jump+sprint+forward.
+
+## What the executor adds on top
+
+The table decides what is *reachable*; getting there is the executor's job,
+and on real terrain a planned jump can still refuse to happen. Three
+behaviours cover that, in the order they are tried, and all three exist
+because a route on 2b2t spawn stopped on them:
+
+1. **Turn to make it.** The take-off heading is searched over ±30° (0 first,
+   cached per node) for one that lands the jump — the idea behind
+   [ParkourCalculatorMod](https://github.com/Leg0shii/ParkourCalculatorMod)'s
+   angle solver. A heading that works costs nothing; ground given up has to
+   be walked again, so this comes first. Bounded: if the body has not left the
+   ground within a jump's worth of ticks, the angle was not the problem.
+2. **Go round the open corner.** A diagonal is priced on the cheaper of its
+   two corners, which is only honest if the walker goes *around* that corner;
+   the open one is inserted as a waypoint. Only once wedged on the node —
+   doing it pre-emptively turns a straight climb into a staircase of 1-block
+   sidesteps (measured: +14 blocks and +3.5 s on one route).
+3. **Make room.** A step back or sideways, each simulated first so it cannot
+   become the fall it was avoiding, ONE tick at a time. A fixed four-tick
+   back-off overshoots by an order of magnitude — the clearance a step-up
+   actually needs is ~0.01 blocks once the hitbox-precision fix is in
+   (README) — and shows up as a visible wobble before every jump.
+
+None of these run while the bot is making progress.
 
 ## Efficiency
 

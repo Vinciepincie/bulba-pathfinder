@@ -41,7 +41,8 @@
     "arena:race": "tsx bench/arena/race.ts",
     "arena:probe": "tsx bench/arena/probe.ts",
     "arena:edit": "tsx bench/arena/race.ts --edit",
-    "build:wasm": "node build-wasm.mjs"
+    "build:wasm": "node build-wasm.mjs",
+    "arena:controls": "tsx bench/arena/controlProbe.ts"
   },
   "keywords": [
     "mineflayer",

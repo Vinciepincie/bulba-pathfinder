@@ -269,8 +269,8 @@ export interface PhysicsLike {
   canNudge (control: { forward?: boolean, back?: boolean, left?: boolean, right?: boolean, jump?: boolean, sneak?: boolean }, ticks?: number): boolean
   /** A take-off heading offset that lands this jump, or null. */
   bestHeading (path: XYZ[], jump: boolean, sprint: boolean): number | null
-  /** Does holding jump while sprinting get further down this path, safely? */
-  sprintHopBetter (path: XYZ[], horizon?: number): boolean
+  /** Does hopping while sprinting get further down this path, safely? */
+  sprintHopBetter (path: XYZ[], lowCeilingHop?: boolean, horizon?: number): boolean
 }
 
 export type { Vec3 }
