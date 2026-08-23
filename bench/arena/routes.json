@@ -135,6 +135,22 @@
         205
       ],
       "notes": "defined by in-world !PF signs"
+    },
+    {
+      "id": "tunnel1",
+      "name": "tunnel1",
+      "scenario": "mixed",
+      "start": [
+        -101,
+        115,
+        153
+      ],
+      "end": [
+        -136,
+        113,
+        128
+      ],
+      "notes": "defined by in-world !PF signs"
     }
   ]
 }

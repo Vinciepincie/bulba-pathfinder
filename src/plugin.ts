@@ -143,6 +143,15 @@ const CUT_LOOKAHEAD = 5
 const CUT_RETIRE = 0.9
 
 /**
+ * How far off the new line a skipped node may sit for the cut to be TAKEN.
+ * Deliberately tighter than CUT_RETIRE: the body does not walk the ideal
+ * chord (turn radius, air control mid-hop, server rounding), so selecting all
+ * the way out to the retirement disc leaves nodes that miss it in practice —
+ * and a node that misses it is stranded for the rest of the path.
+ */
+const CUT_SELECT = 0.55
+
+/**
  * How far ABOVE a parkour node the body may be and still retire it in the
  * air. Roughly one tick of fall: at that height the landing is committed, so
  * holding the node buys nothing and costs the momentum the next move wants.
@@ -1159,6 +1168,15 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       movements.assertSupported()
       stateMovements = movements
       snapshotStale = true
+      // Build this profile's block table NOW, on the same reasoning as
+      // SolverWorkerHost.prewarm: it is a fixed 47 ms pass over the whole
+      // block registry, it is a pure function of (version, profile), and left
+      // alone it is paid inside the FIRST goal — the one tick where the bot is
+      // being asked to hurry. setMovements is where a bot is still idle. The
+      // result is cached by profile fingerprint, so this is one-time per
+      // profile and a no-op on every later call; failures are not fatal, the
+      // solve would rebuild it anyway.
+      try { getLut(bot, movements) } catch { /* the solve path will retry */ }
       resetPath('movements_updated')
     }
 
@@ -1657,10 +1675,18 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         // tick a jump across the route book (basic2 +0.8 s, 15 jumps). So the
         // hold is spent on the case it was written for: a shelf with a hole
         // after it.
+        // "Supported" has to mean what the extended repertoire means by it. A
+        // gap-jump that CATCHES a ladder or a vine ends with the body neither
+        // on the ground nor in water, so a hold that only accepts those two
+        // can never release — the node sits there until the futility timer
+        // gives up on a jump that in fact worked perfectly.
         if ((nextPoint as { parkour?: boolean }).parkour === true &&
             p.y - nextPoint.y > PARKOUR_LAND_DY) {
           const ent = bot.entity as { onGround?: boolean, isInWater?: boolean }
-          if (ent.onGround !== true && ent.isInWater !== true && holeBeyond(nextPoint, p)) break
+          const feet = bot.blockAt(p) as BlockLike | null
+          const caught = ent.onGround === true || ent.isInWater === true ||
+            (feet !== null && (feet.type === ladderId || feet.type === vineId))
+          if (!caught && holeBeyond(nextPoint, p)) break
         }
         if (airborneHold) break
         // Inside the box, or simply GONE BY. The corner cut does not steer
@@ -1669,20 +1695,37 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         // place it turns the bot round to collect it, and the bot then cuts
         // forward again — the vibrating-on-flat-ground shuffle.
         //
-        // "Passed" is measured against the path's own next leg, not against
-        // the body's velocity: a body being nudged backwards by the wedge
-        // recovery has velocity pointing away from a node it has NOT passed,
-        // and would retire it. Projecting onto the leg cannot be fooled that
-        // way — it only reads true once the body is genuinely on the far side
-        // of the node. Never the last node: the goal is always arrived at.
+        // "Passed" is measured along the CHORD the body is actually walking —
+        // the line to the node the cut committed to — and only while a cut is
+        // live. Two rejected alternatives, both of which strand nodes:
+        //
+        //   - the body's velocity: the wedge recovery drives BACKWARDS, which
+        //     reads as "everything ahead of me is behind me".
+        //   - the path's own next leg (path[0] -> path[1]): where that leg
+        //     turns away from the chord, the window in which a node is both
+        //     ahead-of-the-leg and inside the retirement disc can be empty. At
+        //     a 45-degree zig with the node 0.64 off the chord there is no
+        //     such tick at all, and at 0.6 off the window is 0.07 blocks —
+        //     a quarter of a tick at sprint speed. Missing it strands the node
+        //     permanently, because path.shift() is the only consumption site,
+        //     and a stranded node is the bot shuffling on one spot until the
+        //     futility timer replans. That is the glitch this whole feature
+        //     was reported for.
+        //
+        // Projecting onto the chord cannot have an empty window: the body
+        // advances along it monotonically, and selection already bounded the
+        // node's distance FROM it to CUT_SELECT, which is inside the
+        // retirement disc with margin to spare. Never the last node: the goal
+        // is always arrived at.
         let passed = false
-        if (stateMovements.allowCornerCut && !swimming && path.length > 1 && Math.abs(dy) < arriveDy &&
+        if (cutTarget !== null && !swimming && path.length > 1 && Math.abs(dy) < arriveDy &&
             (nextPoint as { parkour?: boolean }).parkour !== true &&
             nextPoint.toBreak.length === 0 && nextPoint.toPlace.length === 0) {
-          const leg = path[1]
-          const abx = leg.x - nextPoint.x
-          const abz = leg.z - nextPoint.z
-          passed = ((p.x - nextPoint.x) * abx + (p.z - nextPoint.z) * abz) > 0 &&
+          const cx = cutTarget.x - p.x
+          const cz = cutTarget.z - p.z
+          const clen = Math.hypot(cx, cz)
+          passed = clen > 1e-6 &&
+            (dx * cx + dz * cz) / clen < 0 &&
             Math.hypot(dx, dz) <= CUT_RETIRE
         }
         if (!passed && !(Math.abs(dx) <= 0.35 && Math.abs(dz) <= 0.35 && Math.abs(dy) < arriveDy)) break
@@ -1746,7 +1789,24 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       // something nobody solved for.
       const nodeDx = dx
       const nodeDz = dz
+      // Only where a swept hitbox is the WHOLE story. Exclusion areas and
+      // entity avoidance are cost fields the planner paid to detour around,
+      // and geometry cannot see either — a mob the profile is avoiding leaves
+      // a one-cell detour that the cut would happily straighten right back
+      // through it.
+      //
+      // And never on the approach to a jump. A cut ends with the body lined
+      // up on the CHORD, which is not the line the take-off wants; measured
+      // on the two jump-dense routes, cutting into a jump made both of them
+      // walk further and finish later (simple3 +0.32 s, basic1 +0.37 s) while
+      // the plain-running routes gained half a second each. So the cut owns
+      // the running and the node-by-node follower owns the jumps.
+      let jumpAhead = false
+      for (let k = 0; k < Math.min(CUT_LOOKAHEAD, path.length); k++) {
+        if ((path[k] as { parkour?: boolean }).parkour === true) { jumpAhead = true; break }
+      }
       const mayCut = stateMovements.allowCornerCut && !swimming && path.length > 1 &&
+        !jumpAhead &&
         stateMovements.exclusionAreasStep.length === 0 &&
         (nextPoint as { parkour?: boolean }).parkour !== true &&
         nextPoint.toBreak.length === 0 && nextPoint.toPlace.length === 0 &&
@@ -1755,16 +1815,34 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       const cuttableTo = (n: Move & { parkour?: boolean }, upTo: number): boolean => {
         if (n.parkour === true || n.toBreak.length > 0 || n.toPlace.length > 0) return false
         if (Math.abs(n.y - nextPoint.y) > 0.1) return false
+        // Never steer BACKWARDS. Without this the re-pick can answer with a
+        // node the body has already gone by — the shortest legal chord is the
+        // one behind you — and the bot turns round, collects it, cuts forward
+        // and turns round again.
+        if ((n.x - p.x) * nodeDx + (n.z - p.z) * nodeDz <= 0) return false
         // Only cut a corner whose skipped nodes can still be COLLECTED. They
         // retire by being gone by rather than by being stood on, and that
         // test has a reach; a node further off the new line than that reach
         // is never reached and never retired, so the bot turns round for it.
         // Cutting without this check made every route LONGER and added
         // replans — simple2 went from 105 blocks and 15.7 s to 111 and 19.9.
-        for (let j = 1; j < upTo; j++) {
-          if (pointToSegment(path[j], p, n) > CUT_RETIRE) return false
+        //
+        // j starts at ZERO. path[0] is a skipped node like any other — the
+        // chord runs from the BODY, not from path[0] — and it is the only one
+        // the arrival loop can ever retire, so leaving it unmeasured is the
+        // one omission that strands a node with certainty.
+        //
+        // Selection is bounded tighter than retirement on purpose. Equal
+        // bounds leave no margin for the body deviating from the ideal chord
+        // — turn radius, air control during a hop, server rounding — and the
+        // real offset is routinely larger than the geometric one measured
+        // here.
+        for (let j = 0; j < upTo; j++) {
+          if (pointToSegment(path[j], p, n) > CUT_SELECT) return false
         }
-        return geometry.walkableLine(bot, p.x, p.z, n.x, n.z, nextPoint.y, stateMovements.blocksToAvoid)
+        return geometry.walkableLine(
+          bot, p.x, p.z, n.x, n.z, nextPoint.y, stateMovements.blocksToAvoid,
+          (cx, cy, cz) => stateMovements.getNumEntitiesAt({ x: cx, y: cy, z: cz }, 0, 0, 0))
       }
       if (!mayCut) cutTarget = null
       else {
@@ -1774,11 +1852,21 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         // screen and a waste of momentum. The target is kept until the body
         // reaches it (it retires like any other node) or it stops being
         // legal, and only then is a new one chosen.
-        if (cutTarget !== null) {
+        //
+        // A body in the air keeps the target it took off with, unrevalidated.
+        // Mid-arc the geometry moves under it — a skipped node clamps past
+        // the selection bound as the body draws level with it — so a live
+        // re-pick swings the yaw by up to 180 degrees with only air control
+        // (0.02 per tick) to answer it, and the bot lands off the line. This
+        // is the same reasoning as biasFlight: a line committed to on the
+        // ground is flown on the ground's terms.
+        const airborne = (bot.entity as { onGround?: boolean }).onGround !== true
+        if (cutTarget !== null && !airborne) {
           const at = path.indexOf(cutTarget)
           if (at < 1 || !cuttableTo(cutTarget as Move & { parkour?: boolean }, at)) cutTarget = null
         }
-        if (cutTarget === null) {
+        if (cutTarget !== null && path.indexOf(cutTarget) < 1) cutTarget = null
+        if (cutTarget === null && !airborne) {
           for (let k = 1; k < Math.min(CUT_LOOKAHEAD, path.length); k++) {
             if (!cuttableTo(path[k] as Move & { parkour?: boolean }, k)) break
             cutTarget = path[k]
@@ -1873,8 +1961,11 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       // so 'forward' presses against it. Both vanilla and prismarine-physics
       // ascend climbables via horizontal collision, so without a wall to
       // press the bot would drift off a ladder/vine column.
+      // Measured on the step to path[0]: a cut aimed several nodes on would
+      // never read as the degenerate straight-up case, and the bot would
+      // drift off the column instead of pressing into it.
       let climbing = false
-      if (nextPoint.y > p.y + 0.1 && Math.abs(dx) < 0.2 && Math.abs(dz) < 0.2) {
+      if (nextPoint.y > p.y + 0.1 && Math.abs(nodeDx) < 0.2 && Math.abs(nodeDz) < 0.2) {
         const feet = bot.blockAt(p) as BlockLike | null
         if (feet && (feet.type === ladderId || feet.type === vineId)) {
           const fx = Math.floor(p.x)
@@ -1930,10 +2021,17 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       // Walking steps only. A jump is flown on the heading the physics
       // rollout approved, and re-steering it mid-flight would land the bot
       // somewhere the planner never routed through.
+      //
+      // Judged on the step to path[0], not on the corner cut's steering
+      // target: with a cut live, `hypot(dx, dz)` is several blocks and this
+      // whole block was skipped — heading still aimed diagonally into the
+      // face, which is precisely the 25-corrections state it was written for.
+      // A wall in the way also ENDS the cut: geometry has just contradicted
+      // the swept line the target was chosen on.
       if (!climbing && (nextPoint as { parkour?: boolean }).parkour !== true &&
-          dy <= STEP_UP_MIN && Math.hypot(dx, dz) <= WALK_STEP_REACH) {
-        const sx = Math.sign(dx)
-        const sz = Math.sign(dz)
+          dy <= STEP_UP_MIN && Math.hypot(nodeDx, nodeDz) <= WALK_STEP_REACH) {
+        const sx = Math.sign(nodeDx)
+        const sz = Math.sign(nodeDz)
         const xBlocked = sx !== 0 && geometry.playerCollides(bot, p.x + sx * SLIDE_PROBE, p.y, p.z)
         const zBlocked = sz !== 0 && geometry.playerCollides(bot, p.x, p.y, p.z + sz * SLIDE_PROBE)
         // The standoff is a fraction of the ALONG-wall component, and it
@@ -1943,6 +2041,11 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         // noise, so the bot faces sideways at a wall instead of at its node.
         // There is no slide to steer there; leave the heading alone and let
         // the wedge recovery below deal with it if nothing moves.
+        if (zBlocked || xBlocked) {
+          cutTarget = null
+          dx = nodeDx
+          dz = nodeDz
+        }
         if (zBlocked && !xBlocked && Math.abs(dx) >= 0.15) dz = -sz * Math.abs(dx) * WALL_STANDOFF
         else if (xBlocked && !zBlocked && Math.abs(dz) >= 0.15) dx = -sx * Math.abs(dz) * WALL_STANDOFF
       }

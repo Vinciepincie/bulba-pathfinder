@@ -158,6 +158,16 @@ The full upstream surface is provided with identical semantics:
   are identical tick for tick (34 jumps each). So it is never the slower
   choice, and it is not behind a flag.
 
+  There is exactly one shape of ground where holding wins, and the gait never
+  meets it: a staircase with treads wide enough that re-pressing on the
+  landing fires the next jump straight into the riser. On 3-block treads that
+  is 60.8 blocks per 200 ticks held against 41.2 pressed — but the gait
+  refuses to leave the ground into rising terrain at all (a rise is the jump
+  gates' business), so the cadence is never asked the question there. A
+  rollout that picks between the two cadences was built and measured, and it
+  never once chose to hold; that is why there is one cadence rather than a
+  choice. Worth knowing if the rise veto is ever relaxed.
+
   `Movements.allowLowCeilingHop` (opt-in, needs `allowSprintHop`) is what lets
   the bot go and find that ground. It changes only how far ahead a DROP in the
   ceiling vetoes a take-off: off, that is the whole comparison horizon, which
@@ -202,6 +212,42 @@ The full upstream surface is provided with identical semantics:
   soul-sand/honey slowdown on a `velocityBlocksOnTop` feature whose version
   list stops at 1.20, so on 1.21 the rollouts believe soul sand is ordinary
   ground.
+- **Corner cutting** (`Movements.allowCornerCut`, on). The planner routes cell
+  centre to cell centre over eight directions, so a run a few degrees off a
+  cardinal comes back as an alternating zig-zag — and a follower that steers
+  at each centre walks every zig and swings its heading ±45° at every one. The
+  executor instead steers at the furthest node it can reach in a straight line
+  the body fits down (full hitbox sampled every quarter block, floor under
+  every sample), and the nodes it skips retire by being gone by rather than by
+  being stood on. Worth 0.2–0.5 s a route on the arena; the plan is untouched,
+  so turning it off restores node-by-node following exactly.
+
+  Four constraints, each of which cost a measured regression to learn: the
+  skipped nodes must stay within *collecting* range of the new line and are
+  selected on a tighter bound (0.55) than they retire on (0.9), because equal
+  bounds leave a retirement window a quarter of a tick wide and a node that
+  misses it is stranded for good — which looks like the bot vibrating on one
+  spot until the futility timer replans. "Gone by" is measured along the chord
+  the body is walking, never along the path's own next leg (where the window
+  can be empty outright) and never against velocity (which the wedge recovery
+  reverses). A target committed to on the ground is kept through the whole
+  arc, because a re-pick mid-hop swings the yaw with only air control to
+  answer it. And the cut never runs into a jump — it leaves the body lined up
+  on the chord rather than on the take-off, which cost 0.3 s a route on the
+  jump-dense ones.
+- **Parkour take-offs are decided on the ground, and parkour landings are
+  landed on.** The arrival box has no ground requirement, so a jump that
+  passes over its node on the way down satisfies it in mid-air — and the
+  executor then starts steering at the node AFTER it, which past a gap means
+  steering into the gap. On the arena's `basic1`, a 4-block drop onto a 2-cell
+  shelf was retired 0.9 blocks above the shelf and the bot spent the rest of
+  its fall thrusting at a node across the chasm beyond: a 40-block fall, about
+  one run in eight, on either gait. A parkour node is now held until the body
+  is supported — on the ground, in water, or caught on a ladder or vine, which
+  is how the extended repertoire's gap-jumps end — and only where there is
+  actually a hole past the landing, since a landing with more ground beyond it
+  can be overrun harmlessly and holding those too costs a tick a jump. Worth
+  0.8 s on `basic1` on top of removing the fall.
 - **Parkour take-offs are decided on the ground.** Asked while the bot is
   still falling out of the previous jump, the rollout has to guess the speed
   it will land with, and a marginal jump is decided entirely by that number.
@@ -364,12 +410,23 @@ Runtime knobs on `bot.pathfinder` (beyond the upstream trio):
 `stuckTimeout` (default −1 = off), `executionTimeout` (−1 = off),
 `keepPathDuringRecompute` (default true).
 
-Opt-in `Movements` flags (both default **false**, so the walking outcome
-matches upstream until you ask for more): `allowParkourExtended` (the full
-sprint-jump repertoire, `docs/ExtendedParkour.md`) and `allowSprintHop`
-(hold jump while sprinting across open ground — 6.97 blocks/s against 5.56,
-measured on the arena, taken only where a rollout of both gaits down the same
-path says the hop gets further without losing height).
+Opt-in `Movements` flags (all default **false**, so the walking outcome
+matches upstream until you ask for more):
+
+| flag | what it buys |
+|---|---|
+| `allowParkourExtended` | the full sprint-jump repertoire (`docs/ExtendedParkour.md`) |
+| `allowSprintHop` | the hopping gait — 7.05 blocks/s against 5.59 sprinting, taken only where a rollout of both gaits down the same path says the hop gets further without losing height |
+| `allowLowCeilingHop` | needs `allowSprintHop`; hop through low headroom instead of round it — 9.68 blocks/s under a 2-block roof |
+
+`allowCornerCut` defaults to **true**: it changes only what the executor
+steers at, never the plan, and node-by-node following is restored exactly by
+turning it off.
+
+`allowLowCeilingHop` is **not** a cadence switch — it does not choose between
+holding the jump key and re-pressing it. The gait always re-presses, with the
+flag off as well as on; what the flag changes is only how far ahead a drop in
+the ceiling vetoes a take-off. See the sprint-hop section above.
 
 ## Scope
 

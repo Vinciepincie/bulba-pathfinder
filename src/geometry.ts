@@ -167,6 +167,7 @@ export function walkableLine (
   x1: number, z1: number,
   y: number,
   avoid: Set<number> | null = null,
+  cellCost: ((x: number, y: number, z: number) => number) | null = null,
   step = 0.25
 ): boolean {
   const dx = x1 - x0
@@ -180,6 +181,16 @@ export function walkableLine (
     const z = z0 + dz * t
     if (playerCollides(bot, x, y, z)) return false
     if (!playerCollides(bot, x, y - 0.55, z)) return false
+    // Cost the geometry cannot see — an entity the profile is avoiding, which
+    // the planner paid to detour around. Checked PER CELL: a world simply
+    // containing entities is every world, so a global "are there any" test
+    // switches the cut off permanently.
+    if (cellCost !== null) {
+      const cx = Math.floor(x)
+      const cz = Math.floor(z)
+      const cy = Math.floor(y)
+      if (cellCost(cx, cy, cz) > 0 || cellCost(cx, cy + 1, cz) > 0) return false
+    }
     if (avoid !== null && avoid.size > 0) {
       const under = bot.blockAt(new Vec3(Math.floor(x), Math.floor(y) - 1, Math.floor(z))) as { type?: number } | null
       if (under !== null && under.type !== undefined && avoid.has(under.type)) return false
