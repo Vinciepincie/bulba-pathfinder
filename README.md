@@ -12,9 +12,19 @@ loop**: the failure class where an unreachable goal freezes the process for
 minutes is structurally impossible here.
 
 Digging is **opt-in** (`movements.canDig = true`; default **off**, unlike
-upstream) with the exact upstream cost model when enabled. Block placement
-is never performed. With digging off, the only block interaction the planner
-ever performs is activating a door or fence gate on the path.
+upstream) with the exact upstream cost model when enabled. The **planner**
+never generates placement moves: with digging off, the only block interaction
+it performs on its own is activating a door or fence gate on the path.
+
+What the bot does *deliberately* is separate from what the planner does on the
+way, and that half is a first-class API: [`dig` / `place` / `open` /
+`activate`](#interactions-dig-place-open-activate) are convenience methods
+that walk into vanilla range only if they have to, guard every click the way
+the server judges it, and retry. They run through one **overridable table**
+that the executor's own digs and doors go through too, and hand off to other
+plugins through a [cooperative interrupt
+protocol](#interrupts-borrowing-the-bot-mid-path) — so auto-eat stops
+happening in mid-jump.
 
 ```js
 import { pathfinder, Movements, goals } from '@bulba/pathfinder' // named ESM imports…
@@ -25,6 +35,10 @@ bot.loadPlugin(pathfinder)
 const movements = new Movements(bot)
 bot.pathfinder.setMovements(movements)
 await bot.pathfinder.goto(new goals.GoalNear(x, y, z, 1))
+
+// …and the interaction half
+await bot.pathfinder.dig(new Vec3(x, y, z))
+const chest = await bot.pathfinder.open(chestBlock)
 ```
 
 ## API compatibility
@@ -67,6 +81,188 @@ The full upstream surface is provided with identical semantics:
 | `allow1by1towers`/`scafoldingBlocks` are inert (warned once, ignored) | No placement moves exist — digging yes, placing no. |
 | `isBuilding()` is only `true` while activating a door/gate | No placement executor branch. |
 | `Movements.getBlock` / `safeToBreak` / `safeOrBreak` are provided for API compatibility, but the per-move generators (`getNeighbors`, `getMoveForward`, …, `getLandingBlock`) are **not** — the solver's move generation runs against the snapshot, not live blocks | Niche internals; open an issue if a real consumer needs them. |
+
+## Interactions: `dig`, `place`, `open`, `activate`
+
+`goto` gets the bot somewhere. These get something **done** — and they walk
+into range only when they have to, so a block already within vanilla reach is
+acted on from where the bot stands, with no goal set and no path computed.
+
+```js
+await bot.pathfinder.dig(vec3OrBlock)                      // break it
+await bot.pathfinder.place(vec3, { item: 'red_shulker_box' })
+const window = await bot.pathfinder.open(vec3OrBlock)      // any window, not just containers
+await bot.pathfinder.activate(vec3OrBlock)                 // lever, button, door
+```
+
+They are serialised against each other and hold an exclusive
+[interrupt](#interrupts-borrowing-the-bot-mid-path) for the interaction
+itself, so the tick loop is never fighting the hand — and neither is anything
+else that plays by the same protocol.
+
+**`open` is not a container API.** `bot.openContainer` asserts the window
+against a chest/shulker/barrel allowlist and throws on anything else, which
+makes it useless for a crafting table, an enchanting table, an anvil, a
+furnace or a beacon. `pathfinder.open()` returns whatever window the block
+opens — mineflayer's `Window`, already extended with
+`close`/`deposit`/`withdraw`.
+
+### What the built-ins guard against
+
+Every one of these is a real failure that presents to the application as "the
+bot just stood there", because the server's answer to a bad click is silence:
+
+| Guard | What it stops |
+|---|---|
+| **Vanilla range**, eye to the *closest point of the cell* | Measuring centre-to-centre thinks it can reach ~0.87 further than the server does on a diagonal. The click is dropped, silently. |
+| **Face agreement** | The clicked face is the one the bot's own raycast reports — the face the server derives from the same rotation. A geometric guess only survives point-blank, and only with `allowGeometric`. |
+| **Aim settle** | Rotation reaches the server in a position packet. Clicking on the same tick as the look sends the click with the *previous* rotation attached. |
+| **Grounded stance** | A swing sent while falling or sliding is sent from a position the server has not accepted yet. |
+| **Correction window** | Nothing is clicked within `forcedMoveGrace` ms of a lagback. |
+| **Decay guard** | Leaves and falling blocks change under a slow aim; the block is re-read before the swing. |
+| **Mid-dig abort** | A lagback, the footing decaying away, or being pushed cancels the dig instead of mining a block the bot can no longer see. |
+| **Verify by the world** | `bot.dig` resolves on its own timer and `bot.placeBlock` *rejects* on a laggy server after the placement landed. Neither promise is evidence; the block is. |
+| **Sneak on placement** | Right-clicking a chest/hopper/barrel/crafting table with a block in hand **opens it** instead of placing. Vanilla's answer is to sneak, and so is ours — without it a shulker station on a hopper is unplaceable. |
+| **Shulker openability** | A shulker opens along the face it was placed against. Faces whose opposite side is obstructed are skipped, so the bot cannot brick its own storage. Turn off with `requireOpenable: false`. |
+| **Bounded `open`** | `bot.openBlock` is `activateBlock` plus a bare `once(bot, 'windowOpen')` with **no timeout**: a dropped click hangs the caller forever, and the abandoned listener later steals a window opened by something else. Ours times out, says whether the server refused the click or never saw it, and removes the listener. |
+
+Failures throw with stable `name`s — `OutOfReach`, `Occluded`, `NoTarget`,
+`DigFailed`, `PlaceFailed`, `OpenFailed`, `MissingItem`, `Unreachable`,
+`ActionAborted` — matched the way the upstream `NoPath`/`Timeout` names are.
+`err.refused === true` means the action stopped short and a reposition-and-
+retry is reasonable; anything else is structural.
+
+### Pacing
+
+Breaks and placements share one jittered cooldown window, because a checker
+counting block actions does not care which kind they were. Vanilla itself
+enforces a 5-tick `destroyDelay` between breaks, so anything faster is outside
+what a client produces.
+
+```js
+bot.pathfinder.actions.config.pacing = 'default' // ~0.6–0.9s, breather every 4th (the default)
+bot.pathfinder.actions.config.pacing = 'drill'   // fast, still above vanilla's floor
+bot.pathfinder.actions.config.pacing = 'none'    // no spacing at all
+```
+
+`'none'` is the right choice on a server you control, and for one-off
+interactions. The setting also applies to the executor's own `canDig` breaks.
+
+### Overriding
+
+Every world interaction the pathfinder performs — including the executor's own
+`canDig` dig branch and the doors it opens while walking — goes through one
+table, so replacing an entry replaces it **everywhere**:
+
+```js
+bot.pathfinder.actions.dig      // (block, options) => Promise<void>
+bot.pathfinder.actions.place    // (vec3, options)  => Promise<void>
+bot.pathfinder.actions.open     // (block, options) => Promise<Window>
+bot.pathfinder.actions.activate // (block, options) => Promise<void>
+bot.pathfinder.actions.equip    // (item, dest)     => Promise<void>
+bot.pathfinder.actions.config   // reach, retries, timeout, pacing, windowTimeout, forcedMoveGrace
+```
+
+Wrap rather than replace, and you keep the guards:
+
+```js
+const inner = bot.pathfinder.actions.dig
+bot.pathfinder.actions.dig = async (block, options) => {
+  if (protectedRegion.contains(block.position)) throw new Error('not there')
+  metrics.digs++
+  return await inner(block, options)
+}
+```
+
+> **If your application monkey-patches `bot.dig`**, stop: the pathfinder
+> captures `bot.dig` at inject time and calls that, so a wrapper which
+> delegates back into the pathfinder cannot recurse — but a global patch also
+> applies to every other consumer of the bot and cannot be scoped, ordered or
+> removed. `actions.dig` is the same power without those problems.
+
+Events, all namespaced so they cannot collide with upstream's:
+`pathfinder:dig_start`, `dig_finish`, `dig_aborted`, `dig_error`,
+`place_start`, `place_finish`, `open_start`, `open_finish`, `open_retry`,
+`activate`.
+
+## Interrupts: borrowing the bot mid-path
+
+Every mineflayer stack hits this eventually. A second plugin — auto-eat, a
+totem swapper, an armour manager — wants the bot's hands, has no idea what the
+pathfinder is doing, and acts whenever its own trigger fires. If that moment
+is the tick the executor committed to a sprint-jump, the bot eats in mid-air:
+item use and sprinting cancel each other in vanilla, the held item is swapped
+away from the tool the next node needs, and the bite lands the bot somewhere
+the planner never routed through. The pathfinder then replans from wherever it
+fell — which is how "the bot randomly walks back on itself" happens.
+
+The fix is not to teach the pathfinder about eating. It is to let borrowers
+**ask**, and to answer only where handing over is harmless:
+
+```js
+const handle = await bot.pathfinder.interrupt('totem-swap')
+try {
+  await bot.equip(totem, 'off-hand')
+} finally {
+  handle.release()
+}
+
+// or, releasing for you even if the body throws:
+await bot.pathfinder.withInterrupt('totem-swap', () => bot.equip(totem, 'off-hand'))
+```
+
+The path is **not** reset while a handle is held: no `path_reset`, no
+re-solve, no `goto()` rejection. The bot stands still on its own path and
+carries on from the same node. From the caller's point of view the walk just
+took a second longer — and the stuck and execution timers are pushed forward
+by exactly the pause, so a long hold is never mistaken for a stall.
+
+- Granted on the ground, in water, or on a climbable — never mid-flight, never
+  mid-dig, never mid-interaction. **"Wait before jumping" needs no special
+  case**: a request arriving while the bot is standing is granted before the
+  executor reaches the take-off decision.
+- **Exclusive by default.** A bot has one pair of hands: while
+  `pathfinder.dig()` holds them, an auto-eat request queues behind it instead
+  of swapping the pickaxe out from under a swing. Pass `{ exclusive: false }`
+  for a passive observer that only wants the bot to stand still.
+- FIFO with head-of-line blocking, so a stream of observers cannot starve an
+  exclusive request.
+- `{ timeout }` (default 5 s) bounds the wait for a safe moment — a genuinely
+  wedged bot still gets to eat. It does **not** override exclusivity.
+- `pf.stop()` always outranks a pause.
+
+`bot.pathfinder.motion` is the read-only view for anything that needs to time
+around the executor: `phase` (`idle` / `walking` / `airborne` / `climbing` /
+`swimming` / `digging` / `interacting` / `paused`), `critical`, `jumpPending`,
+`paused`, `holders`, `node`. Events: `pathfinder:interrupt_requested`,
+`pathfinder:paused`, `pathfinder:resumed`.
+
+### Auto-eat
+
+A ready-made adapter for
+[`mineflayer-auto-eat`](https://github.com/linkle69/mineflayer-auto-eat). It
+turns the plugin's own `physicsTick` eating off and drives it through the
+interrupt protocol instead — the bot lands, stops on its path, eats, and walks
+on from the same node.
+
+```js
+import { pathfinder, autoEatIntegration } from '@bulba/pathfinder'
+import { loader as autoEat } from 'mineflayer-auto-eat'
+
+bot.loadPlugin(pathfinder)
+bot.loadPlugin(autoEat)
+bot.loadPlugin(autoEatIntegration({ startAt: 16 }))
+```
+
+Options: `startAt` (food level, default 16), `healthBelow` (eat when hurt too,
+default off), `checkEveryTicks` (20), `waitForSafe` (10 s before eating
+anyway), `skipWhenWindowOpen` (true), `eatOptions`, `reason`. It is defensive
+about the plugin's own shape — 3.x has shipped both `enableAuto`/`disableAuto`
+and `enable`/`disable`, and both `opts` and `options`.
+
+`bot.pathfinderAutoEat` gives you `eatNow()`, `suspend()` / `resume()`
+(counted, for a caller that needs the hand), `eating`, `suspended` and
+`detach()`.
 
 ## Improvements over upstream
 
@@ -282,6 +478,21 @@ Runtime knobs on `bot.pathfinder` (beyond the upstream trio):
 `stuckTimeout` (default −1 = off), `executionTimeout` (−1 = off),
 `keepPathDuringRecompute` (default true).
 
+Interaction defaults live on `bot.pathfinder.actions.config` and apply to the
+next action — the convenience methods and the executor's own digs and doors
+alike. Per-call options override them:
+
+```js
+bot.pathfinder.actions.config = {
+  reach: 4.5,             // vanilla block-interaction range
+  retries: 3,             // attempts per action
+  timeout: 30_000,        // overall deadline per action, ms (0 = none)
+  pacing: 'default',      // 'none' | 'default' | 'drill'
+  windowTimeout: 3000,    // ms to wait for windowOpen
+  forcedMoveGrace: 800,   // ms after a lagback before anything is clicked
+}
+```
+
 Opt-in `Movements` flags (both default **false**, so the walking outcome
 matches upstream until you ask for more): `allowParkourExtended` (the full
 sprint-jump repertoire, `docs/ExtendedParkour.md`) and `allowSprintHop`
@@ -293,9 +504,14 @@ path says the hop gets further without losing height).
 
 Water walking, ladders, doors/gates, sprinting, parkour, drop-downs, entity
 avoidance and (opt-in) digging are all supported — the full upstream moveset
-except block placement, which is permanently out of scope; the package
-writes zero place packets by construction, and zero dig packets unless
-`canDig` is explicitly enabled.
+except block placement, which is permanently out of scope **for the planner**:
+no move generator emits a placement, so no route can depend on the bot
+building one, and the solver writes zero place packets by construction. Dig
+packets are written only when `canDig` is explicitly enabled.
+
+Deliberate, caller-driven interaction is a different thing and is in scope:
+`pathfinder.place()` places exactly the block you asked for, where you asked
+for it, and nothing plans around it.
 
 ## Testing
 

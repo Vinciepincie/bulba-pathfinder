@@ -1,7 +1,7 @@
 {
   "name": "@bulba/pathfinder",
   "version": "0.1.0",
-  "description": "Drop-in replacement for mineflayer-pathfinder: same API, same walking outcome, snapshot-based zero-allocation A* that runs off the event loop in a worker thread. Walk-only by design (never digs, never places blocks).",
+  "description": "Drop-in replacement for mineflayer-pathfinder: same API, same walking outcome, snapshot-based zero-allocation A* that runs off the event loop in a worker thread. Opt-in digging, an overridable dig/place/open interaction layer with vanilla-range guards and retries, and cooperative interrupts so other plugins stop acting mid-jump.",
   "license": "MIT",
   "type": "module",
   "main": "./dist/cjs/index.js",
