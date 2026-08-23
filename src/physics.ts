@@ -49,6 +49,12 @@ const OVERHEAD_HAZARDS = new Set([
   'water', 'flowing_water', 'bubble_column', 'lava', 'flowing_lava'
 ])
 
+/**
+ * Feet blocks that catch a falling body without ever grounding it. The
+ * extended repertoire jumps at these deliberately — see `caught`.
+ */
+const CAUGHT_FEET = new Set(['ladder', 'vine'])
+
 export class PhysicsSim {
   private readonly bot: Bot
   private readonly world: { getBlock: (pos: Vec3) => unknown }
@@ -241,8 +247,8 @@ export class PhysicsSim {
     sprint: boolean
   ): boolean {
     if (node.parkour !== true) return true
-    if (state.onGround === true) return true
-    const settled = this.simulateUntil(s => s.onGround === true, (s: PlayerState) => {
+    if (this.caught(state)) return true
+    const settled = this.simulateUntil(s => this.caught(s), (s: PlayerState) => {
       const dx = node.x - s.pos.x
       const dz = node.z - s.pos.z
       s.yaw = Math.atan2(-dx, -dz)
@@ -250,9 +256,36 @@ export class PhysicsSim {
       s.control.jump = false
       s.control.sprint = sprint
     }, 12, state)
-    return settled.onGround === true &&
+    return this.caught(settled) &&
       Math.hypot(node.x - settled.pos.x, node.z - settled.pos.z) <= 1 &&
       Math.abs(node.y - settled.pos.y) < 1
+  }
+
+  /**
+   * Has the body ARRIVED somewhere, by any of the means the planner counts as
+   * a landing? Ground, yes — but `moveGen.findExtLanding` also accepts water
+   * and climbables, and the extended repertoire emits gap-jumps that catch a
+   * pool or a ladder on purpose.
+   *
+   * Answering that question with `onGround` alone made every one of those
+   * moves unauthorisable, and unauthorisable is worse than merely unused: the
+   * planner keeps emitting them, every gate refuses, the bot creeps to the
+   * lip and stands there, the wedge recovery shoves it backwards, the
+   * futility timer replans, and the same plan comes back — a livelock at the
+   * take-off, forever, on any route the search wants to send through a pond
+   * or a ladder shaft. Neither case can ever set onGround: prismarine-physics
+   * derives it from a downward vertical collision, and a ladder clamps
+   * vel.y to -0.15 with no collision at all while water deeper than a block
+   * outlasts the settle budget. Catching EARLY also keeps the height check
+   * honest — a body left to sink six blocks into a pool is nowhere near its
+   * node by the time it finally touches the bottom.
+   */
+  private caught (state: PlayerState): boolean {
+    if (state.onGround === true || state.isInWater === true) return true
+    const feet = this.bot.blockAt(
+      new Vec3(Math.floor(state.pos.x), Math.floor(state.pos.y), Math.floor(state.pos.z)), false
+    ) as { name?: string } | null
+    return feet !== null && CAUGHT_FEET.has(feet.name ?? '')
   }
 
   /**

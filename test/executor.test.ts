@@ -17,7 +17,7 @@ import { createPathfinder } from '../src/plugin.js'
 import { GoalBlock } from '../src/goals.js'
 import { Movements } from '../src/movements.js'
 import {
-  VoxelWorld, STONE, AIR, WATER, LAVA, mcData, Block, TEST_VERSION, makeFakeBot, makeOurMovements
+  VoxelWorld, STONE, AIR, WATER, LAVA, LADDER_DRY, mcData, Block, TEST_VERSION, makeFakeBot, makeOurMovements
 } from './helpers/voxelWorld.js'
 import { makeDriveableBot, makeFakePhysics } from './helpers/fakeBot.js'
 import type { DriveableBot } from './helpers/fakeBot.js'
@@ -139,6 +139,58 @@ describe('executor: take-off honesty', () => {
     }
     return false
   }
+})
+
+describe('executor: a catch is a landing', () => {
+  /**
+   * `moveGen.findExtLanding` accepts four landing kinds — a physical top, a
+   * thin floor, LIQUID and CLIMBABLE — and the extended repertoire emits
+   * gap-jumps that aim at the last two on purpose. The take-off gate used to
+   * accept only `onGround`, which neither a ladder nor deep water can ever
+   * set: prismarine-physics derives it from a downward vertical collision, a
+   * ladder clamps vel.y to -0.15 with no collision at all, and water deeper
+   * than a block outlasts the settle budget.
+   *
+   * The result was not "the move goes unused" but a livelock: the planner
+   * keeps emitting it, every gate refuses, the bot creeps to the lip and
+   * stands there, the wedge recovery shoves it backwards, the futility timer
+   * replans, and the identical plan comes back. Forever, on any route through
+   * a pond or a ladder shaft.
+   */
+  it('authorises a jump that catches a ladder across a shaft', () => {
+    const w = new VoxelWorld({ x0: -6, y0: -20, z0: -4, x1: 10, y1: 12, z1: 4 })
+    w.set(0, 0, 0, STONE) // take-off, stand y = 1
+    w.set(-1, 0, 0, STONE) // run-up
+    // A dry ladder column across a 2-cell shaft, with its wall behind it.
+    for (let y = 1; y <= 6; y++) w.set(4, y, 0, STONE)
+    for (let y = 1; y <= 6; y++) w.set(3, y, 0, LADDER_DRY)
+    const sim = new PhysicsSim(physicsBot(w, new Vec3(0.5, 1, 0.5)) as never)
+    expect(sim.canSprintJump([{ x: 3.5, y: 1, z: 0.5, parkour: true }])).to.equal(true)
+  })
+
+  it('authorises a jump into deep water, where the body never grounds', () => {
+    const w = new VoxelWorld({ x0: -6, y0: -20, z0: -4, x1: 10, y1: 12, z1: 4 })
+    w.set(0, 0, 0, STONE)
+    w.set(-1, 0, 0, STONE)
+    // A 1x1 water column over a chasm, six deep — far past the settle budget.
+    // The node is the water CELL, which is where findExtLanding puts a liquid
+    // landing; the body is a block and a half into it before isInWater reads
+    // true, so a node placed at the surface above would fail the arrival box
+    // on height rather than on the catch.
+    for (let y = -5; y <= 0; y++) w.set(3, y, 0, WATER)
+    w.set(3, -6, 0, STONE)
+    const sim = new PhysicsSim(physicsBot(w, new Vec3(0.5, 1, 0.5)) as never)
+    expect(sim.canSprintJump([{ x: 3.5, y: 0, z: 0.5, parkour: true }])).to.equal(true)
+  })
+
+  it('still refuses a jump that catches nothing at all', () => {
+    // Same gap, nothing in it: the catch rule must not become a blank cheque.
+    const w = new VoxelWorld({ x0: -6, y0: -20, z0: -4, x1: 10, y1: 12, z1: 4 })
+    w.set(0, 0, 0, STONE)
+    w.set(-1, 0, 0, STONE)
+    const sim = new PhysicsSim(physicsBot(w, new Vec3(0.5, 1, 0.5)) as never)
+    expect(sim.canSprintJump([{ x: 3.5, y: 1, z: 0.5, parkour: true }])).to.equal(false)
+  })
 })
 
 describe('executor: never sprint against a wall', () => {

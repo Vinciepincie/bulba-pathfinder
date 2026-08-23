@@ -24,6 +24,20 @@ export const LAVA = mcData.blocksByName.lava.minStateId as number
 export const OAK_FENCE = mcData.blocksByName.oak_fence.minStateId as number
 export const OAK_LEAVES = mcData.blocksByName.oak_leaves.minStateId as number
 export const LADDER = mcData.blocksByName.ladder.minStateId as number
+/**
+ * A ladder with NO water in it. `minStateId` is `waterlogged:true` — the
+ * property is sorted before `facing` — so the plain LADDER constant above puts
+ * a block of water in the cell too, which changes what the physics does with
+ * a body in it. Anything measuring a dry catch needs this one.
+ */
+export const LADDER_DRY = ((): number => {
+  const b = mcData.blocksByName.ladder
+  for (let s = b.minStateId as number; s <= (b.maxStateId as number); s++) {
+    const props = (Block.fromStateId(s, 0) as { getProperties: () => Record<string, unknown> }).getProperties()
+    if (props.waterlogged === false || props.waterlogged === 'false') return s
+  }
+  return b.minStateId as number
+})()
 export const VINE = mcData.blocksByName.vine.minStateId as number
 export const COBWEB = mcData.blocksByName.cobweb.minStateId as number
 export const SOUL_SAND = mcData.blocksByName.soul_sand.minStateId as number
