@@ -37,6 +37,17 @@ import { serializeGoal, goalNeedsRaycast, descriptorTargets } from './goalSerde.
 import { TAKEOFF_STAND } from './parkourEnvelope.js'
 import { getSharedWorkerHost } from './worker/host.js'
 import * as geometry from './geometry.js'
+import { InterruptController } from './interrupt.js'
+import type { InterruptHandle, InterruptOptions, MotionPhase } from './interrupt.js'
+import { createActionTable } from './actions/index.js'
+import { Pacer } from './actions/pacing.js'
+import { DEFAULT_ACTION_CONFIG, ActionError, ActionErrors } from './actions/types.js'
+import type {
+  ActionTable, ActivateOptions, BlockTarget, DigOptions, OpenOptions, PlaceOptions, WindowLike
+} from './actions/types.js'
+import type { ActionContext, DiggingBot } from './actions/context.js'
+import { resolveBlock, toVec3, inReach } from './actions/reach.js'
+import { GoalLookAtBlock, GoalNear } from './goals.js'
 import type { PathfinderOptions, GoalDescriptor, PhysicsLike } from './types.js'
 
 // Upstream lib/lock.js.
@@ -282,6 +293,12 @@ export function createPathfinder (options: PathfinderOptions = {}) {
     let lastNodeArrival = performance.now()
     let goalSetTime = performance.now()
     let stopPathing = false
+    /**
+     * When the server last corrected our position. The action layer refuses
+     * to send a click inside the correction window — a swing from a position
+     * the server has already rejected is a wasted packet at best.
+     */
+    let lastForcedMoveAt = 0
 
     const physics = options.physicsFactory ? options.physicsFactory(bot) : new PhysicsSim(bot)
     const lockUseBlock = new Lock()
@@ -405,6 +422,195 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       if (geometry.isStuck(bot)) await geometry.unstick(bot)
       return geometry.settle(bot)
     }
+
+    // ── cooperative interrupts ───────────────────────────────────────────
+    //
+    // The hand-over point another plugin waits for. `isSafe` is the whole
+    // contract: feet on something, nothing half-finished. A request that
+    // arrives while the bot is standing on a block is granted on the same
+    // tick, which is why "wait before jumping" needs no special case — the
+    // executor yields before it ever reaches the take-off decision.
+    const interrupts = new InterruptController(bot as unknown as { emit: (e: string, ...a: unknown[]) => boolean }, {
+      isSafe: () => {
+        if (digging || placing) return false
+        const e = bot.entity as { onGround?: boolean, isInWater?: boolean }
+        if (e.onGround === true || e.isInWater === true) return true
+        // On a ladder or vine the bot is not "on the ground" but is not
+        // falling either; stopping there is harmless.
+        const feet = bot.blockAt(bot.entity.position, false) as { type: number } | null
+        return feet !== null && (feet.type === ladderId || feet.type === vineId)
+      },
+      onPause: () => {
+        fullStop()
+        clearWedge()
+      },
+      onResume: (pausedMs: number) => {
+        // Standing still because someone asked us to is not a stall. Push the
+        // futility and stuck timers forward by exactly the pause, or a long
+        // eat would look identical to a bot wedged in geometry.
+        lastNodeTime += pausedMs
+        lastNodeArrival += pausedMs
+        goalSetTime += pausedMs
+        clearWedge()
+      }
+    })
+
+    pf.interrupt = async (reason: string, options?: InterruptOptions): Promise<InterruptHandle> =>
+      await interrupts.acquire(reason, options)
+    pf.withInterrupt = async <T>(reason: string, fn: () => Promise<T>, options?: InterruptOptions): Promise<T> =>
+      await interrupts.run(reason, fn, options)
+
+    /** What the executor is doing, for anything that needs to time around it. */
+    function motionPhase (): MotionPhase {
+      if (interrupts.paused) return 'paused'
+      if (digging) return 'digging'
+      if (placing) return 'interacting'
+      if (path.length === 0) return 'idle'
+      const e = bot.entity as { onGround?: boolean, isInWater?: boolean }
+      if (e.isInWater === true) return 'swimming'
+      if (e.onGround !== true) {
+        const feet = bot.blockAt(bot.entity.position, false) as { type: number } | null
+        if (feet && (feet.type === ladderId || feet.type === vineId)) return 'climbing'
+        return 'airborne'
+      }
+      return 'walking'
+    }
+
+    pf.motion = {
+      get phase (): MotionPhase { return motionPhase() },
+      /**
+       * True when taking the controls away right now would break the run —
+       * mid-flight over a gap, or half-way through a dig or an interaction.
+       * Callers that can wait should call `interrupt()` instead of polling
+       * this: it does the waiting correctly.
+       */
+      get critical (): boolean {
+        const phase = motionPhase()
+        return phase === 'airborne' || phase === 'digging' || phase === 'interacting'
+      },
+      /** True when the next node is a jump the executor has not committed to yet. */
+      get jumpPending (): boolean {
+        return path.length > 0 && path[0].parkour === true &&
+          (bot.entity as { onGround?: boolean }).onGround === true
+      },
+      get paused (): boolean { return interrupts.paused },
+      get holders (): string[] { return interrupts.holders },
+      get node (): Move | null { return path.length > 0 ? path[0] : null }
+    }
+
+    // ── the interaction table ────────────────────────────────────────────
+    //
+    // Captured BEFORE any application wrapper monkey-patches bot.dig, so an
+    // application whose own dig wrapper delegates here cannot recurse.
+    const rawDig = (bot as unknown as DiggingBot).dig.bind(bot)
+    const pacer = new Pacer()
+
+    async function approachBlock (pos: Vec3, reach: number, signal?: AbortSignal): Promise<boolean> {
+      if (inReach(bot as unknown as never, pos, reach)) return true
+      if (signal?.aborted === true) return false
+      // Release the action's interrupt for the walk — the executor cannot
+      // drive while it is held, and re-take it once we have arrived.
+      const session = activeSession
+      if (session?.handle) {
+        session.handle.release()
+        session.handle = null
+      }
+      let arrived = false
+      try {
+        await gotoImpl(new GoalLookAtBlock(pos, bot.world as never, { reach }))
+        arrived = true
+      } catch {
+        try {
+          await gotoImpl(new GoalNear(pos.x, pos.y, pos.z, Math.max(1, Math.floor(reach) - 1)))
+          arrived = inReach(bot as unknown as never, pos, reach)
+        } catch {
+          arrived = false
+        }
+      }
+      if (session) {
+        session.handle = await interrupts.acquire(session.reason, { timeout: 5000 })
+      }
+      return arrived
+    }
+
+    const actionCtx: ActionContext = {
+      bot: bot as unknown as DiggingBot,
+      config: { ...DEFAULT_ACTION_CONFIG },
+      pacer,
+      rawDig,
+      msSinceForcedMove: () => lastForcedMoveAt === 0 ? Number.POSITIVE_INFINITY : performance.now() - lastForcedMoveAt,
+      serverTps: () => {
+        const tps = (bot as unknown as { getServerTps?: () => number }).getServerTps
+        return typeof tps === 'function' ? tps.call(bot) : null
+      },
+      bestHarvestTool: (block) => (pf.bestHarvestTool as (b: unknown) => unknown)(block),
+      approach: approachBlock
+    }
+
+    /**
+     * Every world interaction the pathfinder performs goes through this
+     * table, including the executor's own dig branch. Replace or wrap any
+     * entry to change the behaviour everywhere at once.
+     */
+    const actions: ActionTable = createActionTable(actionCtx)
+    pf.actions = actions
+
+    // ── convenience methods ──────────────────────────────────────────────
+    //
+    // `goto` gets you somewhere; these get something DONE. Each one walks
+    // into vanilla range only if it has to (a block already in reach is acted
+    // on where the bot stands), then holds an interrupt for the interaction
+    // itself so the tick loop is not fighting the hand.
+    //
+    // They are serialised against each other: one bot, one hand.
+    interface ActionSession { reason: string, handle: InterruptHandle | null }
+    let activeSession: ActionSession | null = null
+    let actionChain: Promise<unknown> = Promise.resolve()
+
+    async function runAction<T> (reason: string, fn: () => Promise<T>): Promise<T> {
+      const start = async (): Promise<T> => {
+        const session: ActionSession = { reason, handle: null }
+        session.handle = await interrupts.acquire(reason, { timeout: 5000 })
+        activeSession = session
+        try {
+          return await fn()
+        } finally {
+          activeSession = null
+          session.handle?.release()
+        }
+      }
+      const run = actionChain.then(start, start)
+      actionChain = run.then(() => undefined, () => undefined)
+      return await run
+    }
+
+    pf.dig = async (target: BlockTarget, options: DigOptions = {}): Promise<void> =>
+      await runAction('pathfinder:dig', async () => {
+        const pos = toVec3(target)
+        if (options.approach !== false) await approachBlock(pos, options.reach ?? actions.config.reach, options.signal)
+        return await actions.dig(resolveBlock(bot as unknown as never, target), options)
+      })
+
+    pf.place = async (target: BlockTarget, options: PlaceOptions = {}): Promise<void> =>
+      await runAction('pathfinder:place', async () => {
+        const pos = toVec3(target)
+        if (options.approach !== false) await approachBlock(pos, options.reach ?? actions.config.reach, options.signal)
+        return await actions.place(pos, options)
+      })
+
+    pf.open = async (target: BlockTarget, options: OpenOptions = {}): Promise<WindowLike> =>
+      await runAction('pathfinder:open', async () => {
+        const pos = toVec3(target)
+        if (options.approach !== false) await approachBlock(pos, options.reach ?? actions.config.reach, options.signal)
+        return await actions.open(resolveBlock(bot as unknown as never, target), options)
+      })
+
+    pf.activate = async (target: BlockTarget, options: ActivateOptions = {}): Promise<void> =>
+      await runAction('pathfinder:activate', async () => {
+        const pos = toVec3(target)
+        if (options.approach !== false) await approachBlock(pos, options.reach ?? actions.config.reach, options.signal)
+        return await actions.activate(resolveBlock(bot as unknown as never, target), options)
+      })
 
     // ── snapshot management ──────────────────────────────────────────────
 
@@ -1367,6 +1573,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
     // still near the path → splice to the closest node and keep walking;
     // snapped away → replan immediately from the corrected position.
     bot.on('forcedMove' as never, (() => {
+      lastForcedMoveAt = performance.now()
       if (path.length === 0) return
       const at = bot.entity.position.floored()
       if (isPositionNearPath(at, path)) {
@@ -1414,6 +1621,19 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       // mid-edge — controls are always released.
       if (stopPathing) {
         internalStop()
+        return
+      }
+
+      // Cooperative interrupts. A stop always outranks a pause (above), but
+      // everything else waits: while a handle is held the executor writes no
+      // controls at all, and the path is left exactly as it was so the bot
+      // carries on from the same node when the holder releases.
+      if (interrupts.gate()) {
+        // Standing still in water is not standing still — it is sinking, at
+        // two blocks a second, for as long as the holder takes.
+        if ((bot.entity as { isInWater?: boolean }).isInWater === true) {
+          bot.setControlState('jump', true)
+        }
         return
       }
 
@@ -1529,8 +1749,8 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       let nextPoint: Move = path[0]
       const p = bot.entity.position
 
-      // Handle digging (canDig solves only) — upstream port: equip the best
-      // tool, dig with forceLook, stand still until the break lands.
+      // Handle digging (canDig solves only): stand still and hand the block
+      // to the interaction table, which equips, aims, guards and verifies.
       if (digging || nextPoint.toBreak.length > 0) {
         if (!digging && bot.entity.onGround) {
           digging = true
@@ -1541,28 +1761,27 @@ export function createPathfinder (options: PathfinderOptions = {}) {
             resetPath('dig_error')
             return
           }
-          const tool = (pf.bestHarvestTool as (blk: unknown) => unknown)(block as never)
           fullStop()
           const pathToken = path
-          const digBlock = (): void => {
-            (bot as unknown as { dig: (blk: unknown, forceLook: boolean) => Promise<void> })
-              .dig(block, true)
-              .catch(() => {
-                if (path === pathToken) resetPath('dig_error')
-              })
-              .then(() => {
-                lastNodeTime = performance.now()
-                digging = false
-              })
-          }
-          if (!tool) {
-            digBlock()
-          } else {
-            (bot as unknown as { equip: (item: unknown, dest: string) => Promise<void> })
-              .equip(tool, 'hand')
-              .catch(() => {})
-              .then(() => digBlock())
-          }
+          // Through the action table, not bot.dig: the guards (vanilla range,
+          // face agreement, grounded stance, mid-dig abort, verify-by-world)
+          // are the same ones bot.pathfinder.dig() gets, and an application
+          // that replaced `actions.dig` gets its own dig here too.
+          //
+          // `approach: false` — the executor is already standing on the node
+          // the planner picked; walking somewhere else mid-path is the last
+          // thing it should do.
+          actions.dig(block as never, { approach: false, equipTool: true })
+            .then(() => {
+              if (path !== pathToken) return
+              lastNodeTime = performance.now()
+            }, (err: unknown) => {
+              bot.emit('pathfinder:dig_error' as never, err as never)
+              if (path === pathToken) resetPath('dig_error')
+            })
+            .then(() => {
+              digging = false
+            })
         }
         return
       }
@@ -1585,7 +1804,12 @@ export function createPathfinder (options: PathfinderOptions = {}) {
           // activateBlock settles async — if the goal/path changed meanwhile,
           // its callbacks must not touch the NEW path's state.
           const pathToken = path
-          bot.activateBlock(block).then(() => {
+          // Through the table too, so an application that wraps `activate`
+          // sees the doors the executor opens as well as the ones it opens
+          // itself. `settle: false` keeps this the same single click it has
+          // always been — the bot is already facing the door it is walking
+          // through, and re-aiming mid-path turns a door into a stall.
+          actions.activate(block as never, { approach: false, retries: 1, settle: false }).then(() => {
             lockUseBlock.release()
             if (path !== pathToken) return
             placingBlock = nextPoint.toPlace.shift() ?? null

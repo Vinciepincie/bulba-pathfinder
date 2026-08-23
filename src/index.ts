@@ -7,6 +7,7 @@
 import { pathfinder, createPathfinder } from './plugin.js'
 import { Movements } from './movements.js'
 import * as goals from './goals.js'
+import { autoEatIntegration } from './integrations/autoEat.js'
 
 export { pathfinder, createPathfinder } from './plugin.js'
 export type { ComputedPathResult } from './plugin.js'
@@ -33,5 +34,20 @@ export { getSharedWorkerHost, SolverWorkerHost } from './worker/host.js'
 export { LutFlags } from './types.js'
 export * as geometry from './geometry.js'
 
+// ── interactions and interrupts (additive; upstream has no equivalent) ────
+export { InterruptController } from './interrupt.js'
+export type { InterruptHandle, InterruptOptions, MotionPhase } from './interrupt.js'
+export { ActionError, ActionErrors, DEFAULT_ACTION_CONFIG } from './actions/types.js'
+export type {
+  ActionConfig, ActionTable, ActivateOptions, BlockTarget, DigOptions,
+  OpenOptions, PacingProfile, PlaceOptions, WindowLike
+} from './actions/types.js'
+export { createActionTable } from './actions/index.js'
+export type { ActionContext, DiggingBot } from './actions/context.js'
+export { Pacer } from './actions/pacing.js'
+export * as reach from './actions/reach.js'
+export { autoEatIntegration } from './integrations/autoEat.js'
+export type { AutoEatControl, AutoEatIntegrationOptions } from './integrations/autoEat.js'
+
 /** Upstream-compatible default export: `{ pathfinder, Movements, goals }`. */
-export default { pathfinder, createPathfinder, Movements, goals }
+export default { pathfinder, createPathfinder, Movements, goals, autoEatIntegration }
