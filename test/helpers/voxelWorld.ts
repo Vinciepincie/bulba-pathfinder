@@ -334,3 +334,15 @@ export function checkWalkable (world: VoxelWorld, start: PathStep, path: PathSte
   }
   return null
 }
+
+/** A north-facing bottom straight mangrove stair (dry) — full-footprint 0.5
+ * slab under the upper step, marked STAIR when extended parkour is on. */
+export const MANGROVE_STAIRS = ((): number => {
+  const b = mcData.blocksByName.mangrove_stairs
+  for (let s = b.minStateId as number; s <= (b.maxStateId as number); s++) {
+    const p = (Block.fromStateId(s, 0) as { getProperties: () => Record<string, unknown> }).getProperties()
+    if (p.half === 'bottom' && p.shape === 'straight' && p.facing === 'north' &&
+        (p.waterlogged === false || p.waterlogged === 'false')) return s
+  }
+  throw new Error('no dry north bottom mangrove_stairs state')
+})()

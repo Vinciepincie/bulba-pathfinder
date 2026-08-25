@@ -202,6 +202,28 @@ describe('buildLut', () => {
       expect(catchClass(head)).to.equal(1)
     })
 
+    it('bottom stairs are marked STAIR in the special grid, top-half stairs are not', () => {
+      // The extended-parkour LUT (allowParkourExtended) carries the special
+      // grid; the walk-only lut used elsewhere in this file does not, so build
+      // one here.
+      const world = new VoxelWorld({ x0: -2, y0: 0, z0: -2, x1: 2, y1: 4, z1: 2 })
+      world.fill(-2, 0, -2, 2, 0, 2, STONE)
+      const bot = makeFakeBot(world)
+      const m = makeOurMovements(bot, { allowParkourExtended: true })
+      const extLut = lutFor(bot, m)
+      const STAIR = 16
+      let bottom = 0
+      let top = 0
+      for (const stateId of statesOf('oak_stairs')) {
+        const props = (Block.fromStateId(stateId, 0) as { getProperties: () => Record<string, unknown> }).getProperties()
+        if (props.waterlogged === true || props.waterlogged === 'true') continue
+        const marked = (extLut.special![stateId] & STAIR) !== 0
+        if (props.half === 'bottom') { bottom++; expect(marked, `bottom ${stateId}`).to.equal(true) } else { top++; expect(marked, `top ${stateId}`).to.equal(false) }
+      }
+      expect(bottom).to.be.greaterThan(0)
+      expect(top).to.be.greaterThan(0)
+    })
+
     it('soul_sand → 28 (0.875 * 32)', () => {
       const soulSand = typeOf('soul_sand').minStateId
       expect(height(soulSand)).to.equal(28)

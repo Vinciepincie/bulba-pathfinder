@@ -146,6 +146,16 @@ export function buildLut (bot: Bot, movements: Movements): BlockLut {
           special[stateId] = LutSpecial.VINE
         } else if (slimeMark && blockType.name === 'slime_block') {
           special[stateId] = LutSpecial.SLIME
+        } else if (slimeMark && blockType.name.endsWith('_stairs')) {
+          // Bottom stairs carry a full-footprint 0.5 slab under their top step
+          // whatever the facing — a parkour flight can catch it and walk up.
+          // Top-half stairs are a full-top block (slab is at the top), so they
+          // are not marked. Detected from the shape: a box whose bottom is 0
+          // and top is 0.5 spanning the whole footprint.
+          const lowSlab = shapes.some(s =>
+            s[1] === 0 && s[4] === 0.5 && s[0] === 0 && s[2] === 0 && s[3] === 1 && s[5] === 1)
+          const hasUpperStep = shapes.some(s => s[4] > 0.5)
+          if (lowSlab && hasUpperStep) special[stateId] = LutSpecial.STAIR
         }
       }
 

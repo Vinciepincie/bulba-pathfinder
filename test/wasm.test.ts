@@ -16,7 +16,7 @@ import { applySnapshotBlockUpdate } from '../src/snapshot.js'
 import type { DigData } from '../src/types.js'
 import {
   VoxelWorld, makeFakeBot, makeOurMovements, lutFor, snapshotFromWorld,
-  AIR, STONE, DIRT, WATER, OAK_LEAVES, LADDER, LADDER_DRY, OAK_FENCE_DRY, SLIME, CREEPER_HEAD, STONE_SLAB_BOTTOM
+  AIR, STONE, DIRT, WATER, OAK_LEAVES, LADDER, LADDER_DRY, OAK_FENCE_DRY, SLIME, CREEPER_HEAD, STONE_SLAB_BOTTOM, MANGROVE_STAIRS
 } from './helpers/voxelWorld.js'
 
 function mulberry32 (seed: number): () => number {
@@ -46,6 +46,7 @@ function genWorld (seed: number): VoxelWorld {
       else if (r < 0.225) world.fill(x, 1, z, x, 1 + Math.floor(rand() * 2), z, OAK_FENCE_DRY)
       else if (r < 0.235) world.set(x, 1 + Math.floor(rand() * 2), z, CREEPER_HEAD)
       else if (r < 0.25) world.fill(x, 0, z, x, Math.floor(rand() * 2), z, SLIME)
+      else if (r < 0.26) world.set(x, 1, z, MANGROVE_STAIRS)
     }
   }
   world.fill(0, 1, 0, 2, 3, 2, AIR)

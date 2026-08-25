@@ -79,6 +79,7 @@ const BUBBLE_UP = LutSpecial.BUBBLE_UP;
 const BUBBLE_DOWN = LutSpecial.BUBBLE_DOWN;
 const SPECIAL_VINE = LutSpecial.VINE;
 const SPECIAL_SLIME = LutSpecial.SLIME;
+const SPECIAL_STAIR = LutSpecial.STAIR;
 /** Bubble-only semantics (float support, fall catching, no-jump) must not
  * fire on VINE/SLIME-marked cells. */
 const BUBBLE_MASK = BUBBLE_UP | BUBBLE_DOWN;
@@ -1231,7 +1232,14 @@ export class MoveGen {
             dy = nodeY - y;
         }
         else {
-            const rise = this.heightAt(tx, supY, tz) - h0;
+            // A bottom stair is landed on its full-footprint 0.5 slab (the
+            // body walks up the step from there): half a block lower than the
+            // top, so half a block more usable flight. Any other support lands
+            // on its collision top.
+            const landTop = (this.specialAt(tx, supY, tz) & SPECIAL_STAIR) !== 0
+                ? supY + 0.5
+                : this.heightAt(tx, supY, tz);
+            const rise = landTop - h0;
             dy = Math.floor(rise);
             frac = rise - dy;
             if (dy >= 1) {

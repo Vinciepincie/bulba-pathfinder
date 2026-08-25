@@ -41,6 +41,7 @@ const BUBBLE_UP: u8 = 1;
 const BUBBLE_DOWN: u8 = 2;
 const SPECIAL_VINE: u8 = 4;
 const SPECIAL_SLIME: u8 = 8;
+const SPECIAL_STAIR: u8 = 16;
 // Bubble-only semantics must not fire on VINE/SLIME-marked cells.
 const BUBBLE_MASK: u8 = BUBBLE_UP | BUBBLE_DOWN;
 
@@ -1468,7 +1469,14 @@ impl SolverState {
         if sup_y == i32::MIN {
             dy = node_y - y;
         } else {
-            let rise = self.height_at(tx, sup_y, tz) - h_0;
+            // A bottom stair is landed on its 0.5 slab (walk up the step):
+            // half a block lower than the top, half a block more flight.
+            let land_top = if (self.special_at(tx, sup_y, tz) & SPECIAL_STAIR) != 0 {
+                sup_y as f64 + 0.5
+            } else {
+                self.height_at(tx, sup_y, tz)
+            };
+            let rise = land_top - h_0;
             let mut d = rise.floor() as i32;
             frac = rise - d as f64;
             if d >= 1 {

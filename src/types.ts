@@ -68,7 +68,15 @@ export const LutSpecial = {
   VINE: 4,
   /** slime_block — a drop onto it rebounds (improvement, marked only when
    * the profile enables allowParkourExtended: slime-bounce moves). */
-  SLIME: 8
+  SLIME: 8,
+  /**
+   * Bottom stair (improvement, allowParkourExtended): its lower slab
+   * [0,0,0,1,0.5,1] is full-footprint whatever the facing, so a parkour
+   * flight can catch the block half a block below its top and walk up the
+   * step — half a block more usable flight than a full-block landing. Marked
+   * only on straight/corner bottom stairs (top-half stairs stay full-top).
+   */
+  STAIR: 16
 } as const
 
 /**
