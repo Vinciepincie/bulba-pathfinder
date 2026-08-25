@@ -96,10 +96,17 @@ export function runRow (runLength: number): number {
 export const J_CHAIN: readonly number[] = [
   2.688724183712625, 3.6039027342842247, 4.2047374170597385, 4.502855113817017, 5.095160282550845, 5.389579921413924, 5.6829817927793265, 5.975457495721843, 6.267090385399532, 6.55795631500623
 ]
-/** A chained second jump keeps its momentum only while it continues the
- * first jump's direction: cos(angle) between the two flight lines ≥ this
- * (~32°; a 45° turn lost enough on the arena's simple2 to miss a (3,3)). */
-export const CHAIN_MIN_COS = 0.85
+/**
+ * A chained second jump keeps most of its momentum through a turn — the
+ * re-jump re-accelerates in the new direction with sprint, so the reach
+ * barely falls with the turn angle (measured, first-hop landing speed:
+ * 0° 3.90 flat, 30° 3.81, 45° 3.70, 60° 3.56). The cutoff is where the
+ * turned reach drops below J_CHAIN's promise (flat 3.60): 45°, cos 0.70.
+ * Beyond that the incoming momentum no longer covers the row. (The simple2
+ * miss that once motivated a tighter 0.85 was the executor sliding off the
+ * stone, fixed by CHAIN_TAKEOFF_FRACTION + the landing-tick rollout gate.)
+ */
+export const CHAIN_MIN_COS = 0.70
 /**
  * The re-jump's takeoff credit is HALF the standing creep credit of the
  * stone (min(TAKEOFF_STAND, half + margin) / 2): the first hop is aimed
