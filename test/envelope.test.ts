@@ -1,12 +1,15 @@
 // Guards the pasted physics constants in src/parkourEnvelope.ts and the
 // generated offset table in src/parkourTable.ts.
 import { expect } from 'chai'
-import { deriveJumpEnvelope, measureFlightCurve } from './helpers/jumpEnvelope.js'
+import { deriveJumpEnvelope, measureFlightCurve, measureSlimeBounce, measureChainTakeoff, measureRunTakeoff, BOUNCE_MAX_DROP as HELPER_BOUNCE_MAX, RUN_LENGTHS as HELPER_RUN_LENGTHS } from './helpers/jumpEnvelope.js'
 import {
-  J_STANDING, J_RUNNING, J_LOW_STANDING, J_LOW_RUNNING, reachBucket, ENVELOPE_BUCKETS,
+  J_STANDING, J_RUNNING, J_LOW_STANDING, J_LOW_RUNNING, J_CHAIN, J_RUN, J_LOW_RUN, RUN_LENGTHS, runRow, reachBucket, ENVELOPE_BUCKETS,
   FLIGHT_STANDING, FLIGHT_RUNNING, FLIGHT_LOW_STANDING, FLIGHT_LOW_RUNNING,
-  feetAt, flightNeeded, takeoffStand, takeoffRun
+  feetAt, flightNeeded, takeoffStand, takeoffRun,
+  BOUNCE_APEX, BOUNCE_MAX_DROP, TAKEOFF_STAND, TAKEOFF_NARROW_MARGIN, LAND_HALF, LAND_NARROW_MARGIN
 } from '../src/parkourEnvelope.js'
+import { CATCH_HALF, topCatchClass } from '../src/shapes.js'
+import { Block, mcData } from './helpers/voxelWorld.js'
 import { getParkourExtTable } from '../src/parkourTable.js'
 import type { ParkourExtEntry } from '../src/parkourTable.js'
 
@@ -22,8 +25,8 @@ describe('parkour reach envelope', function () {
       expect(J_RUNNING[i]).to.be.closeTo(running[i], 1e-12, `running bucket ${i}`)
     }
     // Anchor against the parkour community's tick math (mcpk.wiki): the flat
-    // sprint-jam flight is 2.6234 blocks (J is that minus the 0.2 margin).
-    expect(J_STANDING[reachBucket(0)]).to.be.closeTo(2.6234315139003863 - 0.2, 1e-9)
+    // sprint-jam flight is 2.6234 blocks (J is that minus the 0.1 margin).
+    expect(J_STANDING[reachBucket(0)]).to.be.closeTo(2.6234315139003863 - 0.1, 1e-9)
     // Head-hitter class (lid 2 above the feet, arc bonks at +0.2).
     const [lowStanding, lowRunning] = deriveJumpEnvelope(true)
     for (let i = 0; i < ENVELOPE_BUCKETS; i++) {
@@ -33,6 +36,79 @@ describe('parkour reach envelope', function () {
     // +1 landings are impossible under a 2-high lid (sentinel row ≤ 0).
     expect(J_LOW_STANDING[reachBucket(1)]).to.be.at.most(0)
     expect(J_LOW_RUNNING[reachBucket(1)]).to.be.at.most(0)
+  })
+
+  it('run-length rows match a fresh prismarine-physics derivation exactly', () => {
+    expect(RUN_LENGTHS).to.deep.equal(HELPER_RUN_LENGTHS)
+    for (let r = 0; r < RUN_LENGTHS.length; r++) {
+      const row = measureRunTakeoff(RUN_LENGTHS[r], false)
+      const low = measureRunTakeoff(RUN_LENGTHS[r], true)
+      for (let i = 0; i < ENVELOPE_BUCKETS; i++) {
+        expect(J_RUN[r][i]).to.be.closeTo(row[i], 1e-12, `run ${RUN_LENGTHS[r]} bucket ${i}`)
+        expect(J_LOW_RUN[r][i]).to.be.closeTo(low[i], 1e-12, `low run ${RUN_LENGTHS[r]} bucket ${i}`)
+      }
+    }
+    // The jam is row 0, and every block of run only ever adds reach.
+    expect(J_RUN[0]).to.deep.equal(J_STANDING)
+    for (let r = 1; r < RUN_LENGTHS.length; r++) {
+      for (let i = 0; i < ENVELOPE_BUCKETS; i++) expect(J_RUN[r][i]).to.be.at.least(J_RUN[r - 1][i] - 1e-9)
+    }
+    // A fence post's 0.81 of run already covers the recorded human hops
+    // (pot→pot (5,-2) and pot→head (3,2)+1 on the arena's parkouradv1).
+    expect(runRow(0.81)).to.equal(2)
+    expect(runRow(1.38)).to.equal(3)
+    expect(runRow(2.38)).to.equal(5)
+  })
+
+  it('momentum-chain row matches a fresh prismarine-physics derivation exactly', () => {
+    const chain = measureChainTakeoff()
+    expect(chain).to.have.length(ENVELOPE_BUCKETS)
+    for (let i = 0; i < ENVELOPE_BUCKETS; i++) {
+      expect(J_CHAIN[i]).to.be.closeTo(chain[i], 1e-12, `chain bucket ${i}`)
+      // Landing speed carried into the takeoff beats a run-up from rest.
+      expect(J_CHAIN[i]).to.be.above(J_RUNNING[i])
+    }
+  })
+
+  it('slime-bounce apex constants match a fresh prismarine-physics derivation exactly', () => {
+    const apex = measureSlimeBounce()
+    expect(BOUNCE_MAX_DROP).to.equal(HELPER_BOUNCE_MAX)
+    expect(BOUNCE_APEX).to.have.length(BOUNCE_MAX_DROP + 1)
+    for (let d = 0; d <= BOUNCE_MAX_DROP; d++) {
+      expect(BOUNCE_APEX[d]).to.be.closeTo(apex[d], 1e-12, `drop ${d}`)
+    }
+    // A rebound never returns the whole drop (drag), and grows with it.
+    for (let d = 2; d <= BOUNCE_MAX_DROP; d++) {
+      expect(BOUNCE_APEX[d]).to.be.below(d)
+      if (d > 2) expect(BOUNCE_APEX[d]).to.be.above(BOUNCE_APEX[d - 1])
+    }
+  })
+
+  it('narrow-support credits reduce to the full-block constants at class 0', () => {
+    expect(Math.min(TAKEOFF_STAND, CATCH_HALF[0] + TAKEOFF_NARROW_MARGIN)).to.equal(TAKEOFF_STAND)
+    expect(CATCH_HALF[0] + LAND_NARROW_MARGIN).to.equal(LAND_HALF)
+    // Classification of the shapes the solver meets on a parkour course.
+    const shapesOf = (name: string): number[][] => {
+      const b = (mcData as { blocksByName: Record<string, { minStateId: number, maxStateId: number }> }).blocksByName[name]
+      for (let s = b.minStateId; s <= b.maxStateId; s++) {
+        const blk = Block.fromStateId(s, 0) as { getProperties: () => Record<string, unknown>, shapes: number[][] }
+        const p = blk.getProperties()
+        if (p.waterlogged === true || p.waterlogged === 'true') continue
+        if (name === 'oak_fence' && Object.values(p).some(v => v === true || v === 'true')) continue
+        if (name === 'oak_stairs' && p.half !== 'bottom') continue
+        return blk.shapes
+      }
+      throw new Error(`no plain state for ${name}`)
+    }
+    expect(topCatchClass(shapesOf('stone'))).to.equal(0)
+    expect(topCatchClass(shapesOf('stone_slab'))).to.equal(0)
+    expect(topCatchClass(shapesOf('oak_stairs'))).to.equal(0) // both steps within step height
+    expect(topCatchClass(shapesOf('chest'))).to.equal(0) // 0.4375 half
+    expect(topCatchClass(shapesOf('creeper_head'))).to.equal(1) // 0.25 half
+    expect(topCatchClass(shapesOf('cobblestone_wall'))).to.equal(1) // post 0.25 half
+    expect(topCatchClass(shapesOf('oak_fence'))).to.equal(3) // post 0.125 half
+    expect(topCatchClass(shapesOf('flower_pot'))).to.equal(2) // 0.1875 half
+    expect(topCatchClass([])).to.equal(0)
   })
 
   it('flight curves match a fresh prismarine-physics derivation exactly', () => {

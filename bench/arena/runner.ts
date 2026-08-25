@@ -176,6 +176,8 @@ export interface RunResult {
 export interface MovementProfile {
   extendedParkour: boolean
   maxDropDown: number
+  /** Override for Movements.parkourSafetyMargin (undefined = the package default). */
+  safetyMargin?: number
   thinkTimeout: number
 }
 
@@ -241,6 +243,7 @@ export function applyProfile (
   // allowed to differ. `--parity` turns both off for an apples-to-apples run.
   if (impl !== 'upstream') {
     movements.allowParkourExtended = profile.extendedParkour
+    if (profile.safetyMargin !== undefined) movements.parkourSafetyMargin = profile.safetyMargin
     // `bulba-nohop` is `bulba` with the sprint-hop gait off and nothing else.
     // Racing them side by side is how the gait is measured — same terrain,
     // same tick, same server hitch — instead of across two runs.
@@ -633,10 +636,17 @@ export class Racer {
     // results carry `path: []` — so an unreachable goal reports "arrived" in
     // 90 ms without the bot moving. Scoring the promise would hand upstream a
     // win for giving up fastest.
-    const f = (deathPos ?? bot.entity.position).floored()
+    // A stand on a fence post, pot or head has its node in the cell ABOVE
+    // the block while the feet rest in the upper part of the block's own
+    // cell (260.5 on a pot whose node is 261), so the feet may floor to one
+    // below the end cell as long as they are clearly off that cell's floor.
+    const endPos = deathPos ?? bot.entity.position
+    const f = endPos.floored()
+    const onEndColumn = f.x === end[0] && f.z === end[2]
+    const atEndHeight = f.y === end[1] || (f.y === end[1] - 1 && endPos.y - f.y >= 0.3)
     const reached = tolerance > 0
       ? result.endDistance <= tolerance + 0.5
-      : f.x === end[0] && f.y === end[1] && f.z === end[2]
+      : onEndColumn && atEndHeight
     if (reached) {
       result.outcome = 'arrived'
     } else if (result.outcome === 'arrived' || result.outcome === 'stopped') {

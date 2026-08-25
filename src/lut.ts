@@ -9,6 +9,7 @@
 import type { Bot } from 'mineflayer'
 import prismarineBlockLoader from 'prismarine-block'
 import { LutFlags, LutSpecial } from './types.js'
+import { topCatchClass } from './shapes.js'
 import type { Movements } from './movements.js'
 
 export interface BlockLut {
@@ -16,7 +17,8 @@ export interface BlockLut {
   maxStateId: number
   /** flags[stateId] — LutFlags byte. */
   flags: Uint8Array
-  /** heights[stateId] — max collision-shape top in 1/32 blocks (0 when no shapes). */
+  /** heights[stateId] — packed: bits 0–5 max collision-shape top in 1/32
+   * blocks (0 when no shapes), bits 6–7 topCatchClass (see types.ts). */
   heights: Uint8Array
   /** special[stateId] — LutSpecial byte (bubble columns). Null unless the
    * profile opts into a feature that needs it (useBubbleColumns). */
@@ -78,11 +80,13 @@ export function buildLut (bot: Bot, movements: Movements): BlockLut {
 
   const flags = new Uint8Array(maxStateId + 1)
   const heights = new Uint8Array(maxStateId + 1)
-  // The special grid exists only when a feature needs it: bubble columns
-  // and/or climbable vines (vine cells need the wall-adjacency rule).
+  // The special grid exists only when a feature needs it: bubble columns,
+  // climbable vines (vine cells need the wall-adjacency rule), and slime
+  // blocks when the extended-parkour repertoire (bounce moves) is on.
   const vineBlock = registry.blocksArray.find(b => b.name === 'vine')
   const vineClimb = vineBlock !== undefined && movements.climbables.has(vineBlock.id)
-  const special = movements.useBubbleColumns || vineClimb ? new Uint8Array(maxStateId + 1) : null
+  const slimeMark = movements.allowParkourExtended
+  const special = movements.useBubbleColumns || vineClimb || slimeMark ? new Uint8Array(maxStateId + 1) : null
   const shapeStarts = new Int32Array(maxStateId + 1).fill(-1)
   const shapeCounts = new Uint8Array(maxStateId + 1)
   const shapeChunks: number[] = []
@@ -140,16 +144,19 @@ export function buildLut (bot: Bot, movements: Movements): BlockLut {
           special[stateId] = drag ? LutSpecial.BUBBLE_DOWN : LutSpecial.BUBBLE_UP
         } else if (vineClimb && blockType.name === 'vine') {
           special[stateId] = LutSpecial.VINE
+        } else if (slimeMark && blockType.name === 'slime_block') {
+          special[stateId] = LutSpecial.SLIME
         }
       }
 
-      // Collision-top height, quantized to 1/32 blocks. Vanilla shape tops are
-      // multiples of 1/16 (a few 1/32), so this is exact, not approximate.
+      // Collision-top height, quantized to 1/32 blocks (vanilla shape tops
+      // are multiples of 1/16 — a few 1/32 — and max out at 1.5, so 6 bits
+      // are exact), packed with the topCatchClass in bits 6–7 (types.ts).
       let top = 0
       for (const s of shapes) {
         if (s[4] > top) top = s[4]
       }
-      heights[stateId] = Math.min(255, Math.round(top * 32))
+      heights[stateId] = Math.min(63, Math.round(top * 32)) | (topCatchClass(shapes) << 6)
 
       if (shapes.length > 0) {
         const key = JSON.stringify(shapes)

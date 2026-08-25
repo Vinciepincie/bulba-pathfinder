@@ -16,7 +16,7 @@ import { applySnapshotBlockUpdate } from '../src/snapshot.js'
 import type { DigData } from '../src/types.js'
 import {
   VoxelWorld, makeFakeBot, makeOurMovements, lutFor, snapshotFromWorld,
-  AIR, STONE, DIRT, WATER, OAK_LEAVES, LADDER
+  AIR, STONE, DIRT, WATER, OAK_LEAVES, LADDER, LADDER_DRY, OAK_FENCE_DRY, SLIME, CREEPER_HEAD, STONE_SLAB_BOTTOM
 } from './helpers/voxelWorld.js'
 
 function mulberry32 (seed: number): () => number {
@@ -41,6 +41,11 @@ function genWorld (seed: number): VoxelWorld {
       else if (r < 0.18) world.set(x, 1, z, OAK_LEAVES)
       else if (r < 0.2 && world.stateAt(x, 1, z) === AIR) world.set(x, 1, z, WATER)
       else if (r < 0.21) world.set(x, 1, z, LADDER)
+      // Narrow supports and slime, so the extended repertoire's fence
+      // stands, catch credits and bounces are exercised by the fuzz too.
+      else if (r < 0.225) world.fill(x, 1, z, x, 1 + Math.floor(rand() * 2), z, OAK_FENCE_DRY)
+      else if (r < 0.235) world.set(x, 1 + Math.floor(rand() * 2), z, CREEPER_HEAD)
+      else if (r < 0.25) world.fill(x, 0, z, x, Math.floor(rand() * 2), z, SLIME)
     }
   }
   world.fill(0, 1, 0, 2, 3, 2, AIR)
@@ -54,7 +59,9 @@ interface Pair {
 
 function pathKey (r: RawSolveResult): string {
   return r.path.map(n =>
-    `${n.x},${n.y},${n.z},${n.parkour ? 1 : 0},${n.useOne ? 1 : 0},[${(n.toBreak ?? []).map(b => `${b.x},${b.y},${b.z}`).join(';')}]`
+    `${n.x},${n.y},${n.z},${n.parkour ? 1 : 0},${n.useOne ? 1 : 0},` +
+    `${n.via ? `v${n.via.x},${n.via.y},${n.via.z}` : '-'}${n.chain ? 'c' : ''},` +
+    `[${(n.toBreak ?? []).map(b => `${b.x},${b.y},${b.z}`).join(';')}]`
   ).join('|')
 }
 
@@ -106,6 +113,7 @@ describe('wasm ↔ JS solver differential', function () {
         flags: snap.flags,
         heights: snap.heights,
         states: snap.states,
+        special: snap.special,
         entityIdx: snap.entityIdx,
         entityWeight: snap.entityWeight
       },
@@ -174,6 +182,51 @@ describe('wasm ↔ JS solver differential', function () {
     assertIdentical(pair, 'ext course')
     // Flag off: both must agree it is unreachable.
     assertIdentical(solveBoth(world, new GoalBlock(9, 2, 8)), 'ext course flag off')
+  })
+
+  it('advanced course identical (fence tops, head, spiral ladders, slime stone + bounce)', () => {
+    // Start pillar → fence-post hop → creeper head → slime stepping stone →
+    // drop onto a slime and bounce up onto a ledge → catch a ladder → climb
+    // a spiral of ladders round a 1x1 pillar → exit onto its top (goal).
+    const world = new VoxelWorld({ x0: -2, y0: -3, z0: -2, x1: 24, y1: 14, z1: 10 })
+    world.set(1, 0, 1, STONE) // start stand (1,1,1)
+    world.fill(3, -1, 1, 3, 0, 1, OAK_FENCE_DRY) // 2-stack: top 1.5 → stand (3,1,1) feet 1.5
+    world.set(5, 0, 2, CREEPER_HEAD) // head top 0.5 → stand (5,1,2)
+    world.set(7, 0, 2, SLIME) // slime stepping stone, stand (7,1,2)
+    world.set(9, 0, 2, STONE) // stand (9,1,2)
+    world.set(11, 1, 2, STONE) // up-jump (2,0) +1 → stand (11,2,2)
+    world.set(13, 2, 2, STONE) // up-jump (2,0) +1 → stand (13,3,2)
+    world.set(15, 2, 2, STONE) // flat hop → stand (15,3,2): the bounce takeoff
+    world.set(16, -1, 2, SLIME) // cardinal drop of 3 onto the slime (stand 16,0,2) → rebound apex 2.10
+    world.set(17, 1, 2, STONE_SLAB_BOTTOM) // ring-1 ledge: top 1.5 — too high to jump from the slime,
+    //                                      under the 1.9 rebound: bounce lands (17,2,2)
+    world.set(17, 4, 2, STONE) // head-height lid over the ledge: vetoes every direct flight onto it
+    //                            (and the (4,1) flight past it), clears the rebound (head tops 3.7)
+    world.set(17, 4, 3, STONE) // ...and the (3,2) flight from the takeoff straight to the west ladder
+    world.set(19, 2, 3, LADDER_DRY) // (2,1) hop from the ledge catches the ladder at flight level
+    world.fill(19, 0, 4, 19, 6, 4, STONE) // the pillar it hangs on (north face); top stand (19,7,4)
+    world.set(18, 3, 4, LADDER_DRY) // west face, one up — diagonal transfer round the corner
+    world.set(19, 4, 5, LADDER_DRY) // south face
+    world.set(20, 5, 4, LADDER_DRY) // east face
+    world.set(20, 6, 4, LADDER_DRY) // east face, straight up, then out onto the top
+    const pair = solveBoth(world, new GoalBlock(19, 7, 4), { parkourExtended: true })
+    expect(pair.js.status).to.equal('success')
+    // A momentum chain folds its stepping stone into `via`, so a stand the
+    // body lands on may appear as a via rather than a node — and a chain off
+    // the fence post can legitimately fly straight past the head.
+    const nodes = pair.js.path.flatMap(n => [`${n.x},${n.y},${n.z}`, ...(n.via ? [`${n.via.x},${n.via.y},${n.via.z}`] : [])])
+    expect(nodes).to.include('3,1,1') // fence top
+    expect(nodes).to.include('7,1,2') // slime stone
+    const bounce = pair.js.path.find(n => n.via !== undefined && n.chain !== true)
+    expect(bounce, 'bounce edge on the path').to.not.equal(undefined)
+    expect([bounce!.x, bounce!.y, bounce!.z]).to.deep.equal([17, 2, 2])
+    expect(bounce!.via).to.deep.equal({ x: 16, y: 0, z: 2 })
+    expect(nodes).to.include('19,2,3') // ladder catch
+    expect(nodes).to.include('18,3,4') // spiral transfer
+    expect(nodes).to.include('19,4,5')
+    expect(nodes).to.include('20,5,4')
+    assertIdentical(pair, 'advanced course')
+    assertIdentical(solveBoth(world, new GoalBlock(19, 7, 4)), 'advanced course flag off')
   })
 
   const EXT_CASES = Math.max(10, CASES / 2)

@@ -11,7 +11,7 @@
 import type { GoalDescriptor, MovementsConfig, RawPathNode, DigData, SnapshotMeta } from '../types.js'
 import type { RawSolveResult } from '../solver.js'
 import { getParkourExtTable, serializeParkourTable } from '../parkourTable.js'
-import { J_STANDING, J_RUNNING, J_LOW_STANDING, J_LOW_RUNNING } from '../parkourEnvelope.js'
+import { J_RUN, J_LOW_RUN, ENVELOPE_SAFETY_MARGIN } from '../parkourEnvelope.js'
 
 interface WasmExports {
   memory: WebAssembly.Memory
@@ -215,11 +215,11 @@ export class WasmSolver {
     // ── per-solve blobs: params + entity weights + parkour table ─────────
     const entityCount = snap.entityIdx.length
     const entitySize = entityCount * 8
-    const paramsSize = 4 * 4 + specs.length * 36 + 4 * 2 + 8 * 5 + 4 * 2 + 4 * 2
+    const paramsSize = 4 * 4 + specs.length * 36 + 4 * 2 + 8 * 6 + 4 * 2 + 4 * 2
     // The extended-parkour table travels with the solve (~2.5KB) so the core
     // consumes the exact table the JS reference builds — one geometry source.
     const extBlob = cfg.allowParkourExtended && cfg.allowParkour && cfg.allowSprinting
-      ? serializeParkourTable(getParkourExtTable(), J_STANDING, J_RUNNING, J_LOW_STANDING, J_LOW_RUNNING)
+      ? serializeParkourTable(getParkourExtTable(), J_RUN, J_LOW_RUN)
       : null
     // Allocs before any view — each may grow (and detach views of) wasm
     // memory; resident snapshot/dig data stays valid (growth extends).
@@ -265,6 +265,7 @@ export class WasmSolver {
     i32(cfg.maxDropDown)
     f64(cfg.liquidCost); f64(cfg.entityCost); f64(cfg.digCost)
     f64(cfg.bubbleCost)
+    f64(ENVELOPE_SAFETY_MARGIN - (cfg.parkourSafetyMargin ?? ENVELOPE_SAFETY_MARGIN)) // margin credit
     f64(opts.searchRadius)
     u32(entityPtr); u32(entityCount)
     u32(extPtr); u32(extBlob !== null ? extBlob.byteLength : 0)
@@ -332,7 +333,6 @@ export class WasmSolver {
       const z = view.getInt32(off, true); off += 4
       const edgeCost = view.getFloat64(off, true); off += 8
       const meta = view.getUint8(off); off += 1
-      const breakCount = view.getUint16(off, true); off += 2
       const node: RawPathNode = {
         x,
         y,
@@ -341,6 +341,16 @@ export class WasmSolver {
         parkour: (meta & 1) !== 0,
         useOne: (meta & 2) !== 0 ? { x, y, z } : null
       }
+      if ((meta & (4 | 8)) !== 0) {
+        // META_BOUNCE / META_CHAIN: the via cell follows the meta byte
+        // (lib.rs serialize_result), before the toBreak list.
+        const vx = view.getInt32(off, true); off += 4
+        const vy = view.getInt32(off, true); off += 4
+        const vz = view.getInt32(off, true); off += 4
+        node.via = { x: vx, y: vy, z: vz }
+        if ((meta & 8) !== 0) node.chain = true
+      }
+      const breakCount = view.getUint16(off, true); off += 2
       if (breakCount > 0) {
         node.toBreak = []
         for (let b = 0; b < breakCount; b++) {

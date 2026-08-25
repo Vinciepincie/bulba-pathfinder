@@ -36,11 +36,12 @@ const DOOR_OPEN: u8 = 64;
 const GATE_OPEN: u8 = 128;
 const PASSABLE_WHEN_OPEN: u8 = DOOR_OPEN | GATE_OPEN;
 
-// LutSpecial bytes (bubble columns, vines — see types.ts).
+// LutSpecial bytes (bubble columns, vines, slime — see types.ts).
 const BUBBLE_UP: u8 = 1;
 const BUBBLE_DOWN: u8 = 2;
 const SPECIAL_VINE: u8 = 4;
-// Bubble-only semantics must not fire on VINE-marked cells.
+const SPECIAL_SLIME: u8 = 8;
+// Bubble-only semantics must not fire on VINE/SLIME-marked cells.
 const BUBBLE_MASK: u8 = BUBBLE_UP | BUBBLE_DOWN;
 
 // DigFlags (must match src/types.ts)
@@ -49,9 +50,81 @@ const CANT_BREAK: u8 = 2;
 
 const META_PARKOUR: u8 = 1;
 const META_USEONE: u8 = 2;
+const META_BOUNCE: u8 = 4;
+const META_CHAIN: u8 = 8;
 
 const CARDINAL: [(i32, i32); 4] = [(-1, 0), (1, 0), (0, -1), (0, 1)];
 const DIAGONAL: [(i32, i32); 4] = [(-1, -1), (-1, 1), (1, -1), (1, 1)];
+
+// Climb-transfer directions + per-direction cost (mirror of moveGen.ts).
+const TRANSFER: [(i32, i32); 8] = [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)];
+const TRANSFER_COST: [f64; 8] = [1.5, 1.5, 1.5, 1.5, SQRT_2 + 0.5, SQRT_2 + 0.5, SQRT_2 + 0.5, SQRT_2 + 0.5];
+
+// Slime-bounce landing columns (mirror of moveGen.ts BOUNCE_X/Z).
+const BOUNCE_OFF: [(i32, i32); 12] = [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1), (-2, 0), (2, 0), (0, -2), (0, 2)];
+const BOUNCE_RING1: usize = 8;
+
+// Narrow-support credits and the slime-bounce envelope: pasted from
+// src/parkourEnvelope.ts / shapes.ts (envelope.test.ts pins the JS side to
+// the physics; wasm.test.ts pins this side to the JS side).
+const CATCH_HALF: [f64; 4] = [0.5, 0.25, 0.1875, 0.125];
+/// Run lengths the J_RUN rows were measured at (parkourEnvelope.ts RUN_LENGTHS).
+const RUN_LENGTHS: [f64; 7] = [0.0, 0.4, 0.8, 1.2, 1.6, 2.0, 3.0];
+
+/// Mirror of parkourEnvelope.ts runRow: longest measured run ≤ run_length.
+#[inline]
+fn run_row(run_length: f64) -> usize {
+    let mut row = 0;
+    for i in 1..RUN_LENGTHS.len() {
+        if RUN_LENGTHS[i] <= run_length {
+            row = i;
+        }
+    }
+    row
+}
+const LAND_HALF: f64 = 0.8;
+const TAKEOFF_STAND: f64 = 0.6;
+const TAKEOFF_NARROW_MARGIN: f64 = 0.28;
+const LAND_NARROW_MARGIN: f64 = 0.3;
+const BOUNCE_APEX: [f64; 9] = [
+    0.0, 0.0, 1.299059403294517, 2.1016917686844407, 2.5491276710482,
+    3.5285290916089673, 4.052437529400663, 4.592855224215983, 5.161928468689879,
+];
+const BOUNCE_MAX_DROP: i32 = 8;
+const BOUNCE_MARGIN: f64 = 0.2;
+const BOUNCE_MARGIN_FAR: f64 = 1.0;
+/// Momentum-chain row (pasted from src/parkourEnvelope.ts J_CHAIN).
+const J_CHAIN: [f64; 10] = [
+    2.5887241837126247, 3.5039027342842246, 4.104737417059738,
+    4.402855113817017, 4.995160282550844, 5.289579921413924,
+    5.582981792779326, 5.875457495721842, 6.167090385399532, 6.457956315006229,
+];
+const CHAIN_MIN_COS: f64 = 0.85;
+const CHAIN_TAKEOFF_FRACTION: f64 = 0.5;
+const CHAIN_MIN_COS2: f64 = CHAIN_MIN_COS * CHAIN_MIN_COS;
+const CHAIN_CAP: usize = 256;
+
+/// Mirror of moveGen.ts chainAligned: cos(angle) ≥ CHAIN_MIN_COS, exact.
+#[inline]
+fn chain_aligned(abx: i32, abz: i32, ab2: i32, bcx: i32, bcz: i32) -> bool {
+    let dot = abx * bcx + abz * bcz;
+    if dot <= 0 {
+        return false;
+    }
+    (dot * dot) as f64 >= CHAIN_MIN_COS2 * ab2 as f64 * (bcx * bcx + bcz * bcz) as f64
+}
+
+/// Mirror of moveGen.ts flightFrom: per-axis credited flight for offset
+/// (a, b) from takeoff point `s` along the line — sqrt of a sum, never
+/// hypot, so both engines round identically.
+#[inline]
+fn flight_from(a: f64, b: f64, dist: f64, s: f64, l_cred: f64) -> f64 {
+    let dx = a - a / dist * s - l_cred;
+    let dz = b - b / dist * s - l_cred;
+    let px = if dx > 0.0 { dx } else { 0.0 };
+    let pz = if dz > 0.0 { dz } else { 0.0 };
+    (px * px + pz * pz).sqrt()
+}
 
 /// Extended-parkour offset, received from JS with the solve params — the
 /// table (offsets, swept-corridor cells, reach envelope) is GENERATED once in
@@ -195,6 +268,8 @@ struct Config {
     entity_cost: f64,
     dig_cost: f64,
     bubble_cost: f64,
+    /// ENVELOPE_SAFETY_MARGIN − parkourSafetyMargin (moveGen.ts marginCredit).
+    margin_credit: f64,
 }
 
 // ── heap (mirror of src/heap.ts) ──────────────────────────────────────────
@@ -273,11 +348,13 @@ impl MinHeap {
 // (4 cardinals x forward/jumpUp/dropDown, 4 diagonals, down, up, two bubble
 // rides), upstream's cardinal parkour up to 12 more when the table is off,
 // and the extended table one per entry per applicable direction — 32*4 + 5*2
-// + 5*2 = 148 today, so 168 in the worst case. 160 was 8 short of that, and
-// in Rust the overflow is an index panic inside the wasm core (the solve
-// traps and the host falls back to main-thread JS) rather than the silently
-// dropped write the JS typed arrays give. 192 leaves the table room to grow.
-const OUT_CAP: usize = 192;
+// + 5*2 = 148 today, so 168 in the worst case; extended parkour also adds
+// up to 24 climb transfers and 12 slime-bounce landings per drop generator
+// (5 of them), 252 in all, plus up to CHAIN_CAP momentum chains. In Rust an
+// overflow is an index panic inside the wasm core (the solve traps and the
+// host falls back to main-thread JS) rather than the silently dropped write
+// the JS typed arrays give. 576 leaves the table room to grow.
+const OUT_CAP: usize = 576;
 
 struct NeighborOut {
     idx: [i32; OUT_CAP],
@@ -287,6 +364,8 @@ struct NeighborOut {
     cost: [f64; OUT_CAP],
     meta: [u8; OUT_CAP],
     breaks: [Option<Vec<i32>>; OUT_CAP],
+    /// Slime stand cell of a META_BOUNCE neighbour, -1 otherwise.
+    via: [i32; OUT_CAP],
     count: usize,
 }
 
@@ -324,9 +403,9 @@ struct SolverState {
     /// block·ext_mf_block + cells_off + k.
     ext_mf: Vec<f64>,
     ext_mf_block: usize,
-    /// [0..10) standing, [10..20) running, [20..30) low-standing,
-    /// [30..40) low-running usable flight per dy bucket.
-    ext_reach: [f64; 40],
+    /// J_RUN (7 run rows × 10 buckets) then J_LOW_RUN — usable flight per
+    /// run length before the lip and landing dy (parkourEnvelope.ts).
+    ext_reach: [f64; 140],
     ext_diag_n: usize,
     ext_card_x_n: usize,
     ext_card_z_n: usize,
@@ -339,10 +418,14 @@ struct SolverState {
     stamp: Vec<u32>,
     closed: Vec<u8>,
     breaks: Vec<Option<Vec<i32>>>,
+    /// Slime stand cell per META_BOUNCE node (-1 otherwise); stamped like g.
+    vias: Vec<i32>,
     heap: MinHeap,
 
     out: NeighborOut,
     move_breaks: Vec<i32>,
+    /// Set by slime_bounce for the push it is about to make.
+    pending_via: i32,
 
     // per-solve search state
     best_idx: i32,
@@ -382,7 +465,7 @@ impl SolverState {
             ext_cells: Vec::new(),
             ext_mf: Vec::new(),
             ext_mf_block: 0,
-            ext_reach: [0.0; 40],
+            ext_reach: [0.0; 140],
             ext_diag_n: 0,
             ext_card_x_n: 0,
             ext_card_z_n: 0,
@@ -393,6 +476,7 @@ impl SolverState {
             stamp: Vec::new(),
             closed: Vec::new(),
             breaks: Vec::new(),
+            vias: Vec::new(),
             heap: MinHeap::new(4096),
             out: NeighborOut {
                 idx: [0; OUT_CAP],
@@ -402,9 +486,11 @@ impl SolverState {
                 cost: [0.0; OUT_CAP],
                 meta: [0; OUT_CAP],
                 breaks: [const { None }; OUT_CAP],
+                via: [-1; OUT_CAP],
                 count: 0,
             },
             move_breaks: Vec::new(),
+            pending_via: -1,
             best_idx: -1,
             best_h: f64::INFINITY,
             visited: 0,
@@ -427,6 +513,7 @@ impl SolverState {
             self.stamp.resize(n, 0);
             self.closed.resize(n, 0);
             self.breaks.resize_with(n, || None);
+            self.vias.resize(n, -1);
         }
         self.epoch = self.epoch.wrapping_add(1);
         if self.epoch == 0 {
@@ -544,19 +631,48 @@ impl SolverState {
         }
     }
 
+    /// The height byte is packed — bits 6–7 carry the top-catch class.
     #[inline]
     fn height_at(&mut self, x: i32, y: i32, z: i32) -> f64 {
         let idx = self.cell_index(x, y, z);
         if idx < 0 {
             y as f64
         } else {
-            y as f64 + self.heights[idx as usize] as f64 / 32.0
+            y as f64 + (self.heights[idx as usize] & 63) as f64 / 32.0
+        }
+    }
+
+    /// topCatchClass of the cell's block (mirror of moveGen.ts catchAt).
+    #[inline]
+    fn catch_at(&mut self, x: i32, y: i32, z: i32) -> usize {
+        let idx = self.cell_index(x, y, z);
+        if idx < 0 {
+            0
+        } else {
+            (self.heights[idx as usize] >> 6) as usize
         }
     }
 
     #[inline]
     fn is_safe(&self, f: u8) -> bool {
         (f & SAFE) != 0 || (self.cfg.door_mode && (f & PASSABLE_WHEN_OPEN) != 0)
+    }
+
+    /// Fence/wall/closed-gate class stand (mirror of moveGen.ts isTallStand).
+    #[inline]
+    fn is_tall_stand(&self, f: u8, h_byte: u8) -> bool {
+        (f & (SAFE | PHYSICAL | LIQUID)) == 0 && (h_byte & 63) > 32
+    }
+
+    #[inline]
+    fn tall_stand_at(&mut self, x: i32, y: i32, z: i32) -> bool {
+        let idx = self.cell_index(x, y, z);
+        idx >= 0 && self.is_tall_stand(self.flags[idx as usize], self.heights[idx as usize])
+    }
+
+    #[inline]
+    fn ext_on(&self) -> bool {
+        self.cfg.allow_parkour && self.cfg.allow_sprinting && self.cfg.allow_parkour_extended
     }
 
     /// Thin walk-in floor (carpet class): SAFE + PHYSICAL, not a climbable —
@@ -670,6 +786,8 @@ impl SolverState {
         self.out.z[i] = z;
         self.out.cost[i] = cost;
         self.out.meta[i] = meta;
+        self.out.via[i] = self.pending_via;
+        self.pending_via = -1;
         self.out.breaks[i] = if self.move_breaks.is_empty() {
             None
         } else {
@@ -686,12 +804,25 @@ impl SolverState {
 
         // Improvement (useBubbleColumns): a bubble cell floats you like water.
         if (f_d & PHYSICAL) == 0 && (f_c & LIQUID) == 0 && (self.special_at(x + dx, y, z + dz) & BUBBLE_MASK) == 0 {
-            return;
-        }
-
-        // A thin floor one below is a step DOWN into that cell — move_drop_down
-        // produces the correct node; a same-level node here would float.
-        if self.is_thin_floor(f_d) {
+            if !self.ext_on() {
+                return;
+            }
+            if self.tall_stand_at(x + dx, y - 1, z + dz) {
+                // Walk onto a fence/wall top sunk one below (mirror of moveGen.ts).
+                if self.height_at(x + dx, y - 1, z + dz) - self.height_at(x, y - 1, z) > 0.6 {
+                    return;
+                }
+                let f_up = self.flags_at(x + dx, y + 2, z + dz);
+                if !self.is_safe(f_up) {
+                    return;
+                }
+            } else if (f_c & CLIMBABLE) == 0 || !self.is_safe(f_c) || !self.climb_usable(x + dx, y, z + dz) {
+                return;
+            }
+            // else: step into a free-hanging ladder/vine cell — it catches.
+        } else if self.is_thin_floor(f_d) {
+            // A thin floor one below is a step DOWN into that cell — move_drop_down
+            // produces the correct node; a same-level node here would float.
             return;
         }
 
@@ -747,11 +878,20 @@ impl SolverState {
         }
 
         if (f_c & PHYSICAL) == 0 {
+            // Extended: a fence/wall top is a stand too (mirror of moveGen.ts).
+            if !self.ext_on() || !self.tall_stand_at(x + dx, y, z + dz) {
+                return;
+            }
+            let f3 = self.flags_at(x + dx, y + 3, z + dz);
+            if !self.is_safe(f3) {
+                return;
+            }
+        } else if self.is_thin_floor(f_c) {
+            // A thin floor at the target feet cell is same-level ground (move_forward
+            // walks into it) — "jumping onto" it would land in the air above.
             return;
-        }
-        // A thin floor at the target feet cell is same-level ground (move_forward
-        // walks into it) — "jumping onto" it would land in the air above.
-        if self.is_thin_floor(f_c) {
+        } else if self.ext_on() && (f_c & CLIMBABLE) != 0 {
+            // No jumps onto a ladder's top edge (mirror of moveGen.ts).
             return;
         }
 
@@ -795,6 +935,13 @@ impl SolverState {
             if !self.special.is_empty() && (self.special[idx as usize] & BUBBLE_MASK) != 0 {
                 return ly;
             }
+            // Extended: a ladder/vine below catches the drop.
+            if self.ext_on() && (f & CLIMBABLE) != 0 && self.is_safe(f) && self.climb_usable(lx, ly, lz) {
+                if y - ly <= self.cfg.max_drop_down {
+                    return ly;
+                }
+                return i32::MIN;
+            }
             // Thin floor (carpet class): feet land IN the cell, not on top.
             if self.is_thin_floor(f) {
                 if y - ly <= self.cfg.max_drop_down {
@@ -804,6 +951,14 @@ impl SolverState {
             }
             if (f & PHYSICAL) != 0 {
                 if y - ly <= self.cfg.max_drop_down {
+                    return ly + 1;
+                }
+                return i32::MIN;
+            }
+            // Extended: a fence/wall top is a stand (feet 0.5 into the cell above).
+            if self.ext_on() && self.is_tall_stand(f, self.heights[idx as usize]) {
+                let f3 = self.flags_at(lx, ly + 3, lz);
+                if y - ly <= self.cfg.max_drop_down && self.is_safe(f3) {
                     return ly + 1;
                 }
                 return i32::MIN;
@@ -848,6 +1003,9 @@ impl SolverState {
         cost += self.entities_at(x + dx, land_y, z + dz) * self.cfg.entity_cost;
 
         self.push_out(x + dx, land_y, z + dz, cost, 0);
+        if self.ext_on() && !self.special.is_empty() {
+            self.slime_bounce(x, y, z, x + dx, land_y, z + dz);
+        }
     }
 
     fn move_down(&mut self, x: i32, y: i32, z: i32) {
@@ -875,6 +1033,9 @@ impl SolverState {
         cost += self.entities_at(x, land_y, z) * self.cfg.entity_cost;
 
         self.push_out(x, land_y, z, cost, 0);
+        if self.ext_on() && !self.special.is_empty() {
+            self.slime_bounce(x, y, z, x, land_y, z);
+        }
     }
 
     fn move_up(&mut self, x: i32, y: i32, z: i32) {
@@ -915,6 +1076,10 @@ impl SolverState {
         let mut cost = SQRT_2;
 
         let f_c = self.flags_at(x + dx, y, z + dz);
+        // Extended: never diagonally onto a ladder's top edge (mirror of moveGen.ts).
+        if self.ext_on() && (f_c & (PHYSICAL | CLIMBABLE)) == (PHYSICAL | CLIMBABLE) {
+            return;
+        }
         // A thin floor at the target feet cell is same-level ground, not a +1 hop.
         let yo: i32 = if (f_c & PHYSICAL) != 0 && !self.is_thin_floor(f_c) { 1 } else { 0 };
         let h_0 = self.height_at(x, y - 1, z);
@@ -1061,9 +1226,100 @@ impl SolverState {
         }
     }
 
+    /// Mirror of moveGen.ts momentumChains: re-jump edges through the
+    /// parkour landings this expansion just produced (stepping stones only).
+    fn momentum_chains(&mut self, x: i32, y: i32, z: i32) {
+        let n_out = self.out.count;
+        for i in 0..n_out {
+            if self.out.meta[i] != META_PARKOUR {
+                continue;
+            }
+            let bx = self.out.x[i];
+            let by = self.out.y[i];
+            let bz = self.out.z[i];
+            let f_b = self.flags_at(bx, by, bz);
+            if (f_b & (LIQUID | CLIMBABLE)) != 0 || self.is_thin_floor(f_b) || (self.special_at(bx, by, bz) & BUBBLE_MASK) != 0 {
+                continue;
+            }
+            let idx_s = self.cell_index(bx, by - 1, bz);
+            if idx_s < 0 {
+                continue;
+            }
+            let f_s = self.flags[idx_s as usize];
+            if (f_s & PHYSICAL) == 0 && !self.is_tall_stand(f_s, self.heights[idx_s as usize]) {
+                continue;
+            }
+            let h_b = self.height_at(bx, by - 1, bz);
+            let mut runnable = false;
+            for d in 0..4 {
+                let (ddx, ddz) = CARDINAL[d];
+                let nx = bx + ddx;
+                let nz = bz + ddz;
+                let fn0 = self.flags_at(nx, by - 1, nz);
+                if (fn0 & PHYSICAL) != 0 && self.catch_at(nx, by - 1, nz) == 0 {
+                    let a0 = self.flags_at(nx, by, nz);
+                    let a1 = self.flags_at(nx, by + 1, nz);
+                    if self.is_safe(a0) && self.is_safe(a1) {
+                        let h_n = self.height_at(nx, by - 1, nz);
+                        if h_n - h_b <= 0.2 && h_b - h_n <= 0.2 {
+                            runnable = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if runnable {
+                continue;
+            }
+            let lid = self.flags_at(bx, by + 2, bz);
+            if !self.is_safe(lid) {
+                continue;
+            }
+            let abx = bx - x;
+            let abz = bz - z;
+            let ab2 = abx * abx + abz * abz;
+            let via_idx = self.out.idx[i];
+            let base_cost = self.out.cost[i];
+            for q in 0..4 {
+                let (sx, sz) = DIAGONAL[q];
+                for k in 0..self.ext_diag_n {
+                    let e = self.ext_entries[k];
+                    if !chain_aligned(abx, abz, ab2, e.tx * sx, e.tz * sz) {
+                        continue;
+                    }
+                    self.parkour_ext_target(bx, by, bz, sx, sz, h_b, false, e, via_idx, base_cost);
+                }
+            }
+            for d in 0..4 {
+                let (dx, dz) = CARDINAL[d];
+                if dx != 0 {
+                    for k in 0..self.ext_card_x_n {
+                        let e = self.ext_entries[self.ext_diag_n + k];
+                        if !chain_aligned(abx, abz, ab2, e.tx * dx, 0) {
+                            continue;
+                        }
+                        self.parkour_ext_target(bx, by, bz, dx, 1, h_b, false, e, via_idx, base_cost);
+                    }
+                } else {
+                    for k in 0..self.ext_card_z_n {
+                        let e = self.ext_entries[self.ext_diag_n + self.ext_card_x_n + k];
+                        if !chain_aligned(abx, abz, ab2, 0, e.tz * dz) {
+                            continue;
+                        }
+                        self.parkour_ext_target(bx, by, bz, 1, dz, h_b, false, e, via_idx, base_cost);
+                    }
+                }
+            }
+            if self.out.count - n_out >= CHAIN_CAP {
+                return;
+            }
+        }
+    }
+
     /// Improvement (allowParkourExtended), mirror of moveGen.ts
-    /// parkourExtTarget — rules in docs/ExtendedParkour.md.
-    fn parkour_ext_target(&mut self, x: i32, y: i32, z: i32, sx: i32, sz: i32, h_0: f64, low_takeoff: bool, e: ExtEntry) {
+    /// parkourExtTarget — rules in docs/ExtendedParkour.md. `chain_via ≥ 0`
+    /// is the momentum-chain re-jump variant (see momentum_chains).
+    fn parkour_ext_target(&mut self, x: i32, y: i32, z: i32, sx: i32, sz: i32, h_0: f64, low_takeoff: bool, e: ExtEntry, chain_via: i32, chain_base: f64) {
         self.begin_move();
         let cbase = e.cells_off * 2;
         // Flat-ground fast-out: walkable floor on the first flight-line cell.
@@ -1075,18 +1331,35 @@ impl SolverState {
 
         let tx = x + e.tx * sx;
         let tz = z + e.tz * sz;
-        let f_t = self.flags_at(tx, y, tz);
+        let idx_t = self.cell_index(tx, y, tz);
+        let f_t = if idx_t < 0 { 0 } else { self.flags[idx_t as usize] };
 
-        let node_y: i32;
+        let mut node_y: i32;
         let mut cost = e.cost;
+        // Top-catch class of the landing support; -1 = enters a cell (full credit).
+        let mut land_catch: i32 = -1;
+        // Cell whose top the feet land on (support landings): the reach
+        // bucket is the real rise to it. i32::MIN = a catch (node delta).
+        let mut sup_y: i32 = i32::MIN;
         if (f_t & CLIMBABLE) != 0 && self.is_safe(f_t) && self.climb_usable(tx, y, tz) {
             // Grab a ladder/vine at flight level — before PHYSICAL, because
-            // ladders classify as physical too (see the JS reference).
+            // ladders classify as physical too; the catch is the lowest
+            // contiguous ladder cell up to two below (see the JS reference).
             let t1 = self.flags_at(tx, y + 1, tz);
             if !self.is_safe(t1) {
                 return;
             }
             node_y = y;
+            let mut ly = y - 1;
+            while ly >= y - 2 {
+                let f_l = self.flags_at(tx, ly, tz);
+                if (f_l & CLIMBABLE) == 0 || !self.is_safe(f_l) || !self.climb_usable(tx, ly, tz) {
+                    break;
+                }
+                node_y = ly;
+                cost += 1.0;
+                ly -= 1;
+            }
         } else if self.is_thin_floor(f_t) {
             // Thin floor at flight level (carpeted landing): a same-level
             // jump — feet land IN the cell, like the air-branch landing.
@@ -1107,6 +1380,38 @@ impl SolverState {
             }
             node_y = y + 1;
             cost += 1.0;
+            land_catch = (self.heights[idx_t as usize] >> 6) as i32;
+            sup_y = y;
+        } else if idx_t >= 0 && self.is_tall_stand(f_t, self.heights[idx_t as usize]) {
+            // Fence/wall top at flight level: up landing onto its 1.5 top;
+            // a pot on the post puts the node above the pot (mirror of moveGen.ts).
+            if self.height_at(tx, y, tz) - h_0 > 1.2 {
+                return;
+            }
+            let t1 = self.flags_at(tx, y + 1, tz);
+            if self.is_safe(t1) {
+                let t2 = self.flags_at(tx, y + 2, tz);
+                let t3 = self.flags_at(tx, y + 3, tz);
+                if !self.is_safe(t2) || !self.is_safe(t3) {
+                    return;
+                }
+                node_y = y + 1;
+                cost += 1.0;
+            } else {
+                let idx1 = self.cell_index(tx, y + 1, tz);
+                if idx1 < 0 || (t1 & PHYSICAL) == 0 || (self.heights[idx1 as usize] & 63) > 16 {
+                    return;
+                }
+                let t2 = self.flags_at(tx, y + 2, tz);
+                let t3 = self.flags_at(tx, y + 3, tz);
+                if !self.is_safe(t2) || !self.is_safe(t3) {
+                    return;
+                }
+                node_y = y + 2;
+                cost += 2.0;
+            }
+            land_catch = (self.heights[idx_t as usize] >> 6) as i32;
+            sup_y = y;
         } else {
             let t1 = self.flags_at(tx, y + 1, tz);
             if !self.is_safe(f_t) || !self.is_safe(t1) {
@@ -1115,6 +1420,15 @@ impl SolverState {
             match self.find_ext_landing(tx, y, tz) {
                 Some(ly) => node_y = ly,
                 None => return,
+            }
+            // Landed ON a support rather than IN a catching cell?
+            let f_n = self.flags_at(tx, node_y, tz);
+            if (f_n & (LIQUID | CLIMBABLE)) == 0
+                && !self.is_thin_floor(f_n)
+                && (self.special_at(tx, node_y, tz) & BUBBLE_MASK) == 0
+            {
+                land_catch = self.catch_at(tx, node_y - 1, tz) as i32;
+                sup_y = node_y - 1;
             }
         }
 
@@ -1147,30 +1461,92 @@ impl SolverState {
         // Reach envelope: flight needed vs usable flight for the landing
         // bucket (mirror of moveGen.ts — the J_LOW rows when a lid is over
         // the corridor).
-        let mut bucket = (1 - (node_y - y)) as usize;
-        if bucket >= 10 {
-            bucket = 9;
+        // Real rise for support landings, fractional rises interpolated
+        // between the integer rows (mirror of moveGen.ts).
+        let dy: i32;
+        let mut frac = 0.0;
+        if sup_y == i32::MIN {
+            dy = node_y - y;
+        } else {
+            let rise = self.height_at(tx, sup_y, tz) - h_0;
+            let mut d = rise.floor() as i32;
+            frac = rise - d as f64;
+            if d >= 1 {
+                d = 1;
+                frac = 0.0;
+            }
+            dy = d;
         }
-        let j_base = if low { 20 } else { 0 };
-        let needs_running = e.fn_stand > self.ext_reach[j_base + bucket];
-        if needs_running {
-            if e.fn_run > self.ext_reach[j_base + 10 + bucket] {
+        let bucket_i = 1 - dy;
+        if bucket_i < 0 {
+            return; // a rise above one block: no jump
+        }
+        let bucket = if bucket_i >= 10 { 9 } else { bucket_i as usize };
+        // Run-length model (mirror of moveGen.ts): reach from the run
+        // available before the lip — the support itself plus a walkable
+        // cell behind, level or one step lower.
+        let takeoff_catch = self.catch_at(x, y - 1, z);
+        if (self.flags_at(x, y - 1, z) & CLIMBABLE) != 0 {
+            return; // a ladder's top edge is not a takeoff (mirror of moveGen.ts)
+        }
+        let l_cred = if land_catch < 0 { LAND_HALF } else { LAND_NARROW_MARGIN + CATCH_HALF[land_catch as usize] };
+        let half = CATCH_HALF[takeoff_catch];
+        let front = (TAKEOFF_NARROW_MARGIN + half).min(TAKEOFF_STAND);
+        let mut run = front + half + TAKEOFF_NARROW_MARGIN;
+        let rx = x + e.run_x * sx;
+        let rz = z + e.run_z * sz;
+        let r0 = self.flags_at(rx, y, rz);
+        let r1 = self.flags_at(rx, y + 1, rz);
+        if self.is_safe(r0) && self.is_safe(r1) {
+            let f_r = self.flags_at(rx, y - 1, rz);
+            if (f_r & PHYSICAL) != 0 && self.catch_at(rx, y - 1, rz) == 0 {
+                let h_r = self.height_at(rx, y - 1, rz);
+                if h_r - h_0 <= 0.2 && h_0 - h_r <= 0.6 {
+                    run += 1.0;
+                }
+            } else if self.is_safe(f_r) {
+                let f_r2 = self.flags_at(rx, y - 2, rz);
+                if (f_r2 & PHYSICAL) != 0 && self.catch_at(rx, y - 2, rz) == 0 {
+                    let h_r = self.height_at(rx, y - 2, rz);
+                    if h_0 - h_r <= 1.05 {
+                        run += 1.0;
+                    }
+                }
+            }
+        }
+        let row = run_row(run);
+        let base = (if low { 70 } else { 0 }) + row * 10;
+        let mut usable = self.ext_reach[base + bucket];
+        if frac > 0.0 {
+            usable = usable + (self.ext_reach[base + bucket - 1] - usable) * frac;
+        }
+        usable += self.cfg.margin_credit;
+        let fn_needed = if takeoff_catch == 0 && land_catch <= 0 {
+            e.fn_stand
+        } else {
+            let a = e.tx as f64;
+            let b = e.tz as f64;
+            flight_from(a, b, e.dist, front * e.dist / (if a > b { a } else { b }), l_cred)
+        };
+        let feasible = fn_needed <= usable;
+        let mut needs_running = row >= 1;
+        if chain_via < 0 {
+            if !feasible {
                 return;
             }
-            let rx = x + e.run_x * sx;
-            let rz = z + e.run_z * sz;
-            if (self.flags_at(rx, y - 1, rz) & PHYSICAL) == 0 {
+        } else {
+            // Chain variant (mirror of moveGen.ts): only where the stone's
+            // own jump falls short, from the landing point, never under a lid.
+            if feasible || low {
                 return;
             }
-            let h_r = self.height_at(rx, y - 1, rz);
-            if h_r - h_0 > 0.2 || h_0 - h_r > 0.2 {
+            let a = e.tx as f64;
+            let b = e.tz as f64;
+            let s_chain = (TAKEOFF_NARROW_MARGIN + CATCH_HALF[takeoff_catch]).min(TAKEOFF_STAND) * CHAIN_TAKEOFF_FRACTION * e.dist / (if a > b { a } else { b });
+            if flight_from(a, b, e.dist, s_chain, l_cred) > J_CHAIN[bucket] + self.cfg.margin_credit {
                 return;
             }
-            let r0 = self.flags_at(rx, y, rz);
-            let r1 = self.flags_at(rx, y + 1, rz);
-            if !self.is_safe(r0) || !self.is_safe(r1) {
-                return;
-            }
+            needs_running = true;
         }
 
         // Corridor pass 2: per-cell flight-curve bound mf = the lowest the
@@ -1208,7 +1584,12 @@ impl SolverState {
         if cost > 100.0 {
             return;
         }
-        self.push_out(tx, node_y, tz, cost, META_PARKOUR);
+        if chain_via >= 0 {
+            self.pending_via = chain_via;
+            self.push_out(tx, node_y, tz, chain_base + cost, META_PARKOUR | META_CHAIN);
+        } else {
+            self.push_out(tx, node_y, tz, cost, META_PARKOUR);
+        }
     }
 
     /// Mirror of moveGen.ts findExtLanding (findLanding order + climbables).
@@ -1248,12 +1629,176 @@ impl SolverState {
                 }
                 return Some(ly + 1);
             }
+            // Fence/wall top: a stand with the feet 0.5 into the cell above it.
+            if self.is_tall_stand(f, self.heights[idx as usize]) {
+                let f3 = self.flags_at(tx, ly + 3, tz);
+                if y - (ly + 1) > self.cfg.max_drop_down || !self.is_safe(f3) {
+                    return None;
+                }
+                return Some(ly + 1);
+            }
             if !self.is_safe(f) {
                 return None;
             }
             ly -= 1;
         }
         None
+    }
+
+    /// Mirror of moveGen.ts climbTransfers: step between adjacent climbable
+    /// cells (round a pillar corner, along a wall), one up / level / one down.
+    fn climb_transfers(&mut self, x: i32, y: i32, z: i32) {
+        let f0 = self.flags_at(x, y, z);
+        if (f0 & CLIMBABLE) == 0 || !self.is_safe(f0) || !self.climb_usable(x, y, z) {
+            return;
+        }
+        for i in 0..8 {
+            let (dx, dz) = TRANSFER[i];
+            let tx = x + dx;
+            let tz = z + dz;
+            let mut dy = 1;
+            while dy >= -1 {
+                self.begin_move();
+                let ty = y + dy;
+                let f_t = self.flags_at(tx, ty, tz);
+                if (f_t & CLIMBABLE) == 0 || !self.is_safe(f_t) || !self.climb_usable(tx, ty, tz) {
+                    dy -= 1;
+                    continue;
+                }
+                let head = self.flags_at(tx, ty + 1, tz);
+                if !self.is_safe(head) {
+                    dy -= 1;
+                    continue;
+                }
+                if dy == 1 {
+                    let above = self.flags_at(x, y + 2, z);
+                    if !self.is_safe(above) {
+                        dy -= 1;
+                        continue;
+                    }
+                }
+                if dx != 0 && dz != 0 && !self.corner_open(tx, z, y, dy) && !self.corner_open(x, tz, y, dy) {
+                    dy -= 1;
+                    continue;
+                }
+                let mut cost = TRANSFER_COST[i] + (if dy < 0 { -dy } else { dy }) as f64;
+                cost += self.entities_at(tx, ty, tz) * self.cfg.entity_cost;
+                if cost > 100.0 {
+                    dy -= 1;
+                    continue;
+                }
+                self.push_out(tx, ty, tz, cost, 0);
+                dy -= 1;
+            }
+        }
+    }
+
+    /// Mirror of moveGen.ts cornerOpen.
+    fn corner_open(&mut self, cx: i32, cz: i32, y: i32, dy: i32) -> bool {
+        let a = self.flags_at(cx, y, cz);
+        let b = self.flags_at(cx, y + 1, cz);
+        if !self.is_safe(a) || !self.is_safe(b) {
+            return false;
+        }
+        if dy == 0 {
+            return true;
+        }
+        let c = self.flags_at(cx, y + dy, cz);
+        let d = self.flags_at(cx, y + dy + 1, cz);
+        self.is_safe(c) && self.is_safe(d)
+    }
+
+    /// Mirror of moveGen.ts slimeBounce: a drop onto the slime stand cell
+    /// (sx, sy, sz) is also an edge to every landing its rebound reaches.
+    fn slime_bounce(&mut self, x: i32, y: i32, z: i32, sx: i32, sy: i32, sz: i32) {
+        let sup_idx = self.cell_index(sx, sy - 1, sz);
+        if sup_idx < 0 || self.special[sup_idx as usize] != SPECIAL_SLIME {
+            return;
+        }
+        if (self.flags_at(sx, sy, sz) & LIQUID) != 0 {
+            return;
+        }
+        let d = y - sy;
+        if d < 2 {
+            return;
+        }
+        let apex = BOUNCE_APEX[(if d > BOUNCE_MAX_DROP { BOUNCE_MAX_DROP } else { d }) as usize];
+        let via_idx = self.cell_index(sx, sy, sz);
+        for i in 0..BOUNCE_OFF.len() {
+            let (ox, oz) = BOUNCE_OFF[i];
+            let cx = sx + ox;
+            let cz = sz + oz;
+            let max_top = sy as f64 + apex - (if i < BOUNCE_RING1 { BOUNCE_MARGIN } else { BOUNCE_MARGIN_FAR });
+            let lid = max_top.floor() as i32;
+            if lid < sy {
+                continue;
+            }
+            if i >= BOUNCE_RING1 {
+                let mx = sx + (ox >> 1);
+                let mz = sz + (oz >> 1);
+                let mut open = true;
+                let mut ly = sy + 1;
+                while ly <= lid + 1 {
+                    let f = self.flags_at(mx, ly, mz);
+                    if !self.is_safe(f) {
+                        open = false;
+                        break;
+                    }
+                    ly += 1;
+                }
+                if !open {
+                    continue;
+                }
+            }
+            let mut ly = lid;
+            let mut node_y = i32::MIN;
+            while ly >= sy {
+                let idx = self.cell_index(cx, ly, cz);
+                if idx < 0 {
+                    break;
+                }
+                let f = self.flags[idx as usize];
+                if self.is_safe(f) {
+                    ly -= 1;
+                    continue;
+                }
+                let h = self.heights[idx as usize];
+                if (f & PHYSICAL) != 0 && !self.is_thin_floor(f) {
+                    if ly as f64 + (h & 63) as f64 / 32.0 <= max_top {
+                        node_y = ly + 1;
+                    }
+                } else if self.is_tall_stand(f, h) {
+                    let f3 = self.flags_at(cx, ly + 3, cz);
+                    if ly as f64 + (h & 63) as f64 / 32.0 <= max_top && self.is_safe(f3) {
+                        node_y = ly + 1;
+                    }
+                }
+                break;
+            }
+            if node_y == i32::MIN || node_y <= sy {
+                continue;
+            }
+            let n0 = self.flags_at(cx, node_y, cz);
+            let n1 = self.flags_at(cx, node_y + 1, cz);
+            if !self.is_safe(n0) || !self.is_safe(n1) {
+                continue;
+            }
+            self.begin_move();
+            let adx = cx - x;
+            let adz = cz - z;
+            let ax = if adx < 0 { -adx } else { adx };
+            let az = if adz < 0 { -adz } else { adz };
+            let mut cost = (if ax > az { ax - az } else { az - ax }) as f64
+                + SQRT_2 * (if ax < az { ax } else { az }) as f64
+                + (y - node_y) as f64
+                + 1.0;
+            cost += self.entities_at(cx, node_y, cz) * self.cfg.entity_cost;
+            if cost > 100.0 {
+                continue;
+            }
+            self.pending_via = via_idx;
+            self.push_out(cx, node_y, cz, cost, META_PARKOUR | META_BOUNCE);
+        }
     }
 
     /// Mirror of moveGen.ts climbUsable (moveUp's vine-wall rule).
@@ -1302,14 +1847,18 @@ impl SolverState {
         // Extended-parkour takeoff gates are node-invariant — hoisted (mirror
         // of moveGen.ts generate()).
         let mut ext = false;
+        let mut jumps = false;
         let mut h_0 = 0.0;
         let mut low_takeoff = false;
-        if self.cfg.allow_parkour && self.cfg.allow_sprinting && self.cfg.allow_parkour_extended {
+        if self.ext_on() {
             // No y+2 requirement: a blocked head+1 at the takeoff selects the
-            // head-hitter class instead (mirror of moveGen.ts).
-            ext = (self.flags_at(x, y, z) & LIQUID) == 0
-                && (self.special_at(x, y, z) & BUBBLE_MASK) == 0;
-            if ext {
+            // head-hitter class instead. `ext` supersedes upstream's cardinal
+            // parkour, `jumps` runs the table — not from a climbable cell
+            // (mirror of moveGen.ts).
+            let f0 = self.flags_at(x, y, z);
+            ext = (f0 & LIQUID) == 0 && (self.special_at(x, y, z) & BUBBLE_MASK) == 0;
+            jumps = ext && (f0 & CLIMBABLE) == 0;
+            if jumps {
                 h_0 = self.height_at(x, y - 1, z);
                 let head = self.flags_at(x, y + 2, z);
                 low_takeoff = !self.is_safe(head);
@@ -1326,16 +1875,16 @@ impl SolverState {
             if self.cfg.allow_parkour && !ext {
                 self.move_parkour_forward(x, y, z, dx, dz);
             }
-            if ext {
+            if jumps {
                 if dx != 0 {
                     for k in 0..self.ext_card_x_n {
                         let e = self.ext_entries[self.ext_diag_n + k];
-                        self.parkour_ext_target(x, y, z, dx, 1, h_0, low_takeoff, e);
+                        self.parkour_ext_target(x, y, z, dx, 1, h_0, low_takeoff, e, -1, 0.0);
                     }
                 } else {
                     for k in 0..self.ext_card_z_n {
                         let e = self.ext_entries[self.ext_diag_n + self.ext_card_x_n + k];
-                        self.parkour_ext_target(x, y, z, 1, dz, h_0, low_takeoff, e);
+                        self.parkour_ext_target(x, y, z, 1, dz, h_0, low_takeoff, e, -1, 0.0);
                     }
                 }
             }
@@ -1343,18 +1892,24 @@ impl SolverState {
         for i in 0..4 {
             let (dx, dz) = DIAGONAL[i];
             self.move_diagonal(x, y, z, dx, dz);
-            if ext {
+            if jumps {
                 for k in 0..self.ext_diag_n {
                     let e = self.ext_entries[k];
-                    self.parkour_ext_target(x, y, z, dx, dz, h_0, low_takeoff, e);
+                    self.parkour_ext_target(x, y, z, dx, dz, h_0, low_takeoff, e, -1, 0.0);
                 }
             }
+        }
+        if jumps {
+            self.momentum_chains(x, y, z);
         }
         self.move_down(x, y, z);
         self.move_up(x, y, z);
         if !self.special.is_empty() {
             self.move_bubble_up(x, y, z);
             self.move_bubble_down(x, y, z);
+        }
+        if self.ext_on() {
+            self.climb_transfers(x, y, z);
         }
     }
 
@@ -1474,6 +2029,7 @@ impl SolverState {
                 self.g[ni] = g2;
                 self.parent[ni] = idx;
                 self.meta[ni] = self.out.meta[i];
+                self.vias[ni] = self.out.via[i];
                 match self.out.breaks[i].take() {
                     Some(b) => self.breaks[ni] = Some(b),
                     None => {
@@ -1536,6 +2092,13 @@ impl SolverState {
             let edge = self.g[ni] - if parent >= 0 { self.g[parent as usize] } else { 0.0 };
             out.extend_from_slice(&edge.to_le_bytes());
             out.push(self.meta[ni]);
+            if (self.meta[ni] & (META_BOUNCE | META_CHAIN)) != 0 {
+                // The via cell follows the meta byte (wasmSolver.ts readResult).
+                let via = self.vias[ni];
+                out.extend_from_slice(&self.decode_x(via).to_le_bytes());
+                out.extend_from_slice(&self.decode_y(via).to_le_bytes());
+                out.extend_from_slice(&self.decode_z(via).to_le_bytes());
+            }
             match &self.breaks[ni] {
                 Some(b) => {
                     out.extend_from_slice(&(b.len() as u16).to_le_bytes());
@@ -1602,6 +2165,7 @@ pub unsafe extern "C" fn solve_init(params: *const u8) -> i32 {
     let entity_cost = read_f64(params, &mut off);
     let dig_cost = read_f64(params, &mut off);
     let bubble_cost = read_f64(params, &mut off);
+    let margin_credit = read_f64(params, &mut off);
     let search_radius = read_f64(params, &mut off);
 
     let entity_ptr = read_u32(params, &mut off) as *const u8;
@@ -1625,6 +2189,7 @@ pub unsafe extern "C" fn solve_init(params: *const u8) -> i32 {
         entity_cost,
         dig_cost,
         bubble_cost,
+        margin_credit,
     };
 
     let n = (st.w * st.h * st.l) as usize;
@@ -1690,7 +2255,7 @@ pub unsafe extern "C" fn solve_init(params: *const u8) -> i32 {
             st.ext_cells.push(read_i32(ext_ptr, &mut eo));
         }
         eo = (eo + 7) & !7; // f64 section is 8-aligned in the blob
-        for i in 0..40 {
+        for i in 0..140 {
             st.ext_reach[i] = read_f64(ext_ptr, &mut eo);
         }
         for i in 0..n_total {
@@ -1735,6 +2300,7 @@ pub unsafe extern "C" fn solve_init(params: *const u8) -> i32 {
         st.g[ui] = 0.0;
         st.parent[ui] = -1;
         st.meta[ui] = 0;
+        st.vias[ui] = -1;
         if st.breaks[ui].is_some() {
             st.breaks[ui] = None;
         }

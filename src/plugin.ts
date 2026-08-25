@@ -13,6 +13,7 @@
 //   - stuckTimeout / executionTimeout knobs (default off)
 //   - stop() releases controls within a tick and never wedges a later goal
 import { performance } from 'node:perf_hooks'
+import fs from 'node:fs'
 import { Vec3 } from 'vec3'
 import nbt from 'prismarine-nbt'
 import type { Bot } from 'mineflayer'
@@ -34,7 +35,8 @@ import {
 } from './snapshot.js'
 import type { Box } from './snapshot.js'
 import { serializeGoal, goalNeedsRaycast, descriptorTargets } from './goalSerde.js'
-import { TAKEOFF_STAND } from './parkourEnvelope.js'
+import { TAKEOFF_STAND, TAKEOFF_NARROW_MARGIN, CHAIN_TAKEOFF_FRACTION } from './parkourEnvelope.js'
+import { CATCH_HALF, topCatchClass } from './shapes.js'
 import { getSharedWorkerHost } from './worker/host.js'
 import * as geometry from './geometry.js'
 import { InterruptController } from './interrupt.js'
@@ -125,6 +127,8 @@ const WALL_STANDOFF = 0.25
  * wall-slide turns a one-block step-up into an unreachable node.
  */
 const STEP_UP_MIN = 0.1
+/** Ticks of stepping back for a run-in before a parkour jump no gate authorises from the lip (see the creep branch). */
+const RUN_BACK_TICKS = 24
 
 /** Ground distance one sprinting tick covers, the sprint gate's look-ahead. */
 const SPRINT_TICK = 0.3
@@ -283,6 +287,24 @@ export function createPathfinder (options: PathfinderOptions = {}) {
     let biasTicks = 0
     /** Cell the parkour corner-creep started from (see the creep branch). */
     let creepCell: { x: number, z: number } | null = null
+    /** Slime-bounce phase, latched per node: has the rebound started? */
+    let bounceNode: Move | null = null
+    let bounceRisen = false
+    /** Momentum chain, latched per node: has the re-jump left the stone? */
+    let chainNode: Move | null = null
+    let chainFired = false
+    /** Run-up back-off, one attempt per parkour node (see the creep branch). */
+    let runBackNode: Move | null = null
+    let runBackTicks = 0
+    /**
+     * Decision trace (PF_EXEC_TRACE=<file prefix>): which branch of the tick
+     * loop drove this tick. Written by a second physicsTick listener so every
+     * early return is covered; off by default, costs nothing when unset.
+     */
+    let execBranch = 'idle'
+    let execTick = 0
+    const execTraceFile = process.env.PF_EXEC_TRACE ? `${process.env.PF_EXEC_TRACE}-${bot.username}.jsonl` : null
+    const execTraceBuf: string[] = []
     let lastNodeTime = performance.now()
     /**
      * When a path node was last genuinely REACHED. `lastNodeTime` is also
@@ -701,7 +723,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         time: raw.time,
         visitedNodes: raw.visitedNodes,
         generatedNodes: raw.generatedNodes,
-        path: raw.path.map(Move.fromRaw),
+        path: raw.path.flatMap(Move.expandRaw),
         context
       }
     }
@@ -981,7 +1003,11 @@ export function createPathfinder (options: PathfinderOptions = {}) {
           continue
         }
         let np = getPositionOnTopOf(b)
-        if (np === null) np = getPositionOnTopOf(bot.blockAt(new Vec3(curPoint.x, curPoint.y - 1, curPoint.z)) as BlockLike | null)
+        let support = b
+        if (np === null) {
+          support = bot.blockAt(new Vec3(curPoint.x, curPoint.y - 1, curPoint.z)) as BlockLike | null
+          np = getPositionOnTopOf(support)
+        }
         if (np) {
           curPoint.x = np.x
           curPoint.y = np.y
@@ -990,6 +1016,16 @@ export function createPathfinder (options: PathfinderOptions = {}) {
           curPoint.x = Math.floor(curPoint.x) + 0.5
           curPoint.y = curPoint.y - 1
           curPoint.z = Math.floor(curPoint.z) + 0.5
+        }
+        // A momentum-chain stepping stone is landed on its far side: the
+        // planner priced the re-jump with the creep credit of this support
+        // (parkourEnvelope.ts), so that is where the body has to be.
+        if (curPoint.aimDx !== 0 || curPoint.aimDz !== 0) {
+          const half = support !== null && support.shapes.length > 0 ? CATCH_HALF[topCatchClass(support.shapes)] : 0.5
+          const credit = Math.min(TAKEOFF_STAND, half + TAKEOFF_NARROW_MARGIN) * CHAIN_TAKEOFF_FRACTION
+          const scale = credit / Math.max(Math.abs(curPoint.aimDx), Math.abs(curPoint.aimDz))
+          curPoint.x += curPoint.aimDx * scale
+          curPoint.z += curPoint.aimDz * scale
         }
       }
 
@@ -1323,6 +1359,12 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       if (!stopPathing && path.length > 0) bot.emit('path_reset' as never, reason as never)
       path = []
       cutTarget = null
+      bounceNode = null
+      bounceRisen = false
+      chainNode = null
+      chainFired = false
+      runBackNode = null
+      runBackTicks = 0
       stopDiggingIfNeeded()
       placing = false
       placingBlock = null
@@ -1629,6 +1671,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       // controls at all, and the path is left exactly as it was so the bot
       // carries on from the same node when the holder releases.
       if (interrupts.gate()) {
+        execBranch = 'interrupt'
         // Standing still in water is not standing still — it is sinking, at
         // two blocks a second, for as long as the holder takes.
         if ((bot.entity as { isInWater?: boolean }).isInWater === true) {
@@ -1723,6 +1766,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       }
 
       if (path.length === 0) {
+        execBranch = solveInFlight() ? 'nopath-solving' : 'nopath'
         // Release what only the tick loop ever presses. `resetPath(reason,
         // false)` deliberately keeps the controls so the bot coasts through a
         // soft replan, which is right for forward/sprint — but a `back` or a
@@ -1981,6 +2025,109 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         dz = nextPoint.z - p.z
       }
 
+
+      // Slime bounce (improvement, allowParkourExtended): this node is reached
+      // by dropping onto the slime stand cell `via` and riding the rebound up
+      // — the planner priced the whole arc as one edge (moveGen.slimeBounce).
+      // Two phases, latched per node: aim at the slime's top centre until the
+      // rebound has actually begun (feet at the slime, moving up), then aim
+      // at the node. Walking, never sprinting — the drop has to land on ONE
+      // block, and that is the whole point of "knowing where to land" — and
+      // never sneaking, which cancels the bounce in vanilla. None of the
+      // rollout gates below apply: a body in a rebound is not on the ground
+      // to jump from, and the arc is the planner's envelope, not theirs.
+      // Momentum chain (improvement, allowParkourExtended): the stepping
+      // stone `via` was installed as its own parkour node ahead of this one
+      // (Move.expandRaw) and has just been landed on and retired. The planner
+      // priced this node on the J_CHAIN row — a re-jump on the LANDING TICK,
+      // speed carried over — so there is exactly one right tick to press
+      // jump, and the rollout gates (which model a jump from rest) would
+      // refuse it. Press while grounded on the stone, aimed at the node,
+      // sprint held; once the body has left the stone the ordinary in-flight
+      // handling flies the arc. Not yet on the stone (retired mid-air over
+      // it): settle onto it first, steering at its centre.
+      const chainVia = (nextPoint as Move).via
+      if ((nextPoint as Move).chain && chainVia !== null) {
+        if (chainNode !== nextPoint) {
+          chainNode = nextPoint
+          chainFired = false
+        }
+        if (!chainFired) {
+          cutTarget = null
+          hopHold = false
+          const ent = bot.entity as { onGround?: boolean }
+          const onStone = Math.floor(p.x) === chainVia.x && Math.floor(p.z) === chainVia.z && p.y < chainVia.y + 1
+          if (bot.entity.velocity.y > 0.3 && ent.onGround !== true) {
+            chainFired = true
+          } else if (ent.onGround === true && onStone) {
+            execBranch = 'chain'
+            // The landing speed is in the bot's state, so the ordinary
+            // sprint-jump rollout predicts the chained flight honestly —
+            // press only when it lands; otherwise this is an ordinary node
+            // and the gates below decide (a refused re-jump is a stop, not
+            // a fall).
+            if (!physics.canSprintJump(path)) {
+              chainFired = true
+            } else {
+            bot.look(Math.atan2(-dx, -dz), 0)
+            bot.setControlState('forward', true)
+            bot.setControlState('sprint', true)
+            bot.setControlState('jump', true)
+            bot.setControlState('sneak', false)
+            bot.setControlState('back', false)
+            bot.setControlState('left', false)
+            bot.setControlState('right', false)
+            futile(swimming)
+            return
+            }
+          } else if (!onStone || ent.onGround !== true) {
+            const sx = chainVia.x + 0.5 - p.x
+            const sz = chainVia.z + 0.5 - p.z
+            execBranch = 'chain-settle'
+            const sd = Math.hypot(sx, sz)
+            if (sd > 0.05) bot.look(Math.atan2(-sx, -sz), 0)
+            bot.setControlState('forward', sd > 0.2)
+            bot.setControlState('sprint', false)
+            bot.setControlState('jump', false)
+            bot.setControlState('sneak', false)
+            bot.setControlState('back', false)
+            bot.setControlState('left', false)
+            bot.setControlState('right', false)
+            futile(swimming)
+            return
+          }
+        }
+      }
+
+      const bounceVia = (nextPoint as Move).via
+      if (bounceVia !== null && !(nextPoint as Move).chain && (nextPoint as { parkour?: boolean }).parkour === true) {
+        if (bounceNode !== nextPoint) {
+          bounceNode = nextPoint
+          bounceRisen = false
+        }
+        cutTarget = null
+        hopHold = false
+        const vx = bounceVia.x + 0.5
+        const vz = bounceVia.z + 0.5
+        if (!bounceRisen && bot.entity.velocity.y > 0.05 && p.y < bounceVia.y + 0.5 &&
+            Math.abs(p.x - vx) < 0.8 && Math.abs(p.z - vz) < 0.8) {
+          bounceRisen = true
+        }
+        const ax = bounceRisen ? dx : vx - p.x
+        const az = bounceRisen ? dz : vz - p.z
+        execBranch = bounceRisen ? 'bounce-rise' : 'bounce-drop'
+        const horiz = Math.hypot(ax, az)
+        if (horiz > 0.05) bot.look(Math.atan2(-ax, -az), 0)
+        bot.setControlState('forward', horiz > 0.1)
+        bot.setControlState('sprint', false)
+        bot.setControlState('jump', false)
+        bot.setControlState('sneak', false)
+        bot.setControlState('back', false)
+        bot.setControlState('left', false)
+        bot.setControlState('right', false)
+        futile(swimming)
+        return
+      }
 
       // Corner cut (improvement): walk the line, not the staircase.
       //
@@ -2312,6 +2459,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       // node mid-arc would undo the very thing that made it possible.
       if (biasFlight && (bot.entity as { onGround?: boolean }).onGround !== true &&
           headingBias !== null) {
+        execBranch = 'bias-flight'
         bot.look(Math.atan2(-nodeDx, -nodeDz) + headingBias, 0)
         bot.setControlState('forward', true)
         bot.setControlState('sprint', headingSprint)
@@ -2321,8 +2469,8 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       if (biasFlight && (bot.entity as { onGround?: boolean }).onGround === true) biasFlight = false
 
       if (!squeezed && wedged) {
-        if (driveAngledJump(nextPoint, nodeDx, nodeDz)) { futile(swimming); return }
-        if (driveRecovery(nextPoint)) { futile(swimming); return }
+        if (driveAngledJump(nextPoint, nodeDx, nodeDz)) { execBranch = 'angled'; futile(swimming); return }
+        if (driveRecovery(nextPoint)) { execBranch = 'recovery'; futile(swimming); return }
       }
 
       bot.look(Math.atan2(-dx, -dz), 0)
@@ -2363,6 +2511,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         // help when the node is clearly above.
         bot.setControlState('jump', nextPoint.y > bot.entity.position.y + (inColumn ? 0.25 : -0.1))
         bot.setControlState('sprint', false)
+        execBranch = 'swim'
       } else if (maySprint && physics.canStraightLine(path, true)) {
         // Sprint-hop (improvement, allowSprintHop): the plain sprint upstream
         // uses here is the SLOWEST way a bot with a jump key crosses open
@@ -2388,18 +2537,22 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         // jumps each), so this is never the slower choice and is not optional.
         bot.setControlState('jump', hopHold && (bot.entity as { onGround?: boolean }).onGround === true)
         bot.setControlState('sprint', true)
+        execBranch = hopHold ? 'hop' : 'sprint'
       } else if (maySprint && physics.canSprintJump(path)) {
         hopHold = false
         bot.setControlState('jump', true)
         bot.setControlState('sprint', true)
+        execBranch = 'sprintjump'
       } else if (physics.canStraightLine(path)) {
         hopHold = false
         bot.setControlState('jump', false)
         bot.setControlState('sprint', false)
+        execBranch = maySprint ? 'walk' : 'walk-nosprint'
       } else if (physics.canWalkJump(path)) {
         hopHold = false
         bot.setControlState('jump', true)
         bot.setControlState('sprint', false)
+        execBranch = 'walkjump'
       } else {
         hopHold = false
         // Improvement: creep to the takeoff CORNER before a standing parkour
@@ -2424,7 +2577,22 @@ export function createPathfinder (options: PathfinderOptions = {}) {
             creepCell ??= { x: Math.floor(p.x), z: Math.floor(p.z) }
             const px = p.x - (creepCell.x + 0.5)
             const pz = p.z - (creepCell.z + 0.5)
-            const sCap = TAKEOFF_STAND * len / Math.max(Math.abs(dx), Math.abs(dz))
+            // On a narrow support (fence post, head, pot) the lip is closer:
+            // the same reduced credit the planner used (parkourEnvelope.ts).
+            // Without the cap the sneak guard stops the body at the post's
+            // edge short of the full-block creep target, and the creep never
+            // ends. The support is the block the feet rest on — probed at
+            // feet − 0.2 like the physics does, then one lower, because a
+            // fence's 1.5 top pokes into the cell above its own.
+            let half = 0.5
+            for (const oy of [-0.2, -1.2]) {
+              const sup = bot.blockAt(new Vec3(creepCell.x, Math.floor(p.y + oy), creepCell.z)) as BlockLike | null
+              if (sup !== null && sup.shapes.length > 0) {
+                half = CATCH_HALF[topCatchClass(sup.shapes)]
+                break
+              }
+            }
+            const sCap = Math.min(TAKEOFF_STAND, half + TAKEOFF_NARROW_MARGIN) * len / Math.max(Math.abs(dx), Math.abs(dz))
             creep = (px * dx + pz * dz) / len < sCap
           }
         }
@@ -2460,16 +2628,65 @@ export function createPathfinder (options: PathfinderOptions = {}) {
           dy > STEP_UP_MIN && (nextPoint as { parkour?: boolean }).parkour !== true &&
           physics.canNudge({ back: true }, 3)
 
+        // Run-up back-off (improvement): a parkour jump no gate authorises
+        // from where the body stands is flown the way a player flies it —
+        // from the REAR of the support, sprinting across it and jumping at
+        // the lip (the planner's run-length envelope, parkourEnvelope.ts
+        // J_RUN: even 0.4 blocks of run adds half a block of flight, a post
+        // gives 0.8, a full block 1.4). So before creeping forward to jump
+        // from rest, back off to the rear edge — one attempt per node, only
+        // while the physics says each step back is safe (the rollout stops
+        // at the edge) — and let the ordinary gates re-decide every tick:
+        // the delayed-jump rollout (canStraightLine → canSprintJump(path, i))
+        // authorises the sprint-in as soon as it fits. If it never does, the
+        // creep resumes and the futility timer has the last word.
+        let runBack = false
+        if (!inFlight && !climbing && !swimming &&
+            (nextPoint as { parkour?: boolean }).parkour === true &&
+            (bot.entity as { onGround?: boolean }).onGround === true) {
+          if (runBackNode !== nextPoint) {
+            runBackNode = nextPoint
+            runBackTicks = physics.canNudge({ back: true }, 3) ? RUN_BACK_TICKS : 0
+          }
+          if (runBackTicks > 0) {
+            runBackTicks--
+            runBack = physics.canNudge({ back: true }, 2)
+            if (!runBack) runBackTicks = 0
+          }
+        }
+        if (runBack) creep = false
+
         bot.setControlState('forward', creep || inFlight)
-        bot.setControlState('back', stepBack)
+        bot.setControlState('back', stepBack || runBack)
         bot.setControlState('sneak', creep)
         bot.setControlState('sprint', flyingParkour)
+        execBranch = inFlight ? 'inflight' : runBack ? 'runback' : creep ? 'creep' : stepBack ? 'stepback' : 'wait'
       }
 
       futile(swimming)
     }
 
     bot.on('physicsTick', monitorMovement)
+    if (execTraceFile !== null) {
+      bot.on('physicsTick', () => {
+        execTick++
+        const p = bot.entity.position
+        const c = bot.controlState as unknown as Record<string, boolean>
+        const n = path[0]
+        execTraceBuf.push(JSON.stringify([
+          execTick, +p.x.toFixed(2), +p.y.toFixed(2), +p.z.toFixed(2),
+          (bot.entity as { onGround?: boolean }).onGround === true ? 1 : 0,
+          execBranch, c.forward ? 1 : 0, c.sprint ? 1 : 0, c.jump ? 1 : 0, c.sneak ? 1 : 0, c.back ? 1 : 0,
+          cutTarget !== null ? 1 : 0, path.length,
+          n ? [+n.x.toFixed(1), +n.y.toFixed(1), +n.z.toFixed(1), (n as { parkour?: boolean }).parkour ? 1 : 0] : null
+        ]))
+        execBranch = 'idle'
+        if (execTraceBuf.length >= 40) {
+          fs.appendFileSync(execTraceFile, execTraceBuf.join('\n') + '\n')
+          execTraceBuf.length = 0
+        }
+      })
+    }
   }
 }
 

@@ -52,6 +52,7 @@ const { values } = parseArgs({
     'wait-for': { type: 'string', default: '0' }, // human spectators to wait for
     engines: { type: 'string', default: '' }, // subset of upstream,bulba,bulba-wasm
     parity: { type: 'boolean', default: false }, // disable extended parkour
+    risky: { type: 'boolean', default: false }, // plan frame-tight jumps (parkourSafetyMargin 0)
     attach: { type: 'boolean', default: false }, // use an already-running server
     keep: { type: 'boolean', default: false }, // leave the server up afterwards
     debug: { type: 'string', default: 'auto' }, // auto | off | always — see runDebug
@@ -63,6 +64,7 @@ const { values } = parseArgs({
 const profile: MovementProfile = {
   extendedParkour: !values.parity,
   maxDropDown: Number(values['max-drop']),
+  safetyMargin: values.risky ? 0 : undefined,
   thinkTimeout: Number(values.think)
 }
 const timeoutMs = Number(values.timeout) * 1000

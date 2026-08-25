@@ -56,6 +56,13 @@ export class Movements {
   useBubbleColumns: boolean
   /** Cost per block of bubble-column ride (default 1; true ride is faster). */
   bubbleCost: number
+  /**
+   * Improvement (allowParkourExtended): how far short of the physics limit
+   * a planned jump stays, in blocks (default 0.1). 0 plans frame-tight
+   * jumps — a practised player's course — at the price of more refused
+   * take-offs; the executor's rollout still gates every one.
+   */
+  parkourSafetyMargin: number
 
   dontCreateFlow: boolean
   dontMineUnderFallingBlock: boolean
@@ -164,6 +171,7 @@ export class Movements {
     this.entityCost = 1
     this.useBubbleColumns = false // improvement, opt-in (upstream: columns are plain air)
     this.bubbleCost = 1
+    this.parkourSafetyMargin = 0.1
 
     this.dontCreateFlow = true
     this.dontMineUnderFallingBlock = true
@@ -446,7 +454,8 @@ export class Movements {
       dontCreateFlow: this.dontCreateFlow,
       dontMineUnderFallingBlock: this.dontMineUnderFallingBlock,
       useBubbleColumns: this.useBubbleColumns,
-      bubbleCost: this.bubbleCost
+      bubbleCost: this.bubbleCost,
+      parkourSafetyMargin: this.parkourSafetyMargin
     }
   }
 
@@ -469,7 +478,9 @@ export class Movements {
       setKey(this.doors),
       this.canOpenRealDoors ? 'd1' : 'd0',
       // The LUT's special grid (bubble columns) exists only when opted in.
-      this.useBubbleColumns ? 'b1' : 'b0'
+      this.useBubbleColumns ? 'b1' : 'b0',
+      // Extended parkour marks slime blocks into the special grid.
+      this.allowParkourExtended ? 'x1' : 'x0'
     ].join('|')
   }
 

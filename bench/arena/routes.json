@@ -151,6 +151,22 @@
         128
       ],
       "notes": "defined by in-world !PF signs"
+    },
+    {
+      "id": "parkouradv1",
+      "name": "parkouradv1",
+      "scenario": "mixed",
+      "start": [
+        -135,
+        260,
+        96
+      ],
+      "end": [
+        -111,
+        264,
+        137
+      ],
+      "notes": "defined by in-world !PF signs"
     }
   ]
 }

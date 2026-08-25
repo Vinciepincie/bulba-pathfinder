@@ -6,7 +6,7 @@
 // partial-path selection, same tie-break-relevant relaxation rule.
 import { performance } from 'node:perf_hooks'
 import { MinHeap } from './heap.js'
-import { MoveGen, META_PARKOUR, META_USEONE } from './moveGen.js'
+import { MoveGen, META_PARKOUR, META_USEONE, META_BOUNCE, META_CHAIN } from './moveGen.js'
 import type { SnapshotView, StepExclusionFn, DigContext } from './moveGen.js'
 import type { MovementsConfig, RawPathNode, SolveStatus } from './types.js'
 
@@ -123,6 +123,8 @@ export class Solver {
   private finalResult: RawSolveResult | null = null
   /** Per-node toBreak (cell indices) for canDig solves; lazily created. */
   private breaks: Map<number, number[]> | null = null
+  /** Per-node slime stand cell for META_BOUNCE moves; lazily created. */
+  private vias: Map<number, number> | null = null
 
   constructor (
     snap: SnapshotView,
@@ -229,6 +231,11 @@ export class Solver {
             z: this.decodeZ(idx)
           }))
         }
+        if ((meta & (META_BOUNCE | META_CHAIN)) !== 0) {
+          const via = this.vias?.get(cur)
+          if (via !== undefined) node.via = { x: this.decodeX(via), y: this.decodeY(via), z: this.decodeZ(via) }
+          if ((meta & META_CHAIN) !== 0) node.chain = true
+        }
         path.push(node)
         cur = parent
       }
@@ -322,6 +329,7 @@ export class Solver {
       const outCost = moveGen.outCost
       const outMeta = moveGen.outMeta
       const outBreaks = moveGen.outBreaks
+      const outVia = moveGen.outVia
       const g = gAll[idx]
 
       for (let i = 0; i < count; i++) {
@@ -362,6 +370,12 @@ export class Solver {
           (this.breaks ??= new Map()).set(nIdx, br)
         } else if (this.breaks !== null) {
           this.breaks.delete(nIdx)
+        }
+        const via = outVia[i]
+        if (via >= 0) {
+          (this.vias ??= new Map()).set(nIdx, via)
+        } else if (this.vias !== null) {
+          this.vias.delete(nIdx)
         }
         if (h < this.bestH) {
           this.bestH = h

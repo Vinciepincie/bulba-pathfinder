@@ -222,24 +222,22 @@ export function getParkourExtTable (): ParkourExtTable {
  *   i32 ×7 per entry (diag, cardX, cardZ order): tx, tz, nLine, nCells,
  *        cellsOff, runX, runZ
  *   i32 ×cellsLen: cells
- *   f64 ×40: J_STANDING, J_RUNNING, J_LOW_STANDING, J_LOW_RUNNING (written
- *        by the caller — the envelope lives beside the table in the blob)
+ *   f64 ×140: J_RUN (7 run rows × 10 buckets), then J_LOW_RUN (written by
+ *        the caller — the envelope lives beside the table in the blob)
  *   f64 ×4 per entry: dist, cost, fnStand, fnRun
  *   f64 ×(cellsLen/2) ×4: mfStand, mfRun, mfLowStand, mfLowRun per cell,
  *        each block indexed by cellsOff + k
  */
 export function serializeParkourTable (
   table: ParkourExtTable,
-  standing: readonly number[],
-  running: readonly number[],
-  lowStanding: readonly number[],
-  lowRunning: readonly number[]
+  run: ReadonlyArray<readonly number[]>,
+  lowRun: ReadonlyArray<readonly number[]>
 ): ArrayBuffer {
   const entries = [...table.diag, ...table.cardX, ...table.cardZ]
   const cellsLen = entries.reduce((n, e) => n + e.cells.length, 0)
   const intCount = 4 + entries.length * 7 + cellsLen
   const f64Off = Math.ceil((intCount * 4) / 8) * 8
-  const buf = new ArrayBuffer(f64Off + 8 * (40 + entries.length * 4 + cellsLen * 2))
+  const buf = new ArrayBuffer(f64Off + 8 * (140 + entries.length * 4 + cellsLen * 2))
   const view = new DataView(buf)
   let o = 0
   const i32 = (v: number): void => { view.setInt32(o, v, true); o += 4 }
@@ -252,10 +250,8 @@ export function serializeParkourTable (
   for (const e of entries) for (const c of e.cells) i32(c)
   o = f64Off
   const f64 = (v: number): void => { view.setFloat64(o, v, true); o += 8 }
-  for (const v of standing) f64(v)
-  for (const v of running) f64(v)
-  for (const v of lowStanding) f64(v)
-  for (const v of lowRunning) f64(v)
+  for (const row of run) for (const v of row) f64(v)
+  for (const row of lowRun) for (const v of row) f64(v)
   for (const e of entries) { f64(e.dist); f64(e.cost); f64(e.fnStand); f64(e.fnRun) }
   for (const e of entries) for (const v of e.mfStand) f64(v)
   for (const e of entries) for (const v of e.mfRun) f64(v)

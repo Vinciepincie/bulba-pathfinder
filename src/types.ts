@@ -65,10 +65,22 @@ export const LutSpecial = {
   /** vine — climbable only with an adjacent solid block to press against
    * (vanilla collision climb; prismarine-physics ascends only on
    * horizontal collision, so a free-hanging curtain is unclimbable). */
-  VINE: 4
+  VINE: 4,
+  /** slime_block — a drop onto it rebounds (improvement, marked only when
+   * the profile enables allowParkourExtended: slime-bounce moves). */
+  SLIME: 8
 } as const
 
-/** Snapshot cell = 2 bytes: flags (LutFlags) + height (top of collision, in 1/32 blocks). */
+/**
+ * Snapshot cell = 2 bytes: flags (LutFlags) + a packed height byte.
+ *
+ * Height byte layout: bits 0–5 = collision-top height in 1/32 blocks
+ * (vanilla tops max out at 1.5 = 48, so 6 bits are exact), bits 6–7 = the
+ * TOP-CATCH class — how wide the centered landing surface at the top of the
+ * block is, from `topCatchClass` (shapes.ts): 0 = full/wide (≥0.4 half),
+ * 1 = head/wall class (0.25), 2 = fence-post/pot class (0.125), 3 = too
+ * small to stand on. Consumers must mask: height = (byte & 63) / 32.
+ */
 export interface SnapshotMeta {
   /** World-space minimum corner of the AABB (inclusive). */
   x0: number
@@ -135,6 +147,13 @@ export interface MovementsConfig {
   /** Cost per block of column ride (default 1 = admissible vs the |dy|
    * heuristic; the true ride is faster — ~0.31 up / ~0.72 down). */
   bubbleCost: number
+  /**
+   * Blocks of flight a planned parkour jump must keep short of the physics
+   * limit (parkourEnvelope.ts ENVELOPE_SAFETY_MARGIN = 0.1 default). 0 plans
+   * the frame-tight jumps a practised player makes; the executor's rollout
+   * still gates every take-off. Optional for older serialized configs.
+   */
+  parkourSafetyMargin?: number
 }
 
 /** Per-state dig auxiliaries (only consulted when a block is unsafe). */
@@ -173,6 +192,14 @@ export interface RawPathNode {
   useOne: { x: number, y: number, z: number } | null
   /** Blocks to dig before entering this node (canDig solves only). */
   toBreak?: Array<{ x: number, y: number, z: number }>
+  /**
+   * Two-stage moves (allowParkourExtended). Slime bounce: drop onto the
+   * slime STAND cell `via`, let the rebound carry the body up, land at this
+   * node. Momentum chain (`chain`): jump onto the stepping stone `via` and
+   * re-jump on the landing tick to reach this node. Absent otherwise.
+   */
+  via?: { x: number, y: number, z: number }
+  chain?: boolean
 }
 
 export interface SolveResult {

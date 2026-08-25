@@ -16,9 +16,10 @@ import {
   STONE,
   WATER,
   LADDER,
-  OAK_FENCE
+  OAK_FENCE,
+  OAK_FENCE_DRY
 } from './helpers/voxelWorld.js'
-import { MoveGen, META_PARKOUR } from '../src/moveGen.js'
+import { MoveGen, META_PARKOUR, META_BOUNCE, META_CHAIN } from '../src/moveGen.js'
 import { Snapshot } from '../src/snapshot.js'
 
 interface GenMove {
@@ -27,6 +28,8 @@ interface GenMove {
   z: number
   cost: number
   meta: number
+  /** Slime stand cell index of a bounce move, -1 otherwise. */
+  via: number
 }
 
 interface GenCtx {
@@ -81,7 +84,8 @@ function movesOf (ctx: GenCtx, x: number, y: number, z: number): GenMove[] {
       y: ly + m.y0,
       z: lz + m.z0,
       cost: gen.outCost[i],
-      meta: gen.outMeta[i]
+      meta: gen.outMeta[i],
+      via: gen.outVia[i]
     }
     // Decode round-trip: our arithmetic must agree with Snapshot.index().
     expect(idxOf(snap, mv.x, mv.y, mv.z)).to.equal(idx)
@@ -282,7 +286,7 @@ describe('MoveGen', () => {
       expect(at(moves, 1, 1, 0), 'no plain forward over the gap').to.have.length(0)
       const parkour = moves.filter(mv => (mv.meta & META_PARKOUR) !== 0)
       expect(parkour).to.have.length(1)
-      expect(parkour[0]).to.deep.equal({ x: 2, y: 1, z: 0, cost: 1, meta: META_PARKOUR })
+      expect(parkour[0]).to.deep.equal({ x: 2, y: 1, z: 0, cost: 1, meta: META_PARKOUR, via: -1 })
     })
 
     it('3-cell gap (distance-4 jump): present with sprinting, absent without', () => {
@@ -497,26 +501,29 @@ describe('MoveGen', () => {
       expect(splash[0].meta).to.equal(META_PARKOUR)
     })
 
-    it('long jumps: (3,2) works corner-standing, (4,2) needs a run-up cell', () => {
-      // 1x1 standing start: per-axis corner credits cover the short
-      // diagonals (players jam these from the block corner).
+    it('long jumps: a 1x1 block is its own run-up — (4,2) works, (5,2) never', () => {
+      // A player sprints across the block from its rear edge and jumps at
+      // the lip (the run-length envelope, parkourEnvelope.ts J_RUN), so the
+      // diagonals up to (4,2) go from a lone block; (5,2) is beyond the
+      // physics with or without a cell behind.
       const world = new VoxelWorld({ x0: -4, y0: -2, z0: -4, x1: 6, y1: 7, z1: 6 })
       world.set(0, 0, 0, STONE)
       world.set(3, 0, 1, STONE)
       world.set(3, 0, 2, STONE)
-      const standing = movesOf(makeGen(world, FLAG), 0, 1, 0)
-      expect(at(standing, 3, 1, 1)[0].cost).to.be.closeTo(Math.hypot(3, 1) + 0.5, 1e-12)
-      expect(at(standing, 3, 1, 2)[0].cost).to.be.closeTo(Math.hypot(3, 2) + 0.5, 1e-12)
+      const lone = movesOf(makeGen(world, FLAG), 0, 1, 0)
+      expect(at(lone, 3, 1, 1)[0].cost).to.be.closeTo(Math.hypot(3, 1) + 0.5, 1e-12)
+      expect(at(lone, 3, 1, 2)[0].cost).to.be.closeTo(Math.hypot(3, 2) + 0.5, 1e-12)
+      const four = new VoxelWorld({ x0: -4, y0: -2, z0: -4, x1: 6, y1: 7, z1: 6 })
+      four.set(0, 0, 0, STONE)
+      four.set(4, 0, 2, STONE) // nothing under the flight line: a real gap
+      expect(at(movesOf(makeGen(four, FLAG), 0, 1, 0), 4, 1, 2)[0].cost).to.be.closeTo(Math.hypot(4, 2) + 0.5, 1e-12)
 
-      // (4,2) still needs running speed — clear corridor, 1x1 takeoff.
-      const far = new VoxelWorld({ x0: -4, y0: -2, z0: -4, x1: 6, y1: 7, z1: 6 })
+      const far = new VoxelWorld({ x0: -4, y0: -2, z0: -4, x1: 7, y1: 7, z1: 6 })
       far.set(0, 0, 0, STONE)
-      far.set(4, 0, 2, STONE)
-      expect(at(movesOf(makeGen(far, FLAG), 0, 1, 0), 4, 1, 2)).to.have.length(0)
-
-      far.set(-1, 0, 0, STONE) // run-up cell behind the takeoff
-      const running = movesOf(makeGen(far, FLAG), 0, 1, 0)
-      expect(at(running, 4, 1, 2)[0].cost).to.be.closeTo(Math.hypot(4, 2) + 0.5, 1e-12)
+      far.set(5, 0, 2, STONE)
+      expect(at(movesOf(makeGen(far, FLAG), 0, 1, 0), 5, 1, 2)).to.have.length(0)
+      far.set(-1, 0, 0, STONE) // a run-up cell adds nothing: sprint saturates within a block
+      expect(at(movesOf(makeGen(far, FLAG), 0, 1, 0), 5, 1, 2)).to.have.length(0)
     })
 
     it('MLG drop-boost: (5,1) is beyond running flat reach but lands 1 below', () => {
@@ -532,9 +539,9 @@ describe('MoveGen', () => {
       expect(mlg).to.have.length(1)
       expect(mlg[0].cost).to.be.closeTo(Math.hypot(5, 1) + 0.5, 1e-12)
 
-      world.set(-1, 1, 0, AIR) // no run-up: standing can't make it at -1 either
+      world.set(-1, 1, 0, AIR) // no run-up cell: the block's own 1.38 of run still makes it
       world.set(-1, 0, 0, AIR)
-      expect(at(movesOf(makeGen(world, FLAG), 0, 2, 0), 5, 1, 1)).to.have.length(0)
+      expect(at(movesOf(makeGen(world, FLAG), 0, 2, 0), 5, 1, 1)).to.have.length(1)
     })
   })
 
@@ -614,6 +621,197 @@ describe('MoveGen', () => {
       const ctx = makeGen(bigWorld())
       movesOf(ctx, 6, 3, 0) // node on the x1 edge: forward east probes x=7, outside the box
       expect(ctx.gen.boundaryTouched).to.equal(true)
+    })
+  })
+
+  describe('extended parkour: narrow supports, fence tops, ladders, slime', () => {
+    const FLAG = { allowParkourExtended: true }
+    function voidWorld (): VoxelWorld {
+      return new VoxelWorld({ x0: -4, y0: -3, z0: -4, x1: 8, y1: 9, z1: 8 })
+    }
+
+    it('fence top is a landing: a (2,0) hop onto a post, feet 0.5 into the node cell', () => {
+      const world = voidWorld()
+      world.set(0, 0, 0, STONE)
+      world.set(2, 0, 0, OAK_FENCE_DRY) // top 1.5 → stand (2,1,0)
+      const moves = movesOf(makeGen(world, FLAG), 0, 1, 0)
+      const hop = at(moves, 2, 1, 0)
+      expect(hop).to.have.length(1)
+      expect(hop[0].meta).to.equal(META_PARKOUR)
+      expect(hop[0].cost).to.be.closeTo(2.5, 1e-12)
+      // Upstream classification: not physical, not safe — no landing at all.
+      expect(at(movesOf(makeGen(world), 0, 1, 0), 2, 1, 0)).to.have.length(0)
+      // Head needs the cell above the usual pair: a lid at y+3 vetoes.
+      world.set(2, 3, 0, STONE)
+      expect(at(movesOf(makeGen(world, FLAG), 0, 1, 0), 2, 1, 0)).to.have.length(0)
+    })
+
+    it('narrow credits: a (3,1)+1 hop between posts is real (recorded on parkouradv1), a (3,2)+1 is not', () => {
+      const posts = voidWorld()
+      posts.set(0, 0, 0, OAK_FENCE_DRY) // stand (0,1,0), feet 1.5
+      posts.fill(1, 0, 3, 1, 1, 3, OAK_FENCE_DRY) // 2-stack, top 2.5 → stand (1,2,3): rise 1.0
+      posts.fill(2, 0, 3, 2, 1, 3, OAK_FENCE_DRY) // (2,3): the same rise, half a block further out
+      const fromPost = movesOf(makeGen(posts, FLAG), 0, 1, 0)
+      expect(at(fromPost, 1, 2, 3)).to.have.length(1) // 2.21 needed, 2.35 usable off a 0.81 run
+      expect(at(fromPost, 2, 2, 3)).to.have.length(0) // 2.53 needed
+
+      const blocks = voidWorld()
+      blocks.set(0, 0, 0, STONE)
+      blocks.set(1, 1, 3, STONE) // flight-level block: up landing (1,2,3), rise 1.0
+      const hop = at(movesOf(makeGen(blocks, FLAG), 0, 1, 0), 1, 2, 3)
+      expect(hop).to.have.length(1)
+      expect(hop[0].meta).to.equal(META_PARKOUR)
+    })
+
+    it('narrow credits: landing a (2,1) hop on a head from a post fits standing reach', () => {
+      const world = voidWorld()
+      world.set(0, 0, 0, OAK_FENCE_DRY) // stand (0,1,0), feet 1.5
+      const head = mcData.blocksByName.creeper_head.minStateId as number
+      world.set(2, 1, 1, head) // top 1.5 → stand (2,2,1): flat from the post
+      const hop = at(movesOf(makeGen(world, FLAG), 0, 1, 0), 2, 2, 1)
+      expect(hop).to.have.length(1)
+      expect(hop[0].meta).to.equal(META_PARKOUR)
+    })
+
+    it('sunk fence: walk onto a post whose top is 0.5 above the floor', () => {
+      const world = voidWorld()
+      world.set(0, 0, 0, STONE) // stand (0,1,0)
+      world.set(1, 0, 0, OAK_FENCE_DRY) // top 1.5: step of 0.5 → node (1,1,0)
+      const step = at(movesOf(makeGen(world, FLAG), 0, 1, 0), 1, 1, 0)
+      expect(step).to.have.length(1)
+      expect(step[0].cost).to.equal(1)
+      expect(step[0].meta).to.equal(0)
+      expect(at(movesOf(makeGen(world), 0, 1, 0), 1, 1, 0)).to.have.length(0)
+      // A post one higher is a 1.5 step: not walkable, and not jumpable either (> 1.2).
+      world.set(1, 1, 0, OAK_FENCE_DRY)
+      const moves = movesOf(makeGen(world, FLAG), 0, 1, 0)
+      expect(at(moves, 1, 1, 0)).to.have.length(0)
+      expect(at(moves, 1, 2, 0)).to.have.length(0)
+    })
+
+    it('jump up from a post onto the next post one higher (rise 1.0), cost 2', () => {
+      const world = voidWorld()
+      world.set(0, 0, 0, OAK_FENCE_DRY) // stand (0,1,0), feet 1.5
+      world.set(1, 1, 0, OAK_FENCE_DRY) // top 2.5 → stand (1,2,0)
+      const up = at(movesOf(makeGen(world, FLAG), 0, 1, 0), 1, 2, 0)
+      expect(up).to.have.length(1)
+      expect(up[0].cost).to.equal(2)
+      expect(up[0].meta).to.equal(0)
+    })
+
+    it('drop onto a fence top below: node one above the post, capped by maxDropDown', () => {
+      const world = voidWorld()
+      world.fill(0, 0, 0, 0, 2, 0, STONE) // stand (0,3,0)
+      world.set(1, -1, 0, OAK_FENCE_DRY) // top 0.5 → stand (1,0,0): drop 3
+      const drop = at(movesOf(makeGen(world, FLAG), 0, 3, 0), 1, 0, 0)
+      expect(drop).to.have.length(1)
+      expect(drop[0].cost).to.equal(1)
+      expect(at(movesOf(makeGen(world), 0, 3, 0), 1, 0, 0)).to.have.length(0)
+    })
+
+    it('step into a free-hanging ladder cell from an adjacent stand', () => {
+      const world = voidWorld()
+      world.set(0, 0, 0, STONE) // stand (0,1,0)
+      world.set(1, 1, 0, LADDER) // ladder over void, mounted on...
+      world.fill(2, 0, 0, 2, 3, 0, STONE) // ...this wall
+      const step = at(movesOf(makeGen(world, FLAG), 0, 1, 0), 1, 1, 0)
+      expect(step).to.have.length(1)
+      expect(step[0].cost).to.equal(1)
+      expect(at(movesOf(makeGen(world), 0, 1, 0), 1, 1, 0)).to.have.length(0)
+    })
+
+    it('no extended jumps from a ladder cell; climb transfers round the pillar instead', () => {
+      const world = voidWorld()
+      world.fill(0, 0, 0, 0, 5, 0, STONE) // 1x1 pillar
+      world.set(0, 1, -1, LADDER) // north face
+      world.set(-1, 2, 0, LADDER) // west face, one up
+      world.set(0, 3, 1, LADDER) // south face
+      world.set(1, 4, 0, LADDER) // east face
+      world.set(3, 0, -1, STONE) // a landing an ext jump from the ladder would otherwise take
+      const moves = movesOf(makeGen(world, FLAG), 0, 1, -1)
+      expect(moves.every(mv => mv.meta === 0)).to.equal(true)
+      expect(at(moves, 3, 1, -1)).to.have.length(0)
+      const west = at(moves, -1, 2, 0)
+      expect(west).to.have.length(1)
+      expect(west[0].cost).to.be.closeTo(Math.SQRT2 + 0.5 + 1, 1e-12)
+      // The straight climb is still there, and nothing goes to the other ladders directly.
+      expect(at(moves, 0, 2, -1)).to.have.length(1)
+      expect(at(moves, 0, 3, 1)).to.have.length(0)
+      // Whole spiral, one transfer per corner.
+      const gen = makeGen(world, FLAG)
+      expect(at(movesOf(gen, -1, 2, 0), 0, 3, 1)).to.have.length(1)
+      expect(at(movesOf(gen, 0, 3, 1), 1, 4, 0)).to.have.length(1)
+      // Flag off: no transfer.
+      expect(at(movesOf(makeGen(world), 0, 1, -1), -1, 2, 0)).to.have.length(0)
+      // Both corner columns blocked: no way round.
+      world.fill(-1, 1, -1, -1, 3, -1, STONE)
+      expect(at(movesOf(makeGen(world, FLAG), 0, 1, -1), -1, 2, 0)).to.have.length(0)
+    })
+
+    it('momentum chain: a stepping-stone re-jump reaches what a jump from the stone cannot', () => {
+      // A → B is a plain (3,0) hop onto a fence post. B → C is (5,2) a block
+      // and a half down: off the post's 0.81 of run it needs 3.93 against
+      // 3.90 usable; the chain row from the landing point (4.35, half the
+      // creep credit) covers it at 4.15. So A → C exists, via B.
+      const world = new VoxelWorld({ x0: -3, y0: -3, z0: -4, x1: 12, y1: 7, z1: 6 })
+      world.set(0, 0, 0, STONE)
+      world.set(3, 0, 0, OAK_FENCE_DRY) // stand (3,1,0), feet 1.5
+      world.set(8, -1, 2, STONE) // stand (8,0,2)
+      const ctx = makeGen(world, FLAG)
+      const moves = movesOf(ctx, 0, 1, 0)
+      const chain = at(moves, 8, 0, 2)
+      expect(chain).to.have.length(1)
+      expect(chain[0].meta).to.equal(META_PARKOUR | META_CHAIN)
+      expect(chain[0].via).to.equal(ctx.snap.index(3, 1, 0))
+      expect(chain[0].cost).to.be.closeTo(3.5 + Math.hypot(5, 2) + 0.5, 1e-12)
+      // B itself is a plain parkour landing, and its own expansion cannot reach C.
+      expect(at(moves, 3, 1, 0)[0].meta).to.equal(META_PARKOUR)
+      expect(at(movesOf(ctx, 3, 1, 0), 8, 0, 2)).to.have.length(0)
+      // Turning away kills the momentum: a (0,5) hop off B is not chained.
+      world.set(3, -1, 5, STONE)
+      expect(at(movesOf(makeGen(world, FLAG), 0, 1, 0), 3, 0, 5).filter(mv => (mv.meta & META_CHAIN) !== 0)).to.have.length(0)
+      // A stone with a walkable neighbour is not a stepping stone: its own
+      // jumps run from there, so no chain is emitted.
+      world.set(2, 0, 0, STONE)
+      const wide = movesOf(makeGen(world, FLAG), 0, 1, 0)
+      expect(wide.filter(mv => (mv.meta & META_CHAIN) !== 0)).to.have.length(0)
+      // Flag off: nothing.
+      expect(movesOf(makeGen(world), 0, 1, 0).filter(mv => mv.via >= 0)).to.have.length(0)
+    })
+
+    it('slime bounce: a drop of 3 onto slime reaches a ledge 1.5 up beside it, via the slime', () => {
+      const slime = mcData.blocksByName.slime_block.minStateId as number
+      const world = voidWorld()
+      world.fill(0, 0, 0, 0, 2, 0, STONE) // stand (0,3,0)
+      world.set(1, -1, 0, slime) // stand (1,0,0): drop 3 → rebound apex 2.10
+      world.set(2, 1, 0, bottomSlabState()) // top 1.5 → stand (2,2,0): under 0 + 2.10 - 0.2
+      world.set(1, 1, 2, STONE) // ring-2 (0,+2): top 2 > 0 + 2.10 - 1.0 → out of reach
+      world.set(-1, 1, 1, STONE) // ring-1 (-1,+1): stand (-1,2,1), top 2 > 1.9 → out of reach
+      const ctx = makeGen(world, FLAG)
+      const moves = movesOf(ctx, 0, 3, 0)
+      const drop = at(moves, 1, 0, 0)
+      expect(drop).to.have.length(1)
+      expect(drop[0].meta).to.equal(0)
+      // The ledge is also a plain drop-jump from the takeoff; the bounce
+      // edge is the one carrying META_BOUNCE and the slime as `via`.
+      const bounces = (ms: GenMove[]): GenMove[] => ms.filter(mv => (mv.meta & META_BOUNCE) !== 0)
+      const bounce = bounces(at(moves, 2, 2, 0))
+      expect(bounce).to.have.length(1)
+      expect(bounce[0].meta).to.equal(META_PARKOUR | META_BOUNCE)
+      expect(bounce[0].cost).to.be.closeTo(2 + 1 + 1, 1e-12) // octile(2,0) + |dy| + 1
+      expect(bounce[0].via).to.equal(ctx.snap.index(1, 0, 0))
+      expect(bounces(at(moves, 1, 2, 2))).to.have.length(0)
+      expect(bounces(at(moves, -1, 2, 1))).to.have.length(0)
+      expect(moves.filter(mv => mv.via >= 0)).to.have.length(1)
+      expect(moves.filter(mv => mv.via >= 0 && (mv.meta & META_BOUNCE) === 0)).to.have.length(0)
+      // Flag off: no bounce (and no slime marking at all).
+      expect(bounces(movesOf(makeGen(world), 0, 3, 0))).to.have.length(0)
+      // A drop of 2 rebounds 1.30: the same ledge is out of reach.
+      const low = voidWorld()
+      low.fill(0, 0, 0, 0, 1, 0, STONE) // stand (0,2,0)
+      low.set(1, -1, 0, slime)
+      low.set(2, 1, 0, bottomSlabState())
+      expect(bounces(movesOf(makeGen(low, FLAG), 0, 2, 0))).to.have.length(0)
     })
   })
 })

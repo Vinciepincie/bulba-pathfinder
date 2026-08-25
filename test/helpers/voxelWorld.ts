@@ -38,6 +38,26 @@ export const LADDER_DRY = ((): number => {
   }
   return b.minStateId as number
 })()
+/** A fence with no water in it (minStateId is waterlogged=true, as for ladders). */
+export const OAK_FENCE_DRY = ((): number => {
+  const b = mcData.blocksByName.oak_fence
+  for (let s = b.minStateId as number; s <= (b.maxStateId as number); s++) {
+    const props = (Block.fromStateId(s, 0) as { getProperties: () => Record<string, unknown> }).getProperties()
+    if (props.waterlogged === false || props.waterlogged === 'false') return s
+  }
+  return b.minStateId as number
+})()
+export const SLIME = mcData.blocksByName.slime_block.minStateId as number
+/** Bottom stone slab (collision top 0.5), dry. */
+export const STONE_SLAB_BOTTOM = ((): number => {
+  const b = mcData.blocksByName.stone_slab
+  for (let s = b.minStateId as number; s <= (b.maxStateId as number); s++) {
+    const props = (Block.fromStateId(s, 0) as { getProperties: () => Record<string, unknown> }).getProperties()
+    if (props.type === 'bottom' && (props.waterlogged === false || props.waterlogged === 'false')) return s
+  }
+  throw new Error('no dry bottom stone_slab state')
+})()
+export const CREEPER_HEAD = mcData.blocksByName.creeper_head.minStateId as number
 export const VINE = mcData.blocksByName.vine.minStateId as number
 export const COBWEB = mcData.blocksByName.cobweb.minStateId as number
 export const SOUL_SAND = mcData.blocksByName.soul_sand.minStateId as number

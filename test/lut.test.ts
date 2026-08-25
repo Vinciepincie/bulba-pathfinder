@@ -172,25 +172,40 @@ describe('buildLut', () => {
     })
   })
 
-  describe('heights (collision top in 1/32 blocks)', () => {
-    it('stone_slab bottom state → 16 (0.5 * 32)', () => {
+  describe('heights (collision top in 1/32 blocks, bits 0–5; top-catch class in bits 6–7)', () => {
+    const height = (stateId: number): number => lut.heights[stateId] & 63
+    const catchClass = (stateId: number): number => lut.heights[stateId] >> 6
+
+    it('stone_slab bottom state → 16 (0.5 * 32), full-width catch', () => {
       const bottomStates = statesOf('stone_slab').filter(stateId => {
         const props = (Block.fromStateId(stateId, 0) as { getProperties: () => Record<string, unknown> }).getProperties()
         return props.type === 'bottom'
       })
       expect(bottomStates.length).to.be.greaterThan(0)
       for (const stateId of bottomStates) {
-        expect(lut.heights[stateId], `state ${stateId}`).to.equal(16)
+        expect(height(stateId), `state ${stateId}`).to.equal(16)
+        expect(catchClass(stateId), `state ${stateId}`).to.equal(0)
       }
     })
 
-    it('oak_fence → 48 (1.5 * 32)', () => {
-      expect(lut.heights[OAK_FENCE]).to.equal(48)
+    it('oak_fence → 48 (1.5 * 32), post-class catch on every state (arms or not)', () => {
+      expect(height(OAK_FENCE)).to.equal(48)
+      for (const stateId of statesOf('oak_fence')) {
+        expect(height(stateId), `state ${stateId}`).to.equal(48)
+        expect(catchClass(stateId), `state ${stateId}`).to.equal(3)
+      }
+    })
+
+    it('creeper_head → 16 (0.5 * 32), head-class catch', () => {
+      const head = typeOf('creeper_head').minStateId
+      expect(height(head)).to.equal(16)
+      expect(catchClass(head)).to.equal(1)
     })
 
     it('soul_sand → 28 (0.875 * 32)', () => {
       const soulSand = typeOf('soul_sand').minStateId
-      expect(lut.heights[soulSand]).to.equal(28)
+      expect(height(soulSand)).to.equal(28)
+      expect(catchClass(soulSand)).to.equal(0)
     })
 
     it('air → 0', () => {

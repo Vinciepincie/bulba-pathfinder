@@ -4,7 +4,7 @@
 // test/envelope.test.ts re-derives and asserts equality, so these values can
 // never silently drift from the real physics.
 //
-// J[bucket] = usable flight distance (pure center travel minus a 0.2 safety
+// J[bucket] = usable flight distance (pure center travel minus a 0.1 safety
 // margin) for a landing at dy = +1 (bucket 0), 0 (bucket 1), -1 … -8
 // (buckets 2…9). Take-off and landing geometry is credited PER-AXIS by
 // flightNeeded(): the 0.6-wide hitbox takes off from the block's corner and
@@ -14,24 +14,100 @@
 
 export const ENVELOPE_BUCKETS = 10
 
+/**
+ * The safety margin already subtracted from every row below (the helper's
+ * SAFETY_MARGIN): a plan never asks for a jump closer than this to the
+ * physics limit, because a jump the executor's rollout then refuses is a
+ * 3.5 s stall and a replan. `Movements.parkourSafetyMargin` re-tunes it per
+ * profile — 0 plans the frame-tight jumps a practised player makes (the
+ * arena's `--risky`), more is more conservative.
+ */
+export const ENVELOPE_SAFETY_MARGIN = 0.1
+
 /** Standing start (a 1x1 pillar: no room to build sprint momentum). Pure
  * jam from the cell center; the executor creeps to the takeoff corner
  * (TAKEOFF_STAND per axis) before jumping — that credit is applied by
  * flightNeeded, not baked into these rows. */
 export const J_STANDING: readonly number[] = [
-  1.6856957298356374, 2.423431513900386, 2.930990921511102,
-  3.1886681704338424, 3.7106837967864577, 3.974628686934416,
-  4.240298536969059, 4.507538100500583, 4.77620610331427, 5.046173985874725
+  1.7856957298356373, 2.5234315139003862, 3.030990921511102, 3.2886681704338425, 3.8106837967864577, 4.074628686934417, 4.340298536969059, 4.607538100500584, 4.876206103314271, 5.146173985874726
 ]
 
 /** Running start (≥1 walkable same-level cell behind the takeoff). Measured
  * with the jump firing at the cell center; the executor's rollout delays the
  * jump toward the lip, credited as TAKEOFF_RUN along the flight line. */
 export const J_RUNNING: readonly number[] = [
-  2.4757621249691115, 3.3272852710242216, 3.8946585989703006,
-  4.1782687837201165, 4.745358445833771, 5.028845644365875,
-  5.312298995030089, 5.595721544134523, 5.879116063819559, 6.162485076732942
+  2.5757621249691116, 3.4272852710242216, 3.9946585989703007, 4.278268783720117, 4.845358445833772, 5.128845644365875, 5.412298995030089, 5.695721544134524, 5.97911606381956, 6.2624850767329425
 ]
+
+/**
+ * RUN-LENGTH envelope — the model a real player's jump follows. Nobody jumps
+ * from rest at the lip: they sprint across whatever support they have and
+ * jump at its edge, and even 0.4 blocks of run adds half a block of flight.
+ * RUN_LENGTHS are the blocks of sprint before the jump the rows below were
+ * measured at (0 = the jam from rest, i.e. J_STANDING); a fence post's
+ * ±0.405 support zone gives ~0.8, a head's ~1.06, a full block ~1.38 (rear
+ * overhang 0.78 to the 0.6 creep point), and each walkable cell behind —
+ * level or one step lower — adds 1. Reach saturates around 2. Rows are
+ * usable flight from the JUMP POINT per landing dy (buckets as J_STANDING),
+ * so the per-axis lip credit applies exactly as for the jam. Derived by
+ * measureRunTakeoff(); envelope.test.ts re-derives and asserts equality.
+ * Recorded on the arena's parkouradv1: a human's pot-to-pot (5,-2) at
+ * 0.277 blocks/tick average over 18 ticks — full sprint off a 0.25 post.
+ */
+export const RUN_LENGTHS: readonly number[] = [0,0.4,0.8,1.2,1.6,2,3]
+export const J_RUN: ReadonlyArray<readonly number[]> = [
+  [1.7856957298356373, 2.5234315139003862, 3.030990921511102, 3.2886681704338425, 3.8106837967864577, 4.074628686934417, 4.340298536969059, 4.607538100500584, 4.876206103314271, 5.146173985874726],
+  [2.2448425003383314, 3.072799442818297, 3.627784865828414, 3.9060241479198683, 4.463778644123025, 4.743218486167964, 5.022988742428859, 5.3030596756262725, 5.5834042248359195, 5.863997764616698],
+  [2.3453860036538257, 3.1930994857046064, 3.7584702104153744, 4.041212146087096, 4.606792704478114, 4.889625615684188, 5.172483564881715, 5.455364298651466, 5.7382657663819385, 6.021186102016669],
+  [2.364773860726531, 3.2162970067816405, 3.78367033472772, 4.067280519477537, 4.634370181591191, 4.917857380123294, 5.201310730787508, 5.484733279891943, 5.768127799576979, 6.051496812490361],
+  [2.3811394610873147, 3.235878405483103, 3.8049421628617615, 4.089285250550383, 4.657648771261976, 4.941688264194578, 5.225644202763246, 5.5095241068607335, 5.793334819589448, 6.077082568172577],
+  [2.384295248485215, 3.239654296980699, 3.8090440207634457, 4.093528434514489, 4.662137594055178, 4.946283586209965, 5.230336439070822, 5.514304535174201, 5.7981955026282765, 6.082016283011485],
+  [2.387753235616336, 3.2437917696811356, 3.813538674569071, 4.098177947834882, 4.667056268698188, 4.951318958492379, 5.235478006205092, 5.519542739623661, 5.803521647034559, 6.087422452778476]
+]
+/** Same runs under a solid lid 2 above the feet (head-hitter class). */
+export const J_LOW_RUN: ReadonlyArray<readonly number[]> = [
+  [-0.1, 0.9626976143129206, 1.8600178263100626, 2.292732225692906, 2.748396619821839, 2.9835742558313516, 3.466483304979486, 3.7134731393248104, 3.9637138885790555, 4.216912970400419],
+  [-0.1, 0.8815489801948252, 1.9549023386659186, 2.4430631741072477, 2.944642761936213, 3.1997273989420587, 3.7172368065219197, 3.9792279795150525, 4.243119946938804, 4.508741637294417],
+  [-0.1, 0.6517214113611253, 1.7805282904847677, 2.3453860036538257, 2.627905517934086, 3.1930994857046064, 3.4757647866002963, 3.7584702104153744, 4.041212146087096, 4.323987307548362],
+  [-0.1, 0.943864544997134, 2.051629463425525, 2.550629157326545, 3.0611844038459797, 3.3201605293133847, 3.844433732988282, 4.1093574188328805, 4.375917972951465, 4.643968077199375],
+  [-0.1, 0.6657803555144551, 1.8103637311992655, 2.3811394610873147, 2.6662247919356354, 3.235878405483103, 3.520477231335804, 3.8049421628617615, 4.089285250550383, 4.373517460347029],
+  [-0.1, 0.6670212715536775, 1.812997163448238, 2.384295248485215, 2.669607051741299, 3.239654296980699, 3.5244237858721896, 3.8090440207634457, 4.093528434514489, 4.377889251027939],
+  [-0.1, 0.6683810183152262, 1.8158827744477888, 2.387753235616336, 2.6733131983878926, 3.2437917696811356, 3.528748264386861, 3.813538674569071, 4.098177947834882, 4.382679686506771]
+]
+/** Row of the longest measured run not exceeding `runLength` (conservative). */
+export function runRow (runLength: number): number {
+  let row = 0
+  for (let i = 1; i < RUN_LENGTHS.length; i++) if (RUN_LENGTHS[i] <= runLength) row = i
+  return row
+}
+
+/**
+ * Momentum chain: re-jump on the FIRST grounded tick after a sprint-jump
+ * landing (jump released in the air, pressed on landing — the executor's
+ * press-on-landing cadence). The landing speed carries into the takeoff,
+ * so the second jump out-flies even a running start — this is how players
+ * cross 1x1 courses where no post offers a run-up. Measured from the
+ * weakest realistic incoming speed (a STANDING first jump over a 1-block
+ * gap), usable flight per landing dy from the LANDING POINT; only valid
+ * when the second jump continues the first one's direction (the solver
+ * gates on the angle). Generated by measureChainTakeoff(); envelope.test.ts
+ * re-derives and asserts equality.
+ */
+export const J_CHAIN: readonly number[] = [
+  2.688724183712625, 3.6039027342842247, 4.2047374170597385, 4.502855113817017, 5.095160282550845, 5.389579921413924, 5.6829817927793265, 5.975457495721843, 6.267090385399532, 6.55795631500623
+]
+/** A chained second jump keeps its momentum only while it continues the
+ * first jump's direction: cos(angle) between the two flight lines ≥ this
+ * (~32°; a 45° turn lost enough on the arena's simple2 to miss a (3,3)). */
+export const CHAIN_MIN_COS = 0.85
+/**
+ * The re-jump's takeoff credit is HALF the standing creep credit of the
+ * stone (min(TAKEOFF_STAND, half + margin) / 2): the first hop is aimed
+ * that far past the stone's centre (Move.aimDx/aimDz), which keeps the
+ * landing a hitbox inside the edge — aiming at the lip itself put the body
+ * five centimetres from the edge at speed and it slid off (simple2).
+ */
+export const CHAIN_TAKEOFF_FRACTION = 0.5
 
 /**
  * Head-hitter class: the same takeoffs under a solid lid 2 above the feet —
@@ -41,28 +117,68 @@ export const J_RUNNING: readonly number[] = [
  * gaps in 2-high tunnels and drop off ledges under an overhang.
  */
 export const J_LOW_STANDING: readonly number[] = [
-  -0.2, 0.8626976143129206, 1.7600178263100628,
-  2.192732225692906, 2.6483966198218387, 2.8835742558313515,
-  3.366483304979486, 3.6134731393248103, 3.8637138885790554, 4.116912970400419
+  -0.1, 0.9626976143129206, 1.8600178263100626, 2.292732225692906, 2.748396619821839, 2.9835742558313516, 3.466483304979486, 3.7134731393248104, 3.9637138885790555, 4.216912970400419
 ]
 
 export const J_LOW_RUNNING: readonly number[] = [
-  -0.2, 0.7703333522885409, 1.9076952770607039,
-  2.4757621249691115, 2.759672992379034, 3.3272852710242216,
-  3.6109990552891844, 3.8946585989703006, 4.1782687837201165, 4.461834051842449
+  -0.1, 0.8703333522885409, 2.0076952770607037, 2.5757621249691116, 2.8596729923790343, 3.4272852710242216, 3.7109990552891845, 3.9946585989703007, 4.278268783720117, 4.56183405184245
 ]
 
 /**
- * Takeoff credits. Standing: the executor creeps along the flight line until
- * the widest axis offset reaches TAKEOFF_STAND — center at 0.6 leaves a
- * 0.2-deep support patch under the hitbox (overhang limit is 0.8). Running:
- * the executor's per-tick rollout delays the jump up to the lip; 0.4 along
- * the line is conservative against the sim's jump-at-center measurement.
+ * Takeoff credits. Standing: the executor creeps along the flight line
+ * (sneaking) until the widest axis offset reaches TAKEOFF_STAND — center at
+ * 0.6 leaves a 0.2-deep support patch under the hitbox (overhang limit is
+ * 0.8). Measured on the arena route book: crediting the physical lip (0.78)
+ * on full blocks re-plans routes over marginal standing jumps and the
+ * executor then falls off them (simple2 +7 damage, parkour1 lost); the
+ * patch is what keeps it robust to server corrections. Narrow supports are
+ * different — see TAKEOFF_NARROW_MARGIN. Running: the executor's per-tick
+ * rollout delays the jump up to the lip; 0.4 along the line is conservative
+ * against the sim's jump-at-center measurement.
  */
 export const TAKEOFF_STAND = 0.6
 export const TAKEOFF_RUN = 0.4
 /** Per-axis landing catch: half block + hitbox radius (overhang catch). */
 export const LAND_HALF = 0.8
+
+/**
+ * NARROW-SUPPORT credits (topCatchClass > 0: fence posts, heads, pots —
+ * shapes.ts). Same two formulas as the full-block constants, parameterized
+ * by the support's centered top half-extent `c` (CATCH_HALF[class]):
+ *   takeoff  = min(TAKEOFF_STAND, c + 0.28): the lip, two centimetres
+ *              inside the overhang limit c + 0.3 — on a 1x1 post there is no
+ *              other takeoff, and "jump exactly from the corner" is how the
+ *              hard hops of a post course are made; a full block keeps its
+ *              0.6 (the cap), see TAKEOFF_STAND.
+ *   landing  = c + 0.3  (near-edge catch: half-extent + hitbox radius —
+ *              0.5 + 0.3 = the 0.8 above)
+ * Sneak's edge guard (prismarine-physics implements it) works on any
+ * support, so the creep is safe on a post; what shrinks is simply how far
+ * out the lip is. Running takeoffs are only generated from class-0 supports
+ * — nothing narrower can host a run-up.
+ */
+export const TAKEOFF_NARROW_MARGIN = 0.28
+export const LAND_NARROW_MARGIN = 0.3
+
+/**
+ * Slime-bounce apex per drop height d (blocks above the slime top after a
+ * straight free fall of d blocks onto it, no controls) — index d, 2 … 8;
+ * deeper drops clamp to index 8 (conservative: deeper = higher rebound).
+ * Derived by test/helpers/jumpEnvelope.ts measureSlimeBounce() from
+ * prismarine-physics (vel.y reflects on the contact tick, unless sneaking);
+ * envelope.test.ts re-derives and asserts equality. The rebound apex is
+ * control-independent — air movement never changes vel.y.
+ */
+export const BOUNCE_APEX: readonly number[] = [
+  0, 0, 1.299059403294517, 2.1016917686844407, 2.5491276710482,
+  3.5285290916089673, 4.052437529400663, 4.592855224215983, 5.161928468689879
+]
+export const BOUNCE_MAX_DROP = 8
+/** Planning margin below the exact apex: ring-1 targets (adjacent to the
+ * slime) get the full rebound minus this; ring-2 targets need extra descent
+ * time to drift 2 cells, so they give up a full block of the apex. */
+export const BOUNCE_MARGIN = 0.2
+export const BOUNCE_MARGIN_FAR = 1.0
 
 /**
  * Flight distance (center travel) needed for landing offset (a, b) from a

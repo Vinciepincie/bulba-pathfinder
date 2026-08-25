@@ -74,7 +74,7 @@ function cellChar (x: number, y: number, z: number): string {
   if (!snap.contains(x, y, z)) return '?'
   const i = snap.index(x, y, z)
   const f = snap.flags[i]
-  const h = snap.heights[i]
+  const h = snap.heights[i] & 63 // bits 6–7 carry the top-catch class
   if ((f & LutFlags.LIQUID) !== 0) return '~'
   if ((f & LutFlags.CLIMBABLE) !== 0) return 'L'
   if ((f & LutFlags.PHYSICAL) !== 0) {
