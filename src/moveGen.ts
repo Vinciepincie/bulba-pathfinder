@@ -21,6 +21,33 @@ import { CATCH_HALF } from './shapes.js';
 /** cos(angle) gate as an exact integer test: dot > 0 and dot² ≥ c²·|u|²·|v|². */
 const CHAIN_MIN_COS2 = CHAIN_MIN_COS * CHAIN_MIN_COS;
 /**
+ * Momentum state (allowParkourMomentum, docs/VelocityInSearch.md): MOM_NONE,
+ * or 1 + the packed PRIMITIVE flight direction (dx/g, dz/g) of the parkour
+ * landing that reached the node — each component in [-6, 6]
+ * (MAX_OFFSET_MAJOR), so a state is an exact direction, never a bin, and
+ * the re-jump cone is the same integer test the compound chains use. The
+ * wasm core packs it identically (lib.rs momentum_of).
+ */
+export const MOM_NONE = 0;
+const MOM_RANGE = 6;
+const MOM_SPAN = 2 * MOM_RANGE + 1;
+export function momentumOf (dx: number, dz: number): number {
+    let a = dx < 0 ? -dx : dx;
+    let b = dz < 0 ? -dz : dz;
+    while (b !== 0) {
+        const t = a % b;
+        a = b;
+        b = t;
+    }
+    return 1 + (dx / a + MOM_RANGE) * MOM_SPAN + (dz / a + MOM_RANGE);
+}
+export function momentumDx (m: number): number {
+    return Math.floor((m - 1) / MOM_SPAN) - MOM_RANGE;
+}
+export function momentumDz (m: number): number {
+    return ((m - 1) % MOM_SPAN) - MOM_RANGE;
+}
+/**
  * Flight needed for offset (a, b) ≥ 0 from a takeoff point `s` along the
  * flight line with per-axis landing credit `lCred` — parkourEnvelope's
  * flightNeeded/takeoff pair for arbitrary credits (the narrow-support case;
@@ -146,9 +173,21 @@ export class MoveGen {
   readonly outBreaks!: Array<number[] | null>
     /** Slime stand cell (index) a META_BOUNCE neighbour drops onto; -1 otherwise. */
   readonly outVia!: Int32Array
+    /** Momentum the neighbour arrives with (MOM_NONE unless a support landing
+     * with allowParkourMomentum on). */
+  readonly outMom!: Uint8Array
   outCount = 0
     /** Set by slimeBounce for the push it is about to make. */
   private pendingVia = -1
+    /** Set by parkourExtTarget for the landing it is about to push. */
+  private pendingMom = MOM_NONE
+    /** allowParkourMomentum && parkourExtended: landings carry momentum. */
+  readonly parkourMomentum!: boolean
+    /** Momentum of the node being expanded (set per generate()). */
+  private momIn = MOM_NONE
+  private momDx = 0
+  private momDz = 0
+  private momD2 = 0
     /** Set when any probe left the snapshot — a noPath may be growth-fixable. */
   boundaryTouched = false
   private readonly flags!: Uint8Array
@@ -222,6 +261,8 @@ export class MoveGen {
         this.outMeta = new Uint8Array(cap);
         this.outBreaks = new Array(cap).fill(null);
         this.outVia = new Int32Array(cap).fill(-1);
+        this.outMom = new Uint8Array(cap);
+        this.parkourMomentum = this.parkourExtended && cfg.allowParkourMomentum === true;
         this.canOpenDoors = cfg.canOpenDoors;
         this.doorMode = cfg.canOpenDoors && cfg.canOpenRealDoors;
         this.maxDropDown = cfg.maxDropDown;
@@ -370,6 +411,8 @@ export class MoveGen {
         return cost;
     }
   private push (x: number, y: number, z: number, cost: number, meta: number): void {
+        const mom = this.pendingMom;
+        this.pendingMom = MOM_NONE;
         const idx = this.cellIndex(x, y, z);
         if (idx < 0)
             return; // target outside snapshot — boundaryTouched already set
@@ -382,6 +425,7 @@ export class MoveGen {
         this.outMeta[i] = meta;
         this.outVia[i] = this.pendingVia;
         this.pendingVia = -1;
+        this.outMom[i] = mom;
         if (this.moveBreaks.length > 0) {
             this.outBreaks[i] = this.moveBreaks;
             this.moveBreaks = [];
@@ -390,9 +434,16 @@ export class MoveGen {
             this.outBreaks[i] = null;
         }
     }
-    /** Fills the out* arrays for the node at (x, y, z), upstream order. */
-  generate (x: number, y: number, z: number): void {
+    /** Fills the out* arrays for the node at (x, y, z), upstream order. `mom`
+     * is the node's momentum state (MOM_NONE unless allowParkourMomentum). */
+  generate (x: number, y: number, z: number, mom: number = MOM_NONE): void {
         this.outCount = 0;
+        this.momIn = this.parkourMomentum ? mom : MOM_NONE;
+        if (this.momIn !== MOM_NONE) {
+            this.momDx = momentumDx(this.momIn);
+            this.momDz = momentumDz(this.momIn);
+            this.momD2 = this.momDx * this.momDx + this.momDz * this.momDz;
+        }
         // Extended-parkour takeoff gates are node-invariant — hoisted so a
         // non-jumpable node (in water, no headroom) pays 3 probes, not 40.
         let ext = false;
@@ -458,7 +509,9 @@ export class MoveGen {
                 }
             }
         }
-        if (jumps)
+        // With momentum in the search state the chain is a transition from the
+        // landing's own slot (parkourExtTarget), not a compound edge.
+        if (jumps && !this.parkourMomentum)
             this.momentumChains(x, y, z);
         this.moveDown(x, y, z);
         this.moveUp(x, y, z);
@@ -1298,9 +1351,23 @@ export class MoveGen {
         const feasible = fn <= usable;
         // Any run at all flies the running arc (the corridor curves).
         let needsRunning = row >= 1;
+        let chained = false;
         if (chainVia < 0) {
-            if (!feasible)
-                return;
+            if (!feasible) {
+                // Momentum (allowParkourMomentum): the body LANDED here from a
+                // jump along momIn; a re-jump on the landing tick that continues
+                // it (CHAIN_MIN_COS cone) flies the chain row from the same
+                // far-side landing point the compound chain below uses. Never
+                // under a lid (no bonked chain row was measured).
+                if (this.momIn === MOM_NONE || low ||
+                    !this.chainAligned(this.momDx, this.momDz, this.momD2, t.tx * sx, t.tz * sz))
+                    return;
+                const sChain = Math.min(TAKEOFF_STAND, TAKEOFF_NARROW_MARGIN + CATCH_HALF[takeoffCatch]) * CHAIN_TAKEOFF_FRACTION * t.dist / (t.tx > t.tz ? t.tx : t.tz);
+                if (flightFrom(t.tx, t.tz, t.dist, sChain, lCred) > J_CHAIN[bucket] + this.marginCredit)
+                    return;
+                needsRunning = true;
+                chained = true;
+            }
         }
         else {
             // A chain is only worth an edge where the stone's own jump falls
@@ -1351,9 +1418,19 @@ export class MoveGen {
         cost += this.exclusionAt(tx, nodeY, tz);
         if (cost > 100)
             return;
+        // A support landing carries its flight direction as momentum; a catch
+        // (ladder, water, thin floor, bubble) has no landing tick to re-jump on.
+        if (this.parkourMomentum && landCatch >= 0)
+            this.pendingMom = momentumOf(t.tx * sx, t.tz * sz);
         if (chainVia >= 0) {
             this.pendingVia = chainVia;
             this.push(tx, nodeY, tz, chainBase + cost, META_PARKOUR | META_CHAIN);
+        }
+        else if (chained) {
+            // The stone is this node itself: the path shows it as the previous
+            // node, and the executor lands it far-side and re-jumps from it.
+            this.pendingVia = this.cellIndex(x, y, z);
+            this.push(tx, nodeY, tz, cost, META_PARKOUR | META_CHAIN);
         }
         else {
             this.push(tx, nodeY, tz, cost, META_PARKOUR);

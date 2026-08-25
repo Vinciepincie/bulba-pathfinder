@@ -723,7 +723,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         time: raw.time,
         visitedNodes: raw.visitedNodes,
         generatedNodes: raw.generatedNodes,
-        path: raw.path.flatMap(Move.expandRaw),
+        path: Move.expandRawPath(raw.path),
         context
       }
     }

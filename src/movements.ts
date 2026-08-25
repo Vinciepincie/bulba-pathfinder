@@ -71,6 +71,8 @@ export class Movements {
   allowParkour: boolean
   /** Improvement (opt-in): extended parkour — see MovementsConfig.allowParkourExtended. */
   allowParkourExtended: boolean
+  /** Improvement (opt-in, needs allowParkourExtended): momentum-aware search — see MovementsConfig.allowParkourMomentum. */
+  allowParkourMomentum: boolean
   allowSprinting: boolean
   /**
    * Improvement (opt-in): hold jump while sprinting across open ground.
@@ -179,6 +181,7 @@ export class Movements {
     this.allowFreeMotion = false
     this.allowParkour = true
     this.allowParkourExtended = false // improvement, opt-in (upstream only jumps straight and flat)
+    this.allowParkourMomentum = false // improvement, opt-in (landing momentum as search state)
     this.allowSprinting = true
     this.allowSprintHop = false // improvement, opt-in (executor gait only)
     this.allowLowCeilingHop = false // improvement, opt-in (executor gait only)
@@ -455,7 +458,8 @@ export class Movements {
       dontMineUnderFallingBlock: this.dontMineUnderFallingBlock,
       useBubbleColumns: this.useBubbleColumns,
       bubbleCost: this.bubbleCost,
-      parkourSafetyMargin: this.parkourSafetyMargin
+      parkourSafetyMargin: this.parkourSafetyMargin,
+      allowParkourMomentum: this.allowParkourMomentum
     }
   }
 

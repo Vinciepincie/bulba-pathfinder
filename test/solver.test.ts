@@ -15,10 +15,12 @@ import {
   STONE,
   WATER,
   LADDER,
+  OAK_FENCE_DRY,
   mcData,
   Block
 } from './helpers/voxelWorld.js'
 import { Solver } from '../src/solver.js'
+import { Move } from '../src/move.js'
 import type { RawSolveResult } from '../src/solver.js'
 import { GoalAdapter } from '../src/goalAdapter.js'
 import { GoalBlock } from '../src/goals.js'
@@ -377,5 +379,91 @@ describe('Solver over hand-built scenes', function () {
     assertWalkable(world, start, res)
 
     expect(solve(world, start, new GoalBlock(6, 0, 2)).status).to.equal('noPath')
+  })
+})
+
+describe('momentum search state (allowParkourMomentum)', function () {
+  this.timeout(30000)
+  const MOM = { allowParkourExtended: true, allowParkourMomentum: true }
+  /** A → B (3,0) onto a post → C (5,2) a block and a half down → D (6,2) three down. */
+  function chainWorld (): VoxelWorld {
+    const world = new VoxelWorld({ x0: -3, y0: -6, z0: -4, x1: 18, y1: 7, z1: 8 })
+    world.set(0, 0, 0, STONE) // A: stand (0,1,0)
+    world.set(3, 0, 0, OAK_FENCE_DRY) // B: stand (3,1,0), feet 1.5
+    world.set(8, -1, 2, STONE) // C: stand (8,0,2)
+    world.set(14, -4, 4, STONE) // D: stand (14,-3,4)
+    return world
+  }
+
+  it('a three-hop chain reaches what the compound two-hop chain cannot', () => {
+    const world = chainWorld()
+    const start = { x: 0, y: 1, z: 0 }
+    const off = solve(world, start, new GoalBlock(14, -3, 4), { overrides: { allowParkourExtended: true } })
+    expect(off.status).to.equal('noPath')
+    const on = solve(world, start, new GoalBlock(14, -3, 4), { overrides: MOM })
+    expect(on.status).to.equal('success')
+    // The path is the cells themselves: stone, chain landing, chain landing —
+    // each chain node's `via` is the node before it (its stone).
+    const cells = on.path.map(n => `${n.x},${n.y},${n.z}`)
+    expect(cells).to.deep.equal(['3,1,0', '8,0,2', '14,-3,4'])
+    expect(on.path.map(n => n.parkour)).to.deep.equal([true, true, true])
+    expect(on.path.map(n => n.chain === true)).to.deep.equal([false, true, true])
+    expect(on.path[1].via).to.deep.equal({ x: 3, y: 1, z: 0 })
+    expect(on.path[2].via).to.deep.equal({ x: 8, y: 0, z: 2 })
+    // (6,2) is one of the four offsets floored at the octile heuristic (parkourTable.ts).
+    expect(on.cost).to.be.closeTo(3.5 + Math.hypot(5, 2) + 0.5 + Math.max(Math.hypot(6, 2) + 0.5, 4 + 2 * Math.SQRT2), 1e-9)
+    // Executor form: no stone is duplicated, each stone is aimed at its re-jump.
+    const moves = Move.expandRawPath(on.path)
+    expect(moves.map(m => `${m.x},${m.y},${m.z}`)).to.deep.equal(cells)
+    expect(moves[0].aimDx).to.be.closeTo(5 / Math.hypot(5, 2), 1e-12)
+    expect(moves[1].aimDx).to.be.closeTo(6 / Math.hypot(6, 2), 1e-12)
+    expect(moves[2].aimDx).to.equal(0)
+    // The compound form (flag off) still expands into stone + node.
+    const two = solve(world, start, new GoalBlock(8, 0, 2), { overrides: { allowParkourExtended: true } })
+    expect(two.status).to.equal('success')
+    expect(two.path.map(n => `${n.x},${n.y},${n.z}`)).to.deep.equal(['8,0,2'])
+    expect(Move.expandRawPath(two.path).map(m => `${m.x},${m.y},${m.z}`)).to.deep.equal(['3,1,0', '8,0,2'])
+    // Same two-hop goal with momentum: the stone is a real node, same cost.
+    const twoOn = solve(world, start, new GoalBlock(8, 0, 2), { overrides: MOM })
+    expect(twoOn.status).to.equal('success')
+    expect(twoOn.path.map(n => `${n.x},${n.y},${n.z}`)).to.deep.equal(['3,1,0', '8,0,2'])
+    expect(twoOn.cost).to.be.closeTo(two.cost, 1e-9)
+  })
+
+  it('momentum states are separate nodes: the cell at rest keeps its own best route', () => {
+    // B can be walked to from the side as well as landed on: the walked
+    // arrival is cheaper and must not evict the landing state that C needs.
+    const world = chainWorld()
+    world.fill(1, 0, 0, 2, 0, 0, STONE) // A → B is now a walk, B is no stepping stone
+    world.fill(0, 0, -1, 3, 0, -1, STONE) // ...and it can be reached from beside
+    const on = solve(world, { x: 0, y: 1, z: 0 }, new GoalBlock(8, 0, 2), { overrides: MOM })
+    // B's own run reaches C (5,2) a block and a half down? 3.68 needed against
+    // 3.93 (row 5 with the run-up) — a plain jump; no chain needed at all.
+    expect(on.status).to.equal('success')
+    expect(on.path.some(n => n.chain === true)).to.equal(false)
+    const walked = solve(world, { x: 0, y: 1, z: 0 }, new GoalBlock(8, 0, 2), { overrides: { allowParkourExtended: true } })
+    expect(walked.cost).to.be.closeTo(on.cost, 1e-9)
+    expect(walked.visitedNodes).to.equal(on.visitedNodes)
+  })
+
+  it('the secondary arena grows past its reserve inside one solve', () => {
+    // A field of posts, every one a landing from many directions: far more
+    // (cell, momentum) states than the 4096-slot reserve, all visited because
+    // the goal is walled off.
+    const world = new VoxelWorld({ x0: -2, y0: -3, z0: -2, x1: 62, y1: 6, z1: 62 })
+    for (let x = 0; x <= 58; x += 2) for (let z = 0; z <= 58; z += 2) world.set(x, 0, z, OAK_FENCE_DRY)
+    world.set(0, 0, 0, STONE)
+    world.fill(59, 0, 59, 61, 4, 61, STONE) // a 3x3 plateau 3.5 above the posts: unreachable
+    const bot = makeFakeBot(world, new Vec3(0.5, 1, 0.5))
+    const movements = makeOurMovements(bot, MOM)
+    const lut = lutFor(bot, movements)
+    const snap = snapshotFromWorld(world, lut)
+    const n = snap.meta.w * snap.meta.h * snap.meta.l
+    const solver = new Solver(snap, movements.toConfig(), new GoalAdapter(new GoalBlock(60, 5, 60)), { x: 0, y: 1, z: 0 }, { timeout: 20000, searchRadius: -1 })
+    let res = solver.compute(1e9)
+    while (res.status === 'partial') res = solver.compute(1e9)
+    expect(res.status).to.equal('noPath')
+    expect(solver.momentumStates).to.be.greaterThan(Math.max(4096, n >> 3))
+    expect(res.visitedNodes).to.be.greaterThan(4096)
   })
 })

@@ -162,6 +162,15 @@ export interface MovementsConfig {
    * still gates every take-off. Optional for older serialized configs.
    */
   parkourSafetyMargin?: number
+  /**
+   * Improvement (opt-in, needs allowParkourExtended): momentum-aware search.
+   * A parkour landing carries its flight direction into the search node, so a
+   * re-jump on the landing tick (the J_CHAIN row) is a state transition rather
+   * than a two-hop compound edge: chains of any length, from any support
+   * (docs/VelocityInSearch.md). Off by default; optional for older serialized
+   * configs.
+   */
+  allowParkourMomentum?: boolean
 }
 
 /** Per-state dig auxiliaries (only consulted when a block is unsafe). */

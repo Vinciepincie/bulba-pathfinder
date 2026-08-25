@@ -78,11 +78,12 @@ describe('wasm ↔ JS solver differential', function () {
     }
   })
 
-  function solveBoth (world: VoxelWorld, goal: Goal, opts: { canDig?: boolean, doors?: boolean, searchRadius?: number, parkourExtended?: boolean } = {}): Pair {
+  function solveBoth (world: VoxelWorld, goal: Goal, opts: { canDig?: boolean, doors?: boolean, searchRadius?: number, parkourExtended?: boolean, momentum?: boolean } = {}, start: { x: number, y: number, z: number } = { x: 1, y: 1, z: 1 }): Pair {
     const bot = makeFakeBot(world)
     const overrides: Record<string, unknown> = {}
     if (opts.canDig) overrides.canDig = true
-    if (opts.parkourExtended) overrides.allowParkourExtended = true
+    if (opts.parkourExtended || opts.momentum) overrides.allowParkourExtended = true
+    if (opts.momentum) overrides.allowParkourMomentum = true
     if (opts.doors) {
       overrides.canOpenDoors = true
       overrides.canOpenRealDoors = true
@@ -101,7 +102,7 @@ describe('wasm ↔ JS solver differential', function () {
     const descriptor = serializeGoal(goal)
     expect(descriptor).to.not.equal(null)
     const evaluator = fastEvaluator(descriptor!) ?? new GoalAdapter(goal)
-    const solver = new Solver(snap, movements.toConfig(), evaluator, { x: 1, y: 1, z: 1 }, {
+    const solver = new Solver(snap, movements.toConfig(), evaluator, start, {
       timeout: 30000,
       searchRadius
     }, null, digCtx)
@@ -120,7 +121,7 @@ describe('wasm ↔ JS solver differential', function () {
       },
       movements.toConfig(),
       descriptor!,
-      { x: 1, y: 1, z: 1 },
+      start,
       digData,
       { timeout: 30000, searchRadius, sliceMs: 1e9, cancelFlag: null, onPartial: () => {} }
     )
@@ -181,6 +182,7 @@ describe('wasm ↔ JS solver differential', function () {
     expect(pair.js.status).to.equal('success')
     expect(pair.js.path.filter(n => n.parkour).length).to.be.at.least(4)
     assertIdentical(pair, 'ext course')
+    assertIdentical(solveBoth(world, new GoalBlock(9, 2, 8), { momentum: true }), 'ext course momentum')
     // Flag off: both must agree it is unreachable.
     assertIdentical(solveBoth(world, new GoalBlock(9, 2, 8)), 'ext course flag off')
   })
@@ -227,6 +229,7 @@ describe('wasm ↔ JS solver differential', function () {
     expect(nodes).to.include('19,4,5')
     expect(nodes).to.include('20,5,4')
     assertIdentical(pair, 'advanced course')
+    assertIdentical(solveBoth(world, new GoalBlock(19, 7, 4), { momentum: true }), 'advanced course momentum')
     assertIdentical(solveBoth(world, new GoalBlock(19, 7, 4)), 'advanced course flag off')
   })
 
@@ -241,6 +244,55 @@ describe('wasm ↔ JS solver differential', function () {
       world.set(gx, 0, gz, STONE)
       world.fill(gx, 1, gz, gx, 2, gz, AIR)
       assertIdentical(solveBoth(world, new GoalBlock(gx, 1, gz), { parkourExtended: true }), `seed ${seed}`)
+    })
+  }
+
+  it('momentum: three-hop chain course identical, and the same course without momentum', () => {
+    // A → post (3,0) → stone (5,2) a block and a half down → stone (6,2)
+    // three down: the last hop exists only as a re-jump carrying the (5,2)
+    // landing (solver.test.ts), a state the compound chains cannot express.
+    const world = new VoxelWorld({ x0: -3, y0: -6, z0: -4, x1: 18, y1: 7, z1: 8 })
+    world.set(0, 0, 0, STONE)
+    world.set(3, 0, 0, OAK_FENCE_DRY)
+    world.set(8, -1, 2, STONE)
+    world.set(14, -4, 4, STONE)
+    const start = { x: 0, y: 1, z: 0 }
+    const pair = solveBoth(world, new GoalBlock(14, -3, 4), { momentum: true }, start)
+    expect(pair.js.status).to.equal('success')
+    expect(pair.js.path.filter(n => n.chain === true).length).to.equal(2)
+    assertIdentical(pair, 'momentum chain course')
+    const off = solveBoth(world, new GoalBlock(14, -3, 4), { parkourExtended: true }, start)
+    expect(off.js.status).to.equal('noPath')
+    assertIdentical(off, 'momentum chain course, compound only')
+  })
+
+  it('momentum: a post field grows the secondary arena identically in both engines', () => {
+    const world = new VoxelWorld({ x0: -2, y0: -3, z0: -2, x1: 62, y1: 6, z1: 62 })
+    for (let x = 0; x <= 58; x += 2) for (let z = 0; z <= 58; z += 2) world.set(x, 0, z, OAK_FENCE_DRY)
+    world.set(0, 0, 0, STONE)
+    world.set(43, 0, 41, STONE) // a stone between the posts: stand (43,1,41)
+    world.fill(59, 0, 59, 61, 4, 61, STONE) // a 3x3 plateau 3.5 above the posts: unreachable
+    const start = { x: 0, y: 1, z: 0 }
+    const reach = solveBoth(world, new GoalBlock(43, 1, 41), { momentum: true }, start)
+    expect(reach.js.status).to.equal('success')
+    assertIdentical(reach, 'post field reach')
+    const walled = solveBoth(world, new GoalBlock(60, 5, 60), { momentum: true }, start)
+    expect(walled.js.status).to.equal('noPath')
+    expect(walled.js.visitedNodes).to.be.greaterThan(4096)
+    assertIdentical(walled, 'post field exhaustive')
+  })
+
+  const MOM_CASES = Math.max(10, CASES / 2)
+  for (let i = 0; i < MOM_CASES; i++) {
+    const seed = 9000 + i
+    it(`walk world ${i} (seed ${seed}) — allowParkourMomentum identical`, () => {
+      const world = genWorld(seed)
+      const rand = mulberry32(seed * 17 + 9)
+      const gx = 4 + Math.floor(rand() * 18)
+      const gz = 4 + Math.floor(rand() * 18)
+      world.set(gx, 0, gz, STONE)
+      world.fill(gx, 1, gz, gx, 2, gz, AIR)
+      assertIdentical(solveBoth(world, new GoalBlock(gx, 1, gz), { momentum: true }), `seed ${seed}`)
     })
   }
 

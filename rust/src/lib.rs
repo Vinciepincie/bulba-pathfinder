@@ -94,16 +94,49 @@ const BOUNCE_APEX: [f64; 9] = [
 const BOUNCE_MAX_DROP: i32 = 8;
 const BOUNCE_MARGIN: f64 = 0.2;
 const BOUNCE_MARGIN_FAR: f64 = 1.0;
-/// Momentum-chain row (pasted from src/parkourEnvelope.ts J_CHAIN).
-const J_CHAIN: [f64; 10] = [
-    2.5887241837126247, 3.5039027342842246, 4.104737417059738,
-    4.402855113817017, 4.995160282550844, 5.289579921413924,
-    5.582981792779326, 5.875457495721842, 6.167090385399532, 6.457956315006229,
-];
+/// Offset of the momentum-chain row (J_CHAIN, 10 buckets) inside ext_reach —
+/// uploaded with the table (serializeParkourTable), never pasted here: a
+/// pasted copy once sat 0.1 below the pinned JS row and diverged the engines.
+const CHAIN_ROW: usize = 140;
 const CHAIN_MIN_COS: f64 = 0.70;
 const CHAIN_TAKEOFF_FRACTION: f64 = 0.5;
 const CHAIN_MIN_COS2: f64 = CHAIN_MIN_COS * CHAIN_MIN_COS;
 const CHAIN_CAP: usize = 256;
+
+// Momentum state (mirror of moveGen.ts momentumOf / momentumDx / momentumDz):
+// 0 = none, else 1 + packed primitive landing direction, components in [-6, 6].
+const MOM_NONE: u8 = 0;
+const MOM_RANGE: i32 = 6;
+const MOM_SPAN: i32 = 2 * MOM_RANGE + 1;
+
+#[inline]
+fn momentum_of(dx: i32, dz: i32) -> u8 {
+    let mut a = dx.abs();
+    let mut b = dz.abs();
+    while b != 0 {
+        let t = a % b;
+        a = b;
+        b = t;
+    }
+    (1 + (dx / a + MOM_RANGE) * MOM_SPAN + (dz / a + MOM_RANGE)) as u8
+}
+
+#[inline]
+fn momentum_dx(m: u8) -> i32 {
+    (m as i32 - 1) / MOM_SPAN - MOM_RANGE
+}
+
+#[inline]
+fn momentum_dz(m: u8) -> i32 {
+    (m as i32 - 1) % MOM_SPAN - MOM_RANGE
+}
+
+/// Secondary (momentum) slots reserved beyond the cell region per solve
+/// (mirror of solver.ts momentumReserve).
+#[inline]
+fn momentum_reserve(n: usize) -> usize {
+    if n >> 3 > 4096 { n >> 3 } else { 4096 }
+}
 
 /// Mirror of moveGen.ts chainAligned: cos(angle) ≥ CHAIN_MIN_COS, exact.
 #[inline]
@@ -264,6 +297,7 @@ struct Config {
     dont_create_flow: bool,
     dont_mine_under_falling: bool,
     use_bubble: bool,
+    allow_parkour_momentum: bool,
     max_drop_down: i32,
     liquid_cost: f64,
     entity_cost: f64,
@@ -367,6 +401,8 @@ struct NeighborOut {
     breaks: [Option<Vec<i32>>; OUT_CAP],
     /// Slime stand cell of a META_BOUNCE neighbour, -1 otherwise.
     via: [i32; OUT_CAP],
+    /// Momentum the neighbour arrives with (mirror of MoveGen.outMom).
+    mom: [u8; OUT_CAP],
     count: usize,
 }
 
@@ -404,14 +440,17 @@ struct SolverState {
     /// block·ext_mf_block + cells_off + k.
     ext_mf: Vec<f64>,
     ext_mf_block: usize,
-    /// J_RUN (7 run rows × 10 buckets) then J_LOW_RUN — usable flight per
-    /// run length before the lip and landing dy (parkourEnvelope.ts).
-    ext_reach: [f64; 140],
+    /// J_RUN (7 run rows × 10 buckets), J_LOW_RUN, then J_CHAIN (CHAIN_ROW)
+    /// — usable flight per run length / landing dy (parkourEnvelope.ts).
+    ext_reach: [f64; 150],
     ext_diag_n: usize,
     ext_card_x_n: usize,
     ext_card_z_n: usize,
 
-    // persistent epoch-stamped arena (grow-only, never zeroed per solve)
+    // persistent epoch-stamped arena (grow-only, never zeroed per solve).
+    // Slots [0, n_cells) are cells at momentum NONE; momentum states live in
+    // the secondary region [n_cells, n_cells + sec_count) of the same
+    // arrays (mirror of solver.ts Arena / slotFor).
     epoch: u32,
     g: Vec<f64>,
     parent: Vec<i32>,
@@ -422,11 +461,26 @@ struct SolverState {
     /// Slime stand cell per META_BOUNCE node (-1 otherwise); stamped like g.
     vias: Vec<i32>,
     heap: MinHeap,
+    n_cells: usize,
+    momentum: bool,
+    sec_count: usize,
+    /// Per cell: first secondary entry, trusted only when it reads back the cell.
+    mom_head: Vec<i32>,
+    sec_cell: Vec<i32>,
+    sec_dir: Vec<u8>,
+    sec_next: Vec<i32>,
 
     out: NeighborOut,
     move_breaks: Vec<i32>,
     /// Set by slime_bounce for the push it is about to make.
     pending_via: i32,
+    /// Set by parkour_ext_target for the landing it is about to push.
+    pending_mom: u8,
+    /// Momentum of the node being expanded (mirror of MoveGen.momIn).
+    mom_in: u8,
+    mom_dx: i32,
+    mom_dz: i32,
+    mom_d2: i32,
 
     // per-solve search state
     best_idx: i32,
@@ -466,7 +520,7 @@ impl SolverState {
             ext_cells: Vec::new(),
             ext_mf: Vec::new(),
             ext_mf_block: 0,
-            ext_reach: [0.0; 140],
+            ext_reach: [0.0; 150],
             ext_diag_n: 0,
             ext_card_x_n: 0,
             ext_card_z_n: 0,
@@ -479,6 +533,13 @@ impl SolverState {
             breaks: Vec::new(),
             vias: Vec::new(),
             heap: MinHeap::new(4096),
+            n_cells: 0,
+            momentum: false,
+            sec_count: 0,
+            mom_head: Vec::new(),
+            sec_cell: Vec::new(),
+            sec_dir: Vec::new(),
+            sec_next: Vec::new(),
             out: NeighborOut {
                 idx: [0; OUT_CAP],
                 x: [0; OUT_CAP],
@@ -488,10 +549,16 @@ impl SolverState {
                 meta: [0; OUT_CAP],
                 breaks: [const { None }; OUT_CAP],
                 via: [-1; OUT_CAP],
+                mom: [0; OUT_CAP],
                 count: 0,
             },
             move_breaks: Vec::new(),
             pending_via: -1,
+            pending_mom: MOM_NONE,
+            mom_in: MOM_NONE,
+            mom_dx: 0,
+            mom_dz: 0,
+            mom_d2: 0,
             best_idx: -1,
             best_h: f64::INFINITY,
             visited: 0,
@@ -506,22 +573,87 @@ impl SolverState {
     }
 
     /// Grow-only arena sizing + epoch bump (mirror of the JS arena pool).
-    fn arena_prepare(&mut self, n: usize) {
-        if self.g.len() < n {
-            self.g.resize(n, 0.0);
-            self.parent.resize(n, -1);
-            self.meta.resize(n, 0);
-            self.stamp.resize(n, 0);
-            self.closed.resize(n, 0);
-            self.breaks.resize_with(n, || None);
-            self.vias.resize(n, -1);
+    fn arena_prepare(&mut self, n: usize, momentum: bool) {
+        let need = if momentum { n + momentum_reserve(n) } else { n };
+        if self.g.len() < need {
+            self.grow_slots(need);
         }
+        if momentum && self.mom_head.len() < n {
+            self.mom_head.resize(n, -1);
+        }
+        self.n_cells = n;
+        self.momentum = momentum;
+        self.sec_count = 0;
         self.epoch = self.epoch.wrapping_add(1);
         if self.epoch == 0 {
             // wraparound: fresh stamps
             self.stamp.fill(0);
             self.epoch = 1;
         }
+    }
+
+    /// Slot arrays to at least `need`, contents (stamps included) preserved.
+    fn grow_slots(&mut self, need: usize) {
+        self.g.resize(need, 0.0);
+        self.parent.resize(need, -1);
+        self.meta.resize(need, 0);
+        self.stamp.resize(need, 0);
+        self.closed.resize(need, 0);
+        self.breaks.resize_with(need, || None);
+        self.vias.resize(need, -1);
+    }
+
+    #[inline]
+    fn cell_of(&self, slot: i32) -> i32 {
+        let s = slot as usize;
+        if s < self.n_cells { slot } else { self.sec_cell[s - self.n_cells] }
+    }
+
+    #[inline]
+    fn mom_of(&self, slot: i32) -> u8 {
+        let s = slot as usize;
+        if s < self.n_cells { MOM_NONE } else { self.sec_dir[s - self.n_cells] }
+    }
+
+    /// Mirror of solver.ts slotFor: the cell at NONE, else the matching
+    /// secondary entry, created on first sight (per-cell list off mom_head).
+    fn slot_for(&mut self, cell: i32, mom: u8) -> i32 {
+        if mom == MOM_NONE {
+            return cell;
+        }
+        let c = cell as usize;
+        let mut k = self.mom_head[c];
+        let mut first = -1;
+        if k >= 0 && (k as usize) < self.sec_count && self.sec_cell[k as usize] == cell {
+            first = k;
+            loop {
+                if self.sec_dir[k as usize] == mom {
+                    return (self.n_cells + k as usize) as i32;
+                }
+                let nx = self.sec_next[k as usize];
+                if nx < 0 {
+                    break;
+                }
+                k = nx;
+            }
+        }
+        let idx = self.sec_count;
+        self.sec_count += 1;
+        if self.n_cells + idx >= self.g.len() {
+            let need = (self.n_cells + idx + 1) * 3 / 2;
+            self.grow_slots(need);
+        }
+        if idx >= self.sec_cell.len() {
+            let cap = (idx + 1) * 3 / 2;
+            self.sec_cell.resize(cap, 0);
+            self.sec_dir.resize(cap, 0);
+            self.sec_next.resize(cap, -1);
+        }
+        self.sec_cell[idx] = cell;
+        self.sec_dir[idx] = mom;
+        self.sec_next[idx] = first;
+        self.mom_head[c] = idx as i32;
+        (self.n_cells + idx) as i32
     }
 }
 
@@ -775,6 +907,8 @@ impl SolverState {
     }
 
     fn push_out(&mut self, x: i32, y: i32, z: i32, cost: f64, meta: u8) {
+        let mom = self.pending_mom;
+        self.pending_mom = MOM_NONE;
         let idx = self.cell_index(x, y, z);
         if idx < 0 {
             return;
@@ -789,6 +923,7 @@ impl SolverState {
         self.out.meta[i] = meta;
         self.out.via[i] = self.pending_via;
         self.pending_via = -1;
+        self.out.mom[i] = mom;
         self.out.breaks[i] = if self.move_breaks.is_empty() {
             None
         } else {
@@ -1538,9 +1673,25 @@ impl SolverState {
         };
         let feasible = fn_needed <= usable;
         let mut needs_running = row >= 1;
+        let mut chained = false;
         if chain_via < 0 {
             if !feasible {
-                return;
+                // Momentum chain from the landing's own state (mirror of
+                // moveGen.ts): continue the incoming flight within the cone,
+                // chain row from the far-side landing point, never under a lid.
+                if self.mom_in == MOM_NONE || low
+                    || !chain_aligned(self.mom_dx, self.mom_dz, self.mom_d2, e.tx * sx, e.tz * sz)
+                {
+                    return;
+                }
+                let a = e.tx as f64;
+                let b = e.tz as f64;
+                let s_chain = (TAKEOFF_NARROW_MARGIN + CATCH_HALF[takeoff_catch]).min(TAKEOFF_STAND) * CHAIN_TAKEOFF_FRACTION * e.dist / (if a > b { a } else { b });
+                if flight_from(a, b, e.dist, s_chain, l_cred) > self.ext_reach[CHAIN_ROW + bucket] + self.cfg.margin_credit {
+                    return;
+                }
+                needs_running = true;
+                chained = true;
             }
         } else {
             // Chain variant (mirror of moveGen.ts): only where the stone's
@@ -1551,7 +1702,7 @@ impl SolverState {
             let a = e.tx as f64;
             let b = e.tz as f64;
             let s_chain = (TAKEOFF_NARROW_MARGIN + CATCH_HALF[takeoff_catch]).min(TAKEOFF_STAND) * CHAIN_TAKEOFF_FRACTION * e.dist / (if a > b { a } else { b });
-            if flight_from(a, b, e.dist, s_chain, l_cred) > J_CHAIN[bucket] + self.cfg.margin_credit {
+            if flight_from(a, b, e.dist, s_chain, l_cred) > self.ext_reach[CHAIN_ROW + bucket] + self.cfg.margin_credit {
                 return;
             }
             needs_running = true;
@@ -1592,9 +1743,16 @@ impl SolverState {
         if cost > 100.0 {
             return;
         }
+        // A support landing carries its flight direction (mirror of moveGen.ts).
+        if self.momentum && land_catch >= 0 {
+            self.pending_mom = momentum_of(e.tx * sx, e.tz * sz);
+        }
         if chain_via >= 0 {
             self.pending_via = chain_via;
             self.push_out(tx, node_y, tz, chain_base + cost, META_PARKOUR | META_CHAIN);
+        } else if chained {
+            self.pending_via = self.cell_index(x, y, z);
+            self.push_out(tx, node_y, tz, cost, META_PARKOUR | META_CHAIN);
         } else {
             self.push_out(tx, node_y, tz, cost, META_PARKOUR);
         }
@@ -1850,8 +2008,14 @@ impl SolverState {
         self.push_out(x, y - 1, z, cost, 0);
     }
 
-    fn generate(&mut self, x: i32, y: i32, z: i32) {
+    fn generate(&mut self, x: i32, y: i32, z: i32, mom: u8) {
         self.out.count = 0;
+        self.mom_in = if self.momentum { mom } else { MOM_NONE };
+        if self.mom_in != MOM_NONE {
+            self.mom_dx = momentum_dx(self.mom_in);
+            self.mom_dz = momentum_dz(self.mom_in);
+            self.mom_d2 = self.mom_dx * self.mom_dx + self.mom_dz * self.mom_dz;
+        }
         // Extended-parkour takeoff gates are node-invariant — hoisted (mirror
         // of moveGen.ts generate()).
         let mut ext = false;
@@ -1907,7 +2071,7 @@ impl SolverState {
                 }
             }
         }
-        if jumps {
+        if jumps && !self.momentum {
             self.momentum_chains(x, y, z);
         }
         self.move_down(x, y, z);
@@ -1988,9 +2152,10 @@ impl SolverState {
                 continue; // stale duplicate (untouched or closed)
             }
 
-            let x = self.decode_x(idx);
-            let y = self.decode_y(idx);
-            let z = self.decode_z(idx);
+            let cell = self.cell_of(idx);
+            let x = self.decode_x(cell);
+            let y = self.decode_y(cell);
+            let z = self.decode_z(cell);
 
             if self.goal.is_end(x, y, z) {
                 self.best_idx = idx;
@@ -2004,11 +2169,12 @@ impl SolverState {
             self.open_count -= 1;
             self.touch_chunk(x, z);
 
-            self.generate(x, y, z);
+            let mom = self.mom_of(idx);
+            self.generate(x, y, z, mom);
             let g = self.g[ui];
 
             for i in 0..self.out.count {
-                let n_idx = self.out.idx[i];
+                let n_idx = self.slot_for(self.out.idx[i], self.out.mom[i]);
                 let ni = n_idx as usize;
                 let touched = self.stamp[ni] == epoch;
 
@@ -2093,9 +2259,10 @@ impl SolverState {
         out.extend_from_slice(&(nodes.len() as u32).to_le_bytes());
         for &n in &nodes {
             let ni = n as usize;
-            out.extend_from_slice(&self.decode_x(n).to_le_bytes());
-            out.extend_from_slice(&self.decode_y(n).to_le_bytes());
-            out.extend_from_slice(&self.decode_z(n).to_le_bytes());
+            let cell = self.cell_of(n);
+            out.extend_from_slice(&self.decode_x(cell).to_le_bytes());
+            out.extend_from_slice(&self.decode_y(cell).to_le_bytes());
+            out.extend_from_slice(&self.decode_z(cell).to_le_bytes());
             let parent = self.parent[ni];
             let edge = self.g[ni] - if parent >= 0 { self.g[parent as usize] } else { 0.0 };
             out.extend_from_slice(&edge.to_le_bytes());
@@ -2192,6 +2359,7 @@ pub unsafe extern "C" fn solve_init(params: *const u8) -> i32 {
         dont_mine_under_falling: cfg_bits & 128 != 0,
         use_bubble: cfg_bits & 256 != 0,
         allow_parkour_extended: cfg_bits & 512 != 0,
+        allow_parkour_momentum: cfg_bits & 1024 != 0,
         max_drop_down,
         liquid_cost,
         entity_cost,
@@ -2263,7 +2431,7 @@ pub unsafe extern "C" fn solve_init(params: *const u8) -> i32 {
             st.ext_cells.push(read_i32(ext_ptr, &mut eo));
         }
         eo = (eo + 7) & !7; // f64 section is 8-aligned in the blob
-        for i in 0..140 {
+        for i in 0..150 {
             st.ext_reach[i] = read_f64(ext_ptr, &mut eo);
         }
         for i in 0..n_total {
@@ -2284,7 +2452,8 @@ pub unsafe extern "C" fn solve_init(params: *const u8) -> i32 {
     }
 
     st.goal = MultiGoal { specs };
-    st.arena_prepare(n);
+    let momentum = ext_on && st.cfg.allow_parkour_momentum;
+    st.arena_prepare(n, momentum);
     st.heap.clear();
     st.chunk_set.fill(0);
     st.chunk_list.clear();

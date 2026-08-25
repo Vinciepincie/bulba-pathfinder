@@ -81,8 +81,38 @@ export class Move extends Vec3 {
     const node = Move.fromRaw(raw)
     if (!node.chain || node.via === null) return [node]
     const stone = new Move(node.via.x, node.via.y, node.via.z, 0, 0, [], [], true)
-    // Unit direction of the second hop; the executor scales it by the
-    // stone's creep credit once it knows the support's shape.
+    Move.aimStone(stone, node)
+    return [stone, node]
+  }
+
+  /**
+   * Whole-path form of expandRaw. With momentum in the search
+   * (allowParkourMomentum) a chain node's stone IS the node before it, so
+   * that one is aimed far-side rather than duplicated; a compound chain
+   * (stone folded into `via` only) still expands into stone + node.
+   */
+  static expandRawPath (raws: RawPathNode[]): Move[] {
+    const out: Move[] = []
+    for (const raw of raws) {
+      const node = Move.fromRaw(raw)
+      if (node.chain && node.via !== null) {
+        const prev = out.length > 0 ? out[out.length - 1] : null
+        if (prev !== null && prev.x === node.via.x && prev.y === node.via.y && prev.z === node.via.z) {
+          Move.aimStone(prev, node)
+        } else {
+          const stone = new Move(node.via.x, node.via.y, node.via.z, 0, 0, [], [], true)
+          Move.aimStone(stone, node)
+          out.push(stone)
+        }
+      }
+      out.push(node)
+    }
+    return out
+  }
+
+  /** Unit direction of the re-jump off `stone` toward `node`; the executor
+   * scales it by the stone's creep credit once it knows the support's shape. */
+  private static aimStone (stone: Move, node: Move): void {
     const dx = node.x - stone.x
     const dz = node.z - stone.z
     const len = Math.hypot(dx, dz)
@@ -90,6 +120,5 @@ export class Move extends Vec3 {
       stone.aimDx = dx / len
       stone.aimDz = dz / len
     }
-    return [stone, node]
   }
 }

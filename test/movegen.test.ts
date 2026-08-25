@@ -17,9 +17,10 @@ import {
   WATER,
   LADDER,
   OAK_FENCE,
-  OAK_FENCE_DRY
+  OAK_FENCE_DRY,
+  LADDER_DRY
 } from './helpers/voxelWorld.js'
-import { MoveGen, META_PARKOUR, META_BOUNCE, META_CHAIN } from '../src/moveGen.js'
+import { MoveGen, META_PARKOUR, META_BOUNCE, META_CHAIN, MOM_NONE, momentumOf, momentumDx, momentumDz } from '../src/moveGen.js'
 import { Snapshot } from '../src/snapshot.js'
 
 interface GenMove {
@@ -813,5 +814,114 @@ describe('MoveGen', () => {
       low.set(2, 1, 0, bottomSlabState())
       expect(bounces(movesOf(makeGen(low, FLAG), 0, 2, 0))).to.have.length(0)
     })
+  })
+})
+
+describe('momentum search state (allowParkourMomentum)', () => {
+  const FLAG = { allowParkourExtended: true }
+  const MOM = { allowParkourExtended: true, allowParkourMomentum: true }
+  /** movesOf with the node's momentum state, plus each neighbour's outgoing momentum. */
+  function movesFrom (ctx: GenCtx, x: number, y: number, z: number, mom: number): Array<GenMove & { mom: number }> {
+    const { gen, snap } = ctx
+    gen.generate(x, y, z, mom)
+    const m = snap.meta
+    const out: Array<GenMove & { mom: number }> = []
+    for (let i = 0; i < gen.outCount; i++) {
+      const idx = gen.outIdx[i]
+      const lx = idx % m.w
+      const rest = (idx - lx) / m.w
+      const lz = rest % m.l
+      const ly = (rest - lz) / m.l
+      out.push({ x: lx + m.x0, y: ly + m.y0, z: lz + m.z0, cost: gen.outCost[i], meta: gen.outMeta[i], via: gen.outVia[i], mom: gen.outMom[i] })
+    }
+    return out
+  }
+  /** A → B (3,0) onto a post → C (5,2) a block and a half down → D (6,2) three down. */
+  function chainWorld (): VoxelWorld {
+    const world = new VoxelWorld({ x0: -3, y0: -6, z0: -4, x1: 18, y1: 7, z1: 8 })
+    world.set(0, 0, 0, STONE) // A: stand (0,1,0)
+    world.set(3, 0, 0, OAK_FENCE_DRY) // B: stand (3,1,0), feet 1.5
+    world.set(8, -1, 2, STONE) // C: stand (8,0,2)
+    world.set(14, -4, 4, STONE) // D: stand (14,-3,4)
+    return world
+  }
+
+  it('encodes the primitive landing direction exactly and round-trips it', () => {
+    for (const [dx, dz] of [[3, 0], [5, 2], [6, 2], [-4, 1], [0, -5], [-6, -6], [2, -6]]) {
+      const m = momentumOf(dx, dz)
+      expect(m).to.be.greaterThan(MOM_NONE)
+      expect(m).to.be.at.most(255)
+      let a = Math.abs(dx); let b = Math.abs(dz)
+      while (b !== 0) { const t = a % b; a = b; b = t }
+      expect([momentumDx(m), momentumDz(m)]).to.deep.equal([dx / a, dz / a])
+    }
+    expect(momentumOf(6, 2)).to.equal(momentumOf(3, 1))
+    expect(momentumOf(3, 1)).to.not.equal(momentumOf(1, 3))
+  })
+
+  it('a support landing carries its flight direction; a catch carries none', () => {
+    const world = chainWorld()
+    world.set(3, 1, 3, LADDER_DRY) // a ladder catch beside B
+    world.fill(3, 0, 4, 3, 2, 4, STONE) // ...mounted on this wall
+    const moves = movesFrom(makeGen(world, MOM), 0, 1, 0, MOM_NONE)
+    const post = at(moves, 3, 1, 0)
+    expect(post).to.have.length(1)
+    expect(post[0].meta).to.equal(META_PARKOUR)
+    expect((post[0] as { mom: number }).mom).to.equal(momentumOf(3, 0))
+    const catchMove = at(moves, 3, 1, 3)
+    expect(catchMove).to.have.length(1)
+    expect((catchMove[0] as { mom: number }).mom).to.equal(MOM_NONE)
+    // Flag off (compound chains): no momentum on anything.
+    expect(movesFrom(makeGen(world, FLAG), 0, 1, 0, MOM_NONE).every(mv => (mv as { mom: number }).mom === MOM_NONE)).to.equal(true)
+  })
+
+  it('the chain is a transition from the landing state, not a compound edge', () => {
+    const world = chainWorld()
+    const ctx = makeGen(world, MOM)
+    // From A nothing is folded: B is a plain landing, C is not an edge of A.
+    const fromA = movesFrom(ctx, 0, 1, 0, MOM_NONE)
+    expect(at(fromA, 8, 0, 2)).to.have.length(0)
+    expect(fromA.filter(mv => (mv.meta & META_CHAIN) !== 0)).to.have.length(0)
+    // From B at rest: C is out of reach (as before).
+    expect(at(movesFrom(ctx, 3, 1, 0, MOM_NONE), 8, 0, 2)).to.have.length(0)
+    // From B carrying the (3,0) landing: C is a chain edge priced as its own hop,
+    // via the stone itself, and lands carrying (5,2).
+    const fromB = movesFrom(ctx, 3, 1, 0, momentumOf(3, 0))
+    const c = at(fromB, 8, 0, 2)
+    expect(c).to.have.length(1)
+    expect(c[0].meta).to.equal(META_PARKOUR | META_CHAIN)
+    expect(c[0].via).to.equal(ctx.snap.index(3, 1, 0))
+    expect(c[0].cost).to.be.closeTo(Math.hypot(5, 2) + 0.5, 1e-12)
+    expect((c[0] as { mom: number }).mom).to.equal(momentumOf(5, 2))
+    // The landing state is a complete node: the ordinary moves are there too.
+    expect(fromB.filter(mv => (mv.meta & META_CHAIN) === 0).length).to.be.greaterThan(0)
+    // Turning away kills the momentum: the same offset mirrored is not chained.
+    world.set(-2, -1, 2, STONE)
+    expect(at(movesFrom(makeGen(world, MOM), 3, 1, 0, momentumOf(3, 0)), -2, 0, 2)).to.have.length(0)
+    // The compound model still exists with the flag off, as A → C via B.
+    const compound = at(movesFrom(makeGen(world, FLAG), 0, 1, 0, MOM_NONE), 8, 0, 2)
+    expect(compound).to.have.length(1)
+    expect(compound[0].meta).to.equal(META_PARKOUR | META_CHAIN)
+  })
+
+  it('chains chain: the second landing re-jumps again, and without momentum it cannot', () => {
+    const ctx = makeGen(chainWorld(), MOM)
+    // C at rest: D (6,2) three down needs 4.67 against 4.63 of run reach.
+    expect(at(movesFrom(ctx, 8, 0, 2, MOM_NONE), 14, -3, 4)).to.have.length(0)
+    // C landed from (5,2): the chain row covers it (5.02 against 5.10).
+    const d = at(movesFrom(ctx, 8, 0, 2, momentumOf(5, 2)), 14, -3, 4)
+    expect(d).to.have.length(1)
+    expect(d[0].meta).to.equal(META_PARKOUR | META_CHAIN)
+    expect(d[0].via).to.equal(ctx.snap.index(8, 0, 2))
+    expect((d[0] as { mom: number }).mom).to.equal(momentumOf(6, 2))
+    // A momentum too far off the line does not.
+    expect(at(movesFrom(ctx, 8, 0, 2, momentumOf(0, 1)), 14, -3, 4)).to.have.length(0)
+  })
+
+  it('a lid over the stone forbids the chain (no bonked chain row)', () => {
+    const world = chainWorld()
+    world.set(3, 3, 0, STONE) // head+1 over B
+    const ctx = makeGen(world, MOM)
+    expect(at(movesFrom(ctx, 3, 1, 0, momentumOf(3, 0)), 8, 0, 2)).to.have.length(0)
   })
 })

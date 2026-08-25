@@ -11,7 +11,7 @@
 import type { GoalDescriptor, MovementsConfig, RawPathNode, DigData, SnapshotMeta } from '../types.js'
 import type { RawSolveResult } from '../solver.js'
 import { getParkourExtTable, serializeParkourTable } from '../parkourTable.js'
-import { J_RUN, J_LOW_RUN, ENVELOPE_SAFETY_MARGIN } from '../parkourEnvelope.js'
+import { J_RUN, J_LOW_RUN, J_CHAIN, ENVELOPE_SAFETY_MARGIN } from '../parkourEnvelope.js'
 
 interface WasmExports {
   memory: WebAssembly.Memory
@@ -219,7 +219,7 @@ export class WasmSolver {
     // The extended-parkour table travels with the solve (~2.5KB) so the core
     // consumes the exact table the JS reference builds — one geometry source.
     const extBlob = cfg.allowParkourExtended && cfg.allowParkour && cfg.allowSprinting
-      ? serializeParkourTable(getParkourExtTable(), J_RUN, J_LOW_RUN)
+      ? serializeParkourTable(getParkourExtTable(), J_RUN, J_LOW_RUN, J_CHAIN)
       : null
     // Allocs before any view — each may grow (and detach views of) wasm
     // memory; resident snapshot/dig data stays valid (growth extends).
@@ -261,6 +261,7 @@ export class WasmSolver {
     if (cfg.dontMineUnderFallingBlock) cfgBits |= 128
     if (cfg.useBubbleColumns) cfgBits |= 256
     if (cfg.allowParkourExtended) cfgBits |= 512
+    if (cfg.allowParkourMomentum === true) cfgBits |= 1024
     i32(cfgBits)
     i32(cfg.maxDropDown)
     f64(cfg.liquidCost); f64(cfg.entityCost); f64(cfg.digCost)
