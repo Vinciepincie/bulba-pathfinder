@@ -16,7 +16,7 @@ import { LutFlags, LutSpecial, DigFlags } from './types.js';
 import type { MovementsConfig, SnapshotMeta, DigData } from './types.js';
 import { getParkourExtTable } from './parkourTable.js';
 import type { ParkourExtEntry, ParkourExtTable } from './parkourTable.js';
-import { J_RUN, J_LOW_RUN, runRow, J_CHAIN, CHAIN_MIN_COS, CHAIN_TAKEOFF_FRACTION, reachBucket, ENVELOPE_SAFETY_MARGIN, TAKEOFF_STAND, LAND_HALF, TAKEOFF_NARROW_MARGIN, LAND_NARROW_MARGIN, BOUNCE_APEX, BOUNCE_MAX_DROP, BOUNCE_MARGIN, BOUNCE_MARGIN_FAR } from './parkourEnvelope.js';
+import { J_RUN, J_LOW_RUN, runRow, J_CHAIN, CHAIN_MIN_COS, CHAIN_TAKEOFF_FRACTION, CHAIN_TURN_LOSS, LIP_PHASE, reachBucket, ENVELOPE_SAFETY_MARGIN, TAKEOFF_STAND, LAND_HALF, TAKEOFF_NARROW_MARGIN, LAND_NARROW_MARGIN, BOUNCE_APEX, BOUNCE_MAX_DROP, BOUNCE_MARGIN, BOUNCE_MARGIN_FAR } from './parkourEnvelope.js';
 import { CATCH_HALF } from './shapes.js';
 /** cos(angle) gate as an exact integer test: dot > 0 and dot² ≥ c²·|u|²·|v|². */
 const CHAIN_MIN_COS2 = CHAIN_MIN_COS * CHAIN_MIN_COS;
@@ -1348,22 +1348,37 @@ export class MoveGen {
         const fn = takeoffCatch === 0 && landCatch <= 0
             ? t.fnStand
             : flightFrom(t.tx, t.tz, t.dist, front * t.dist / (t.tx > t.tz ? t.tx : t.tz), lCred);
-        const feasible = fn <= usable;
+        let feasible = fn <= usable;
         // Any run at all flies the running arc (the corridor curves).
         let needsRunning = row >= 1;
         let chained = false;
+        let lipJump = false;
         if (chainVia < 0) {
+            if (!feasible && this.parkourMomentum) {
+                // Momentum (allowParkourMomentum): a RUNNING take-off leaves from
+                // the lip — half + 0.3 past centre plus the median tick phase
+                // (parkourEnvelope.ts LIP_STRIDE / LIP_PHASE) — tried only where
+                // the creep credit falls short, so every edge the plain model
+                // emits keeps its arc and its corridor; the lip corridor
+                // (mfLip) bounds the later, lower rising arc.
+                const sLip = (half + LAND_NARROW_MARGIN + LIP_PHASE) * t.dist / (t.tx > t.tz ? t.tx : t.tz);
+                if (flightFrom(t.tx, t.tz, t.dist, sLip, lCred) <= usable) {
+                    feasible = true;
+                    lipJump = true;
+                }
+            }
             if (!feasible) {
                 // Momentum (allowParkourMomentum): the body LANDED here from a
                 // jump along momIn; a re-jump on the landing tick that continues
                 // it (CHAIN_MIN_COS cone) flies the chain row from the same
-                // far-side landing point the compound chain below uses. Never
-                // under a lid (no bonked chain row was measured).
+                // far-side landing point the compound chain below uses, less the
+                // measured turn loss. Never under a lid (no bonked chain row).
                 if (this.momIn === MOM_NONE || low ||
                     !this.chainAligned(this.momDx, this.momDz, this.momD2, t.tx * sx, t.tz * sz))
                     return;
                 const sChain = Math.min(TAKEOFF_STAND, TAKEOFF_NARROW_MARGIN + CATCH_HALF[takeoffCatch]) * CHAIN_TAKEOFF_FRACTION * t.dist / (t.tx > t.tz ? t.tx : t.tz);
-                if (flightFrom(t.tx, t.tz, t.dist, sChain, lCred) > J_CHAIN[bucket] + this.marginCredit)
+                const cosTurn = (this.momDx * (t.tx * sx) + this.momDz * (t.tz * sz)) / Math.sqrt(this.momD2 * (t.tx * t.tx + t.tz * t.tz));
+                if (flightFrom(t.tx, t.tz, t.dist, sChain, lCred) > J_CHAIN[bucket] - CHAIN_TURN_LOSS * (1 - cosTurn) + this.marginCredit)
                     return;
                 needsRunning = true;
                 chained = true;
@@ -1390,9 +1405,11 @@ export class MoveGen {
         // it. This is what lets a drop-jump fly over same-level corners near
         // takeoff (feet at apex there) instead of demanding full landing-depth
         // clearance everywhere.
-        const mf = low
-            ? (needsRunning ? t.mfLowRun : t.mfLowStand)
-            : (needsRunning ? t.mfRun : t.mfStand);
+        const mf = lipJump
+            ? (low ? t.mfLowLip : t.mfLip)
+            : low
+                ? (needsRunning ? t.mfLowRun : t.mfLowStand)
+                : (needsRunning ? t.mfRun : t.mfStand);
         for (let k = 0; k * 2 < cells.length; k++) {
             const cx = x + cells[k * 2] * sx;
             const cz = z + cells[k * 2 + 1] * sz;

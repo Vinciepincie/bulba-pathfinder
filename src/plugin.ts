@@ -1954,7 +1954,11 @@ export function createPathfinder (options: PathfinderOptions = {}) {
           const feet = bot.blockAt(p) as BlockLike | null
           const caught = ent.onGround === true || ent.isInWater === true ||
             (feet !== null && (feet.type === ladderId || feet.type === vineId))
-          if (!caught && holeBeyond(nextPoint, p)) break
+          // A chain's stone is held to touchdown whatever lies beyond it: the
+          // re-jump is pressed on the landing tick, and a stone retired in
+          // mid-air is settled onto at a walk instead (the chain branch below).
+          const stoneOfChain = path.length > 1 && (path[1] as Move).chain === true
+          if (!caught && (stoneOfChain || holeBeyond(nextPoint, p))) break
         }
         if (airborneHold) break
         // Inside the box, or simply GONE BY. The corner cut does not steer

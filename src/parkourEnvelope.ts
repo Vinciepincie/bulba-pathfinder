@@ -108,6 +108,18 @@ export const J_CHAIN: readonly number[] = [
  */
 export const CHAIN_MIN_COS = 0.70
 /**
+ * Turn loss of a chain re-jump at the EXECUTOR's cadence (jump pressed on
+ * the landing tick, J_CHAIN's own measurement): the landing velocity has
+ * had one ground tick to rotate toward the new heading, so the reach falls
+ * with the turn — measured (turnChain1.ts, standing first hop): 0° 3.70,
+ * 30° 3.60, 45° 3.47, 60° 3.30 flat; −1: 4.30, 4.19, 4.05, 3.85 — a
+ * straight line in cos, 0.8 blocks per unit. (The 0°→60° table in
+ * VelocityInSearch.md was taken one tick later, where the turn costs
+ * less; that cadence is not the executor's.) Applied with
+ * allowParkourMomentum: usable = J_CHAIN − CHAIN_TURN_LOSS × (1 − cos).
+ */
+export const CHAIN_TURN_LOSS = 0.8
+/**
  * The re-jump's takeoff credit is HALF the standing creep credit of the
  * stone (min(TAKEOFF_STAND, half + margin) / 2): the first hop is aimed
  * that far past the stone's centre (Move.aimDx/aimDz), which keeps the
@@ -166,6 +178,30 @@ export const LAND_HALF = 0.8
  */
 export const TAKEOFF_NARROW_MARGIN = 0.28
 export const LAND_NARROW_MARGIN = 0.3
+
+/**
+ * LIP take-off (allowParkourMomentum): a RUNNING body leaves from the
+ * support's overhang limit, half + 0.3, whatever the tick phase. The engine
+ * resolves the y axis (which sets onGround) before a tick's horizontal
+ * move, so the flag lags a tick and the jump input on the first airborne
+ * tick still fires — vanilla's late jump. The last tick with the hitbox
+ * over the block is ≤ half + 0.3 past centre; the jump then fires from
+ * there plus one sprint stride. Measured on the arena's parkouradv1 stair
+ * (bench/arena/.run/scratch/trace.ts): grounded at 0.78, flagged at 1.06,
+ * jumped there. The executor's delayed-jump rollout finds that tick. The
+ * corridor is bounded over the whole window [limit, limit + LIP_STRIDE]
+ * (parkourTable.ts mfLip). Standing creep jumps keep TAKEOFF_STAND.
+ *
+ * The take-off is credited at the MEDIAN of that window (limit + LIP_PHASE):
+ * where in the stride the last grounded tick falls is set by the approach,
+ * so half of all run-ins fly further than this and half shorter; a run-in
+ * whose phase falls short is refused by the rollout and re-tried from the
+ * executor's back-off, which samples the other phases (plugin.ts). Measured
+ * on parkouradv1's fence→fence (3,−3,5): the brute force lands it from
+ * 0.68 past the post's centre, the minimum phase (0.425) is 0.05 short.
+ */
+export const LIP_STRIDE = 0.28
+export const LIP_PHASE = LIP_STRIDE / 2
 
 /**
  * Slime-bounce apex per drop height d (blocks above the slime top after a

@@ -100,6 +100,10 @@ const BOUNCE_MARGIN_FAR: f64 = 1.0;
 const CHAIN_ROW: usize = 140;
 const CHAIN_MIN_COS: f64 = 0.70;
 const CHAIN_TAKEOFF_FRACTION: f64 = 0.5;
+/// Chain turn loss per unit cos (parkourEnvelope.ts CHAIN_TURN_LOSS).
+const CHAIN_TURN_LOSS: f64 = 0.8;
+/// Median tick phase of a lip take-off (parkourEnvelope.ts LIP_PHASE = LIP_STRIDE / 2).
+const LIP_PHASE: f64 = 0.28 / 2.0;
 const CHAIN_MIN_COS2: f64 = CHAIN_MIN_COS * CHAIN_MIN_COS;
 const CHAIN_CAP: usize = 256;
 
@@ -435,9 +439,9 @@ struct SolverState {
     // extended-parkour table (per-solve upload; see ExtEntry)
     ext_entries: Vec<ExtEntry>,
     ext_cells: Vec<i32>,
-    /// Per-corridor-cell min feet height: four blocks (standing, running,
-    /// low-standing, low-running), each ext_mf_block long, indexed by
-    /// block·ext_mf_block + cells_off + k.
+    /// Per-corridor-cell min feet height: six blocks (standing, running,
+    /// low-standing, low-running, lip, low-lip), each ext_mf_block long,
+    /// indexed by block·ext_mf_block + cells_off + k.
     ext_mf: Vec<f64>,
     ext_mf_block: usize,
     /// J_RUN (7 run rows × 10 buckets), J_LOW_RUN, then J_CHAIN (CHAIN_ROW)
@@ -1671,14 +1675,27 @@ impl SolverState {
             let b = e.tz as f64;
             flight_from(a, b, e.dist, front * e.dist / (if a > b { a } else { b }), l_cred)
         };
-        let feasible = fn_needed <= usable;
+        let mut feasible = fn_needed <= usable;
         let mut needs_running = row >= 1;
         let mut chained = false;
+        let mut lip_jump = false;
         if chain_via < 0 {
+            if !feasible && self.momentum {
+                // Lip take-off (mirror of moveGen.ts): half + 0.3 past centre,
+                // tried only where the creep credit falls short.
+                let a = e.tx as f64;
+                let b = e.tz as f64;
+                let s_lip = (half + LAND_NARROW_MARGIN + LIP_PHASE) * e.dist / (if a > b { a } else { b });
+                if flight_from(a, b, e.dist, s_lip, l_cred) <= usable {
+                    feasible = true;
+                    lip_jump = true;
+                }
+            }
             if !feasible {
                 // Momentum chain from the landing's own state (mirror of
                 // moveGen.ts): continue the incoming flight within the cone,
-                // chain row from the far-side landing point, never under a lid.
+                // chain row from the far-side landing point less the turn
+                // loss, never under a lid.
                 if self.mom_in == MOM_NONE || low
                     || !chain_aligned(self.mom_dx, self.mom_dz, self.mom_d2, e.tx * sx, e.tz * sz)
                 {
@@ -1687,7 +1704,9 @@ impl SolverState {
                 let a = e.tx as f64;
                 let b = e.tz as f64;
                 let s_chain = (TAKEOFF_NARROW_MARGIN + CATCH_HALF[takeoff_catch]).min(TAKEOFF_STAND) * CHAIN_TAKEOFF_FRACTION * e.dist / (if a > b { a } else { b });
-                if flight_from(a, b, e.dist, s_chain, l_cred) > self.ext_reach[CHAIN_ROW + bucket] + self.cfg.margin_credit {
+                let cos_turn = (self.mom_dx * (e.tx * sx) + self.mom_dz * (e.tz * sz)) as f64
+                    / ((self.mom_d2 * (e.tx * e.tx + e.tz * e.tz)) as f64).sqrt();
+                if flight_from(a, b, e.dist, s_chain, l_cred) > self.ext_reach[CHAIN_ROW + bucket] - CHAIN_TURN_LOSS * (1.0 - cos_turn) + self.cfg.margin_credit {
                     return;
                 }
                 needs_running = true;
@@ -1710,7 +1729,11 @@ impl SolverState {
 
         // Corridor pass 2: per-cell flight-curve bound mf = the lowest the
         // feet can be over that cell (see the JS reference for the rules).
-        let mf_base = ((if low { 2usize } else { 0 }) + (if needs_running { 1 } else { 0 })) * self.ext_mf_block;
+        let mf_base = (if lip_jump {
+            if low { 5usize } else { 4 }
+        } else {
+            (if low { 2usize } else { 0 }) + (if needs_running { 1 } else { 0 })
+        }) * self.ext_mf_block;
         for k in 0..e.n_cells {
             let c_ax = self.ext_cells[cbase + k * 2];
             let c_az = self.ext_cells[cbase + k * 2 + 1];
@@ -2441,9 +2464,9 @@ pub unsafe extern "C" fn solve_init(params: *const u8) -> i32 {
             st.ext_entries[i].fn_run = read_f64(ext_ptr, &mut eo);
         }
         // Per-cell min-feet arrays: standing, running, low-standing,
-        // low-running blocks.
+        // low-running, lip, low-lip blocks.
         st.ext_mf_block = cells_len / 2;
-        for _ in 0..cells_len * 2 {
+        for _ in 0..cells_len * 3 {
             st.ext_mf.push(read_f64(ext_ptr, &mut eo));
         }
         if eo != ext_len {

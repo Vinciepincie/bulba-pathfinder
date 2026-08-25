@@ -18,7 +18,9 @@ import {
   LADDER,
   OAK_FENCE,
   OAK_FENCE_DRY,
-  LADDER_DRY
+  LADDER_DRY,
+  MANGROVE_STAIRS,
+  CREEPER_HEAD
 } from './helpers/voxelWorld.js'
 import { MoveGen, META_PARKOUR, META_BOUNCE, META_CHAIN, MOM_NONE, momentumOf, momentumDx, momentumDz } from '../src/moveGen.js'
 import { Snapshot } from '../src/snapshot.js'
@@ -836,13 +838,17 @@ describe('momentum search state (allowParkourMomentum)', () => {
     }
     return out
   }
-  /** A → B (3,0) onto a post → C (5,2) a block and a half down → D (6,2) three down. */
+  /** A → B (3,0) onto a post → C (6,1) four down onto a head → D (6,2) four down
+   * onto a head. Post to head, a (6,1) four down needs 4.90 from the lip against
+   * 4.89 of run reach and 5.26 from the landing point against J_CHAIN's 5.39: a
+   * chain, never a plain jump — a full block would run from its lip as far as a
+   * chain re-jumps, so only narrow supports still need the landing state. */
   function chainWorld (): VoxelWorld {
-    const world = new VoxelWorld({ x0: -3, y0: -6, z0: -4, x1: 18, y1: 7, z1: 8 })
+    const world = new VoxelWorld({ x0: -4, y0: -11, z0: -4, x1: 19, y1: 7, z1: 8 })
     world.set(0, 0, 0, STONE) // A: stand (0,1,0)
     world.set(3, 0, 0, OAK_FENCE_DRY) // B: stand (3,1,0), feet 1.5
-    world.set(8, -1, 2, STONE) // C: stand (8,0,2)
-    world.set(14, -4, 4, STONE) // D: stand (14,-3,4)
+    world.set(9, -3, 1, CREEPER_HEAD) // C: a head, stand (9,-2,1), feet -2.5
+    world.set(15, -7, 3, CREEPER_HEAD) // D: a head, stand (15,-6,3), feet -6.5
     return world
   }
 
@@ -880,48 +886,90 @@ describe('momentum search state (allowParkourMomentum)', () => {
     const ctx = makeGen(world, MOM)
     // From A nothing is folded: B is a plain landing, C is not an edge of A.
     const fromA = movesFrom(ctx, 0, 1, 0, MOM_NONE)
-    expect(at(fromA, 8, 0, 2)).to.have.length(0)
+    expect(at(fromA, 9, -2, 1)).to.have.length(0)
     expect(fromA.filter(mv => (mv.meta & META_CHAIN) !== 0)).to.have.length(0)
     // From B at rest: C is out of reach (as before).
-    expect(at(movesFrom(ctx, 3, 1, 0, MOM_NONE), 8, 0, 2)).to.have.length(0)
+    expect(at(movesFrom(ctx, 3, 1, 0, MOM_NONE), 9, -2, 1)).to.have.length(0)
     // From B carrying the (3,0) landing: C is a chain edge priced as its own hop,
-    // via the stone itself, and lands carrying (5,2).
+    // via the stone itself, and lands carrying (6,1).
     const fromB = movesFrom(ctx, 3, 1, 0, momentumOf(3, 0))
-    const c = at(fromB, 8, 0, 2)
+    const c = at(fromB, 9, -2, 1)
     expect(c).to.have.length(1)
     expect(c[0].meta).to.equal(META_PARKOUR | META_CHAIN)
     expect(c[0].via).to.equal(ctx.snap.index(3, 1, 0))
-    expect(c[0].cost).to.be.closeTo(Math.hypot(5, 2) + 0.5, 1e-12)
-    expect((c[0] as { mom: number }).mom).to.equal(momentumOf(5, 2))
+    expect(c[0].cost).to.be.closeTo(Math.max(Math.hypot(6, 1) + 0.5, 5 + Math.SQRT2), 1e-12)
+    expect((c[0] as { mom: number }).mom).to.equal(momentumOf(6, 1))
     // The landing state is a complete node: the ordinary moves are there too.
     expect(fromB.filter(mv => (mv.meta & META_CHAIN) === 0).length).to.be.greaterThan(0)
     // Turning away kills the momentum: the same offset mirrored is not chained.
-    world.set(-2, -1, 2, STONE)
-    expect(at(movesFrom(makeGen(world, MOM), 3, 1, 0, momentumOf(3, 0)), -2, 0, 2)).to.have.length(0)
+    world.set(-3, -3, 1, CREEPER_HEAD)
+    expect(at(movesFrom(makeGen(world, MOM), 3, 1, 0, momentumOf(3, 0)), -3, -2, 1)).to.have.length(0)
     // The compound model still exists with the flag off, as A → C via B.
-    const compound = at(movesFrom(makeGen(world, FLAG), 0, 1, 0, MOM_NONE), 8, 0, 2)
+    const compound = at(movesFrom(makeGen(world, FLAG), 0, 1, 0, MOM_NONE), 9, -2, 1)
     expect(compound).to.have.length(1)
     expect(compound[0].meta).to.equal(META_PARKOUR | META_CHAIN)
   })
 
   it('chains chain: the second landing re-jumps again, and without momentum it cannot', () => {
     const ctx = makeGen(chainWorld(), MOM)
-    // C at rest: D (6,2) three down needs 4.67 against 4.63 of run reach.
-    expect(at(movesFrom(ctx, 8, 0, 2, MOM_NONE), 14, -3, 4)).to.have.length(0)
-    // C landed from (5,2): the chain row covers it (5.02 against 5.10).
-    const d = at(movesFrom(ctx, 8, 0, 2, momentumOf(5, 2)), 14, -3, 4)
+    // C at rest: D (6,2) four down needs 4.91 from the head's lip against 4.89.
+    expect(at(movesFrom(ctx, 9, -2, 1, MOM_NONE), 15, -6, 3)).to.have.length(0)
+    // C landed from (6,1): the chain row covers it (5.37 against 5.39).
+    const d = at(movesFrom(ctx, 9, -2, 1, momentumOf(6, 1)), 15, -6, 3)
     expect(d).to.have.length(1)
     expect(d[0].meta).to.equal(META_PARKOUR | META_CHAIN)
-    expect(d[0].via).to.equal(ctx.snap.index(8, 0, 2))
+    expect(d[0].via).to.equal(ctx.snap.index(9, -2, 1))
     expect((d[0] as { mom: number }).mom).to.equal(momentumOf(6, 2))
     // A momentum too far off the line does not.
-    expect(at(movesFrom(ctx, 8, 0, 2, momentumOf(0, 1)), 14, -3, 4)).to.have.length(0)
+    expect(at(movesFrom(ctx, 9, -2, 1, momentumOf(0, 1)), 15, -6, 3)).to.have.length(0)
   })
 
   it('a lid over the stone forbids the chain (no bonked chain row)', () => {
     const world = chainWorld()
     world.set(3, 3, 0, STONE) // head+1 over B
     const ctx = makeGen(world, MOM)
-    expect(at(movesFrom(ctx, 3, 1, 0, momentumOf(3, 0)), 8, 0, 2)).to.have.length(0)
+    expect(at(movesFrom(ctx, 3, 1, 0, momentumOf(3, 0)), 9, -2, 1)).to.have.length(0)
+  })
+
+  it('the chain re-jump pays the measured turn loss at the executor cadence', () => {
+    const ctx = makeGen(chainWorld(), MOM)
+    // D (6,2) needs 5.36 against J_CHAIN's 5.39: straight on (incoming
+    // (3,1), cos 1) it is a chain; at 45 degrees (incoming (2,-1), cos
+    // 0.71) the loss is 0.23 and it is not.
+    expect(at(movesFrom(ctx, 9, -2, 1, momentumOf(3, 1)), 15, -6, 3)).to.have.length(1)
+    expect(at(movesFrom(ctx, 9, -2, 1, momentumOf(2, -1)), 15, -6, 3)).to.have.length(0)
+  })
+
+  it('lip take-off: the parkouradv1 stair (0,5) onto a low step, a third of a block past the creep credit', () => {
+    // Take-off on a bottom stair (top 1.0, class 0), landing on the low
+    // step of another five cells on: 5 − 0.6 − 0.8 = 3.6 needed against
+    // 3.50 usable (run row 3 at −0.5) — refused; from the lip, 3.26 — made.
+    // The executor's own gates fly it from the stale-ground tick
+    // (bench/arena/.run/scratch/execSim.ts, wood → stair → stair).
+    const world = new VoxelWorld({ x0: -3, y0: -3, z0: -3, x1: 4, y1: 8, z1: 10 })
+    world.set(0, 1, 0, MANGROVE_STAIRS) // stand (0,2,0), h0 = 2
+    world.set(0, 1, 5, MANGROVE_STAIRS) // stand (0,2,5), low step at 1.5
+    expect(at(movesOf(makeGen(world, FLAG), 0, 2, 0), 0, 2, 5)).to.have.length(0)
+    const lip = at(movesFrom(makeGen(world, MOM), 0, 2, 0, MOM_NONE), 0, 2, 5)
+    expect(lip).to.have.length(1)
+    expect(lip[0].meta).to.equal(META_PARKOUR)
+    expect(lip[0].cost).to.be.closeTo(5.5, 1e-12)
+    expect((lip[0] as { mom: number }).mom).to.equal(momentumOf(0, 5))
+    // A full-top landing (no low step) still needs 3.26 against 3.22: not even from the lip.
+    world.set(0, 1, 5, STONE)
+    expect(at(movesFrom(makeGen(world, MOM), 0, 2, 0, MOM_NONE), 0, 2, 5)).to.have.length(0)
+  })
+
+  it('every edge of the plain model survives the flag unchanged (the lip is a fallback)', () => {
+    // A (3,0) hop onto a post plus a fence one cell past the take-off that
+    // the early arc clears: the plain corridor accepts it, so the flag must
+    // keep that edge as is rather than re-judge it on the lip corridor.
+    const world = chainWorld()
+    const plain = at(movesOf(makeGen(world, FLAG), 0, 1, 0), 3, 1, 0)
+    const withFlag = at(movesFrom(makeGen(world, MOM), 0, 1, 0, MOM_NONE), 3, 1, 0)
+    expect(plain).to.have.length(1)
+    expect(withFlag).to.have.length(1)
+    expect(withFlag[0].cost).to.equal(plain[0].cost)
+    expect(withFlag[0].meta).to.equal(plain[0].meta)
   })
 })

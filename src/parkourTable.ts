@@ -7,7 +7,7 @@
 import {
   MAX_OFFSET_MAJOR, J_RUNNING, FLIGHT_STANDING, FLIGHT_RUNNING,
   FLIGHT_LOW_STANDING, FLIGHT_LOW_RUNNING, feetAt,
-  flightNeeded, takeoffStand, takeoffRun, TAKEOFF_STAND, TAKEOFF_RUN
+  flightNeeded, takeoffStand, takeoffRun, TAKEOFF_STAND, TAKEOFF_RUN, LAND_HALF, LIP_STRIDE
 } from './parkourEnvelope.js'
 
 export interface ParkourExtEntry {
@@ -28,6 +28,12 @@ export interface ParkourExtEntry {
   /** Same, on the head-hitter (2-high, bonked) flight curves. */
   mfLowStand: number[]
   mfLowRun: number[]
+  /** Same for a LIP take-off (allowParkourMomentum): the lowest feet over
+   * the cell for any take-off in [LAND_HALF, LAND_HALF + LIP_STRIDE] along
+   * the line — a later take-off is lower on the rising arc, an earlier one
+   * on the falling arc, so both ends of the window bound it. */
+  mfLip: number[]
+  mfLowLip: number[]
   /** Flight needed from the standing corner-creep takeoff / the running
    * delayed-jump takeoff, per-axis credited (parkourEnvelope.flightNeeded).
    * Compared against J_STANDING / J_RUNNING (or the J_LOW rows when the
@@ -137,6 +143,10 @@ function buildEntry (a: number, b: number): ParkourExtEntry {
   const mfRun: number[] = []
   const mfLowStand: number[] = []
   const mfLowRun: number[] = []
+  const mfLip: number[] = []
+  const mfLowLip: number[] = []
+  const sLipNear = LAND_HALF
+  const sLipFar = LAND_HALF + LIP_STRIDE
   for (const c of [...line, ...corners]) {
     cells.push(c.ax, c.az)
     // The flight arc rises then falls (unimodal), so the minimum feet height
@@ -145,6 +155,14 @@ function buildEntry (a: number, b: number): ParkourExtEntry {
     mfRun.push(Math.min(feetAt(FLIGHT_RUNNING, c.tIn * dist - sRun), feetAt(FLIGHT_RUNNING, c.tOut * dist - sRun)))
     mfLowStand.push(Math.min(feetAt(FLIGHT_LOW_STANDING, c.tIn * dist - sStand), feetAt(FLIGHT_LOW_STANDING, c.tOut * dist - sStand)))
     mfLowRun.push(Math.min(feetAt(FLIGHT_LOW_RUNNING, c.tIn * dist - sRun), feetAt(FLIGHT_LOW_RUNNING, c.tOut * dist - sRun)))
+    // Over the take-off WINDOW x the cell's sweep the minimum is still at an
+    // end: the latest take-off at the cell's entry, the earliest at its exit.
+    // Floored by the running curve too, so the lip corridor is never more
+    // permissive than today's on the falling arc (a narrow support's lip is
+    // earlier than a full block's, which is lower there) — only honest about
+    // the later, lower rising arc.
+    mfLip.push(Math.min(mfRun[mfRun.length - 1], feetAt(FLIGHT_RUNNING, c.tIn * dist - sLipFar), feetAt(FLIGHT_RUNNING, c.tOut * dist - sLipNear)))
+    mfLowLip.push(Math.min(mfLowRun[mfLowRun.length - 1], feetAt(FLIGHT_LOW_RUNNING, c.tIn * dist - sLipFar), feetAt(FLIGHT_LOW_RUNNING, c.tOut * dist - sLipNear)))
   }
   const [tsx, tsz] = takeoffStand(a, b)
   const [trx, trz] = takeoffRun(a, b)
@@ -157,6 +175,8 @@ function buildEntry (a: number, b: number): ParkourExtEntry {
     mfRun,
     mfLowStand,
     mfLowRun,
+    mfLip,
+    mfLowLip,
     fnStand: flightNeeded(a, b, tsx, tsz),
     fnRun: flightNeeded(a, b, trx, trz),
     runX: -cells[0],
@@ -226,8 +246,8 @@ export function getParkourExtTable (): ParkourExtTable {
  *        (10) — the envelope lives beside the table in the blob, so the core
  *        never carries a pasted copy that can drift from the pinned rows
  *   f64 ×4 per entry: dist, cost, fnStand, fnRun
- *   f64 ×(cellsLen/2) ×4: mfStand, mfRun, mfLowStand, mfLowRun per cell,
- *        each block indexed by cellsOff + k
+ *   f64 ×(cellsLen/2) ×6: mfStand, mfRun, mfLowStand, mfLowRun, mfLip,
+ *        mfLowLip per cell, each block indexed by cellsOff + k
  */
 export function serializeParkourTable (
   table: ParkourExtTable,
@@ -239,7 +259,7 @@ export function serializeParkourTable (
   const cellsLen = entries.reduce((n, e) => n + e.cells.length, 0)
   const intCount = 4 + entries.length * 7 + cellsLen
   const f64Off = Math.ceil((intCount * 4) / 8) * 8
-  const buf = new ArrayBuffer(f64Off + 8 * (150 + entries.length * 4 + cellsLen * 2))
+  const buf = new ArrayBuffer(f64Off + 8 * (150 + entries.length * 4 + cellsLen * 3))
   const view = new DataView(buf)
   let o = 0
   const i32 = (v: number): void => { view.setInt32(o, v, true); o += 4 }
@@ -260,5 +280,7 @@ export function serializeParkourTable (
   for (const e of entries) for (const v of e.mfRun) f64(v)
   for (const e of entries) for (const v of e.mfLowStand) f64(v)
   for (const e of entries) for (const v of e.mfLowRun) f64(v)
+  for (const e of entries) for (const v of e.mfLip) f64(v)
+  for (const e of entries) for (const v of e.mfLowLip) f64(v)
   return buf
 }

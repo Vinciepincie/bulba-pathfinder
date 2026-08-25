@@ -178,6 +178,8 @@ export interface MovementProfile {
   maxDropDown: number
   /** Override for Movements.parkourSafetyMargin (undefined = the package default). */
   safetyMargin?: number
+  /** Movements.allowParkourMomentum (docs/VelocityInSearch.md); needs extendedParkour. */
+  momentum?: boolean
   thinkTimeout: number
 }
 
@@ -244,6 +246,7 @@ export function applyProfile (
   if (impl !== 'upstream') {
     movements.allowParkourExtended = profile.extendedParkour
     if (profile.safetyMargin !== undefined) movements.parkourSafetyMargin = profile.safetyMargin
+    movements.allowParkourMomentum = profile.extendedParkour && profile.momentum === true
     // `bulba-nohop` is `bulba` with the sprint-hop gait off and nothing else.
     // Racing them side by side is how the gait is measured — same terrain,
     // same tick, same server hitch — instead of across two runs.
