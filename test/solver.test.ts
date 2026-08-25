@@ -386,47 +386,47 @@ describe('Solver over hand-built scenes', function () {
 describe('momentum search state (allowParkourMomentum)', function () {
   this.timeout(30000)
   const MOM = { allowParkourExtended: true, allowParkourMomentum: true }
-  /** A → B (3,0) onto a post → C (6,1) four down onto a head → D (6,2) four down onto a head (movegen.test.ts). */
+  /** A → B (3,0) onto a head → C (5,0) one down onto a head → D (5,0) one down onto a head (movegen.test.ts). */
   function chainWorld (): VoxelWorld {
-    const world = new VoxelWorld({ x0: -4, y0: -11, z0: -4, x1: 19, y1: 7, z1: 8 })
+    const world = new VoxelWorld({ x0: -4, y0: -7, z0: -4, x1: 17, y1: 7, z1: 6 })
     world.set(0, 0, 0, STONE) // A: stand (0,1,0)
-    world.set(3, 0, 0, OAK_FENCE_DRY) // B: stand (3,1,0), feet 1.5
-    world.set(9, -3, 1, CREEPER_HEAD) // C: a head, stand (9,-2,1), feet -2.5
-    world.set(15, -7, 3, CREEPER_HEAD) // D: a head, stand (15,-6,3), feet -6.5
+    world.set(3, 0, 0, CREEPER_HEAD) // B: a head, stand (3,1,0), feet 0.5
+    world.set(8, -1, 0, CREEPER_HEAD) // C: a head, stand (8,0,0), feet -0.5
+    world.set(13, -2, 0, CREEPER_HEAD) // D: a head, stand (13,-1,0), feet -1.5
     return world
   }
 
   it('a three-hop chain reaches what the compound two-hop chain cannot', () => {
     const world = chainWorld()
     const start = { x: 0, y: 1, z: 0 }
-    const off = solve(world, start, new GoalBlock(15, -6, 3), { overrides: { allowParkourExtended: true } })
+    const off = solve(world, start, new GoalBlock(13, -1, 0), { overrides: { allowParkourExtended: true } })
     expect(off.status).to.equal('noPath')
-    const on = solve(world, start, new GoalBlock(15, -6, 3), { overrides: MOM })
+    const on = solve(world, start, new GoalBlock(13, -1, 0), { overrides: MOM })
     expect(on.status).to.equal('success')
     // The path is the cells themselves: stone, chain landing, chain landing —
     // each chain node's `via` is the node before it (its stone).
     const cells = on.path.map(n => `${n.x},${n.y},${n.z}`)
-    expect(cells).to.deep.equal(['3,1,0', '9,-2,1', '15,-6,3'])
+    expect(cells).to.deep.equal(['3,1,0', '8,0,0', '13,-1,0'])
     expect(on.path.map(n => n.parkour)).to.deep.equal([true, true, true])
     expect(on.path.map(n => n.chain === true)).to.deep.equal([false, true, true])
     expect(on.path[1].via).to.deep.equal({ x: 3, y: 1, z: 0 })
-    expect(on.path[2].via).to.deep.equal({ x: 9, y: -2, z: 1 })
-    expect(on.cost).to.be.closeTo(3.5 + Math.max(Math.hypot(6, 1) + 0.5, 5 + Math.SQRT2) + Math.max(Math.hypot(6, 2) + 0.5, 4 + 2 * Math.SQRT2), 1e-9)
+    expect(on.path[2].via).to.deep.equal({ x: 8, y: 0, z: 0 })
+    expect(on.cost).to.be.closeTo(3.5 + 5.5 + 5.5, 1e-9)
     // Executor form: no stone is duplicated, each stone is aimed at its re-jump.
     const moves = Move.expandRawPath(on.path)
     expect(moves.map(m => `${m.x},${m.y},${m.z}`)).to.deep.equal(cells)
-    expect(moves[0].aimDx).to.be.closeTo(6 / Math.hypot(6, 1), 1e-12)
-    expect(moves[1].aimDx).to.be.closeTo(6 / Math.hypot(6, 2), 1e-12)
+    expect(moves[0].aimDx).to.equal(1)
+    expect(moves[1].aimDx).to.equal(1)
     expect(moves[2].aimDx).to.equal(0)
     // The compound form (flag off) still expands into stone + node.
-    const two = solve(world, start, new GoalBlock(9, -2, 1), { overrides: { allowParkourExtended: true } })
+    const two = solve(world, start, new GoalBlock(8, 0, 0), { overrides: { allowParkourExtended: true } })
     expect(two.status).to.equal('success')
-    expect(two.path.map(n => `${n.x},${n.y},${n.z}`)).to.deep.equal(['9,-2,1'])
-    expect(Move.expandRawPath(two.path).map(m => `${m.x},${m.y},${m.z}`)).to.deep.equal(['3,1,0', '9,-2,1'])
+    expect(two.path.map(n => `${n.x},${n.y},${n.z}`)).to.deep.equal(['8,0,0'])
+    expect(Move.expandRawPath(two.path).map(m => `${m.x},${m.y},${m.z}`)).to.deep.equal(['3,1,0', '8,0,0'])
     // Same two-hop goal with momentum: the stone is a real node, same cost.
-    const twoOn = solve(world, start, new GoalBlock(9, -2, 1), { overrides: MOM })
+    const twoOn = solve(world, start, new GoalBlock(8, 0, 0), { overrides: MOM })
     expect(twoOn.status).to.equal('success')
-    expect(twoOn.path.map(n => `${n.x},${n.y},${n.z}`)).to.deep.equal(['3,1,0', '9,-2,1'])
+    expect(twoOn.path.map(n => `${n.x},${n.y},${n.z}`)).to.deep.equal(['3,1,0', '8,0,0'])
     expect(twoOn.cost).to.be.closeTo(two.cost, 1e-9)
   })
 

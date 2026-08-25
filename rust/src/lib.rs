@@ -104,6 +104,8 @@ const CHAIN_TAKEOFF_FRACTION: f64 = 0.5;
 const CHAIN_TURN_LOSS: f64 = 0.8;
 /// Median tick phase of a lip take-off (parkourEnvelope.ts LIP_PHASE = LIP_STRIDE / 2).
 const LIP_PHASE: f64 = 0.28 / 2.0;
+/// Deepest landing rise that still carries momentum (moveGen.ts MOMENTUM_MAX_DROP).
+const MOMENTUM_MAX_DROP: f64 = 1.75;
 const CHAIN_MIN_COS2: f64 = CHAIN_MIN_COS * CHAIN_MIN_COS;
 const CHAIN_CAP: usize = 256;
 
@@ -1605,6 +1607,7 @@ impl SolverState {
         // between the integer rows (mirror of moveGen.ts).
         let dy: i32;
         let mut frac = 0.0;
+        let mut rise = 0.0;
         if sup_y == i32::MIN {
             dy = node_y - y;
         } else {
@@ -1615,7 +1618,7 @@ impl SolverState {
             } else {
                 self.height_at(tx, sup_y, tz)
             };
-            let rise = land_top - h_0;
+            rise = land_top - h_0;
             let mut d = rise.floor() as i32;
             frac = rise - d as f64;
             if d >= 1 {
@@ -1766,8 +1769,10 @@ impl SolverState {
         if cost > 100.0 {
             return;
         }
-        // A support landing carries its flight direction (mirror of moveGen.ts).
-        if self.momentum && land_catch >= 0 {
+        // A narrow support landing that does not hurt carries its flight
+        // direction (mirror of moveGen.ts: a full block's lip out-reaches a
+        // re-jump, a damaging fall's velocity packet zeroes the motion).
+        if self.momentum && land_catch >= 1 && rise >= -MOMENTUM_MAX_DROP {
             self.pending_mom = momentum_of(e.tx * sx, e.tz * sz);
         }
         if chain_via >= 0 {

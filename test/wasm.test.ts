@@ -248,20 +248,20 @@ describe('wasm ↔ JS solver differential', function () {
   }
 
   it('momentum: three-hop chain course identical, and the same course without momentum', () => {
-    // A → post (3,0) → head (6,1) four down → head (6,2) four down: the
-    // last hop exists only as a re-jump carrying the (6,1) landing
+    // A → head (3,0) → head (5,0) one down → head (5,0) one down: the last
+    // hop exists only as a re-jump carrying the (5,0) landing
     // (solver.test.ts), a state the compound chains cannot express.
-    const world = new VoxelWorld({ x0: -4, y0: -11, z0: -4, x1: 19, y1: 7, z1: 8 })
+    const world = new VoxelWorld({ x0: -4, y0: -7, z0: -4, x1: 17, y1: 7, z1: 6 })
     world.set(0, 0, 0, STONE)
-    world.set(3, 0, 0, OAK_FENCE_DRY)
-    world.set(9, -3, 1, CREEPER_HEAD)
-    world.set(15, -7, 3, CREEPER_HEAD)
+    world.set(3, 0, 0, CREEPER_HEAD)
+    world.set(8, -1, 0, CREEPER_HEAD)
+    world.set(13, -2, 0, CREEPER_HEAD)
     const start = { x: 0, y: 1, z: 0 }
-    const pair = solveBoth(world, new GoalBlock(15, -6, 3), { momentum: true }, start)
+    const pair = solveBoth(world, new GoalBlock(13, -1, 0), { momentum: true }, start)
     expect(pair.js.status).to.equal('success')
     expect(pair.js.path.filter(n => n.chain === true).length).to.equal(2)
     assertIdentical(pair, 'momentum chain course')
-    const off = solveBoth(world, new GoalBlock(15, -6, 3), { parkourExtended: true }, start)
+    const off = solveBoth(world, new GoalBlock(13, -1, 0), { parkourExtended: true }, start)
     expect(off.js.status).to.equal('noPath')
     assertIdentical(off, 'momentum chain course, compound only')
   })

@@ -260,6 +260,11 @@ export function applyProfile (
     // Bisect switch: ARENA_NO_CUT=1 races the same build with node-by-node
     // following, which is the only honest way to price the corner cut.
     if (process.env.ARENA_NO_CUT === '1') movements.allowCornerCut = false
+    // Bisect switch for the sprint-hop gait on any engine (bulba-nohop is JS only).
+    if (process.env.ARENA_NO_HOP === '1') {
+      movements.allowSprintHop = false
+      movements.allowLowCeilingHop = false
+    }
   }
 }
 

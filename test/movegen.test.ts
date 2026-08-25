@@ -838,17 +838,18 @@ describe('momentum search state (allowParkourMomentum)', () => {
     }
     return out
   }
-  /** A → B (3,0) onto a post → C (6,1) four down onto a head → D (6,2) four down
-   * onto a head. Post to head, a (6,1) four down needs 4.90 from the lip against
-   * 4.89 of run reach and 5.26 from the landing point against J_CHAIN's 5.39: a
+  /** A → B (3,0) onto a head → C (5,0) one down onto a head → D (5,0) one down
+   * onto a head. Head to head, a (5,0) one down needs 3.760 from the lip against
+   * 3.758 of run reach and 4.185 from the landing point against J_CHAIN's 4.205: a
    * chain, never a plain jump — a full block would run from its lip as far as a
-   * chain re-jumps, so only narrow supports still need the landing state. */
+   * chain re-jumps, so only narrow supports still need the landing state; and a
+   * one-block drop is a landing that does not hurt, so it keeps its momentum. */
   function chainWorld (): VoxelWorld {
-    const world = new VoxelWorld({ x0: -4, y0: -11, z0: -4, x1: 19, y1: 7, z1: 8 })
+    const world = new VoxelWorld({ x0: -4, y0: -7, z0: -4, x1: 17, y1: 7, z1: 6 })
     world.set(0, 0, 0, STONE) // A: stand (0,1,0)
-    world.set(3, 0, 0, OAK_FENCE_DRY) // B: stand (3,1,0), feet 1.5
-    world.set(9, -3, 1, CREEPER_HEAD) // C: a head, stand (9,-2,1), feet -2.5
-    world.set(15, -7, 3, CREEPER_HEAD) // D: a head, stand (15,-6,3), feet -6.5
+    world.set(3, 0, 0, CREEPER_HEAD) // B: a head, stand (3,1,0), feet 0.5
+    world.set(8, -1, 0, CREEPER_HEAD) // C: a head, stand (8,0,0), feet -0.5
+    world.set(13, -2, 0, CREEPER_HEAD) // D: a head, stand (13,-1,0), feet -1.5
     return world
   }
 
@@ -886,58 +887,82 @@ describe('momentum search state (allowParkourMomentum)', () => {
     const ctx = makeGen(world, MOM)
     // From A nothing is folded: B is a plain landing, C is not an edge of A.
     const fromA = movesFrom(ctx, 0, 1, 0, MOM_NONE)
-    expect(at(fromA, 9, -2, 1)).to.have.length(0)
+    expect(at(fromA, 8, 0, 0)).to.have.length(0)
     expect(fromA.filter(mv => (mv.meta & META_CHAIN) !== 0)).to.have.length(0)
     // From B at rest: C is out of reach (as before).
-    expect(at(movesFrom(ctx, 3, 1, 0, MOM_NONE), 9, -2, 1)).to.have.length(0)
+    expect(at(movesFrom(ctx, 3, 1, 0, MOM_NONE), 8, 0, 0)).to.have.length(0)
     // From B carrying the (3,0) landing: C is a chain edge priced as its own hop,
-    // via the stone itself, and lands carrying (6,1).
+    // via the stone itself, and lands carrying (5,0).
     const fromB = movesFrom(ctx, 3, 1, 0, momentumOf(3, 0))
-    const c = at(fromB, 9, -2, 1)
+    const c = at(fromB, 8, 0, 0)
     expect(c).to.have.length(1)
     expect(c[0].meta).to.equal(META_PARKOUR | META_CHAIN)
     expect(c[0].via).to.equal(ctx.snap.index(3, 1, 0))
-    expect(c[0].cost).to.be.closeTo(Math.max(Math.hypot(6, 1) + 0.5, 5 + Math.SQRT2), 1e-12)
-    expect((c[0] as { mom: number }).mom).to.equal(momentumOf(6, 1))
+    expect(c[0].cost).to.be.closeTo(5.5, 1e-12)
+    expect((c[0] as { mom: number }).mom).to.equal(momentumOf(5, 0))
     // The landing state is a complete node: the ordinary moves are there too.
     expect(fromB.filter(mv => (mv.meta & META_CHAIN) === 0).length).to.be.greaterThan(0)
     // Turning away kills the momentum: the same offset mirrored is not chained.
-    world.set(-3, -3, 1, CREEPER_HEAD)
-    expect(at(movesFrom(makeGen(world, MOM), 3, 1, 0, momentumOf(3, 0)), -3, -2, 1)).to.have.length(0)
+    world.set(-2, -1, 0, CREEPER_HEAD)
+    expect(at(movesFrom(makeGen(world, MOM), 3, 1, 0, momentumOf(3, 0)), -2, 0, 0)).to.have.length(0)
     // The compound model still exists with the flag off, as A → C via B.
-    const compound = at(movesFrom(makeGen(world, FLAG), 0, 1, 0, MOM_NONE), 9, -2, 1)
+    const compound = at(movesFrom(makeGen(world, FLAG), 0, 1, 0, MOM_NONE), 8, 0, 0)
     expect(compound).to.have.length(1)
     expect(compound[0].meta).to.equal(META_PARKOUR | META_CHAIN)
   })
 
   it('chains chain: the second landing re-jumps again, and without momentum it cannot', () => {
     const ctx = makeGen(chainWorld(), MOM)
-    // C at rest: D (6,2) four down needs 4.91 from the head's lip against 4.89.
-    expect(at(movesFrom(ctx, 9, -2, 1, MOM_NONE), 15, -6, 3)).to.have.length(0)
-    // C landed from (6,1): the chain row covers it (5.37 against 5.39).
-    const d = at(movesFrom(ctx, 9, -2, 1, momentumOf(6, 1)), 15, -6, 3)
+    // C at rest: D (5,0) one down needs 3.760 from the head's lip against 3.758.
+    expect(at(movesFrom(ctx, 8, 0, 0, MOM_NONE), 13, -1, 0)).to.have.length(0)
+    // C landed from (5,0): the chain row covers it (4.185 against 4.205).
+    const d = at(movesFrom(ctx, 8, 0, 0, momentumOf(5, 0)), 13, -1, 0)
     expect(d).to.have.length(1)
     expect(d[0].meta).to.equal(META_PARKOUR | META_CHAIN)
-    expect(d[0].via).to.equal(ctx.snap.index(9, -2, 1))
-    expect((d[0] as { mom: number }).mom).to.equal(momentumOf(6, 2))
+    expect(d[0].via).to.equal(ctx.snap.index(8, 0, 0))
+    expect((d[0] as { mom: number }).mom).to.equal(momentumOf(5, 0))
     // A momentum too far off the line does not.
-    expect(at(movesFrom(ctx, 9, -2, 1, momentumOf(0, 1)), 15, -6, 3)).to.have.length(0)
+    expect(at(movesFrom(ctx, 8, 0, 0, momentumOf(0, 1)), 13, -1, 0)).to.have.length(0)
   })
 
   it('a lid over the stone forbids the chain (no bonked chain row)', () => {
     const world = chainWorld()
     world.set(3, 3, 0, STONE) // head+1 over B
     const ctx = makeGen(world, MOM)
-    expect(at(movesFrom(ctx, 3, 1, 0, momentumOf(3, 0)), 9, -2, 1)).to.have.length(0)
+    expect(at(movesFrom(ctx, 3, 1, 0, momentumOf(3, 0)), 8, 0, 0)).to.have.length(0)
   })
 
   it('the chain re-jump pays the measured turn loss at the executor cadence', () => {
     const ctx = makeGen(chainWorld(), MOM)
-    // D (6,2) needs 5.36 against J_CHAIN's 5.39: straight on (incoming
-    // (3,1), cos 1) it is a chain; at 45 degrees (incoming (2,-1), cos
-    // 0.71) the loss is 0.23 and it is not.
-    expect(at(movesFrom(ctx, 9, -2, 1, momentumOf(3, 1)), 15, -6, 3)).to.have.length(1)
-    expect(at(movesFrom(ctx, 9, -2, 1, momentumOf(2, -1)), 15, -6, 3)).to.have.length(0)
+    // D (5,0) needs 4.185 against J_CHAIN's 4.205: straight on (incoming
+    // (1,0), cos 1) it is a chain; at 27 degrees (incoming (2,-1), cos
+    // 0.89) the loss is 0.085 and it is not.
+    expect(at(movesFrom(ctx, 8, 0, 0, momentumOf(1, 0)), 13, -1, 0)).to.have.length(1)
+    expect(at(movesFrom(ctx, 8, 0, 0, momentumOf(2, -1)), 13, -1, 0)).to.have.length(0)
+  })
+
+  it('a landing that hurts carries no momentum (the server zeroes it), nor does a full block', () => {
+    // From a stone at stand y=1: a (4,0) hop onto a head a block lower
+    // (rise -1.5, 2.75 of fall) keeps its direction; the same hop onto a
+    // head two lower (rise -2.5, 3.75 of fall — damage, and vanilla's
+    // velocity packet) does not; and a full block a block lower carries
+    // none either, because its lip take-off out-reaches any re-jump.
+    const world = new VoxelWorld({ x0: -3, y0: -6, z0: -3, x1: 8, y1: 6, z1: 3 })
+    world.set(0, 0, 0, STONE)
+    world.set(4, -1, 0, CREEPER_HEAD) // stand (4,0,0), feet -0.5
+    const one = at(movesFrom(makeGen(world, MOM), 0, 1, 0, MOM_NONE), 4, 0, 0)
+    expect(one).to.have.length(1)
+    expect((one[0] as { mom: number }).mom).to.equal(momentumOf(4, 0))
+    world.set(4, -1, 0, AIR)
+    world.set(4, -2, 0, CREEPER_HEAD) // stand (4,-1,0), feet -1.5
+    const two = at(movesFrom(makeGen(world, MOM), 0, 1, 0, MOM_NONE), 4, -1, 0)
+    expect(two).to.have.length(1)
+    expect((two[0] as { mom: number }).mom).to.equal(MOM_NONE)
+    world.set(4, -2, 0, AIR)
+    world.set(4, -1, 0, STONE) // stand (4,0,0), a full block
+    const full = at(movesFrom(makeGen(world, MOM), 0, 1, 0, MOM_NONE), 4, 0, 0)
+    expect(full).to.have.length(1)
+    expect((full[0] as { mom: number }).mom).to.equal(MOM_NONE)
   })
 
   it('lip take-off: the parkouradv1 stair (0,5) onto a low step, a third of a block past the creep credit', () => {
@@ -954,7 +979,8 @@ describe('momentum search state (allowParkourMomentum)', () => {
     expect(lip).to.have.length(1)
     expect(lip[0].meta).to.equal(META_PARKOUR)
     expect(lip[0].cost).to.be.closeTo(5.5, 1e-12)
-    expect((lip[0] as { mom: number }).mom).to.equal(momentumOf(0, 5))
+    // A stair is a full-width top: its own lip out-reaches a re-jump, no momentum state.
+    expect((lip[0] as { mom: number }).mom).to.equal(MOM_NONE)
     // A full-top landing (no low step) still needs 3.26 against 3.22: not even from the lip.
     world.set(0, 1, 5, STONE)
     expect(at(movesFrom(makeGen(world, MOM), 0, 2, 0, MOM_NONE), 0, 2, 5)).to.have.length(0)

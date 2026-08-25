@@ -29,6 +29,9 @@ const CHAIN_MIN_COS2 = CHAIN_MIN_COS * CHAIN_MIN_COS;
  * wasm core packs it identically (lib.rs momentum_of).
  */
 export const MOM_NONE = 0;
+/** Deepest landing (rise, blocks) that still carries momentum: a jump's
+ * 1.25 apex plus this is the 3-block fall vanilla starts hurting at. */
+export const MOMENTUM_MAX_DROP = 1.75;
 const MOM_RANGE = 6;
 const MOM_SPAN = 2 * MOM_RANGE + 1;
 export function momentumOf (dx: number, dz: number): number {
@@ -1281,6 +1284,7 @@ export class MoveGen {
         // height check already gates it).
         let dy;
         let frac = 0;
+        let rise = 0;
         if (Number.isNaN(supY)) {
             dy = nodeY - y;
         }
@@ -1292,7 +1296,7 @@ export class MoveGen {
             const landTop = (this.specialAt(tx, supY, tz) & SPECIAL_STAIR) !== 0
                 ? supY + 0.5
                 : this.heightAt(tx, supY, tz);
-            const rise = landTop - h0;
+            rise = landTop - h0;
             dy = Math.floor(rise);
             frac = rise - dy;
             if (dy >= 1) {
@@ -1435,9 +1439,19 @@ export class MoveGen {
         cost += this.exclusionAt(tx, nodeY, tz);
         if (cost > 100)
             return;
-        // A support landing carries its flight direction as momentum; a catch
-        // (ladder, water, thin floor, bubble) has no landing tick to re-jump on.
-        if (this.parkourMomentum && landCatch >= 0)
+        // A NARROW support landing carries its flight direction as momentum.
+        // A catch (ladder, water, thin floor, bubble) has no landing tick to
+        // re-jump on, and neither has a landing that hurts: past three blocks
+        // of fall (the 1.25 apex plus the drop) the server answers the damage
+        // with a velocity packet that zeroes the body's horizontal motion on
+        // the landing tick — measured on parkouradv1's fence-to-fence
+        // (3,-3,5), where the next hop then left from rest and fell short. A
+        // full block carries none because it needs none: its lip take-off
+        // (0.94 of credit on the run rows) out-reaches a landing-tick re-jump
+        // (0.3 on J_CHAIN) in every bucket, so a momentum state there is a
+        // second copy of the cell's expansion — 3-5x the visited count on the
+        // arena's route book for no edge the cell lacks.
+        if (this.parkourMomentum && landCatch >= 1 && rise >= -MOMENTUM_MAX_DROP)
             this.pendingMom = momentumOf(t.tx * sx, t.tz * sz);
         if (chainVia >= 0) {
             this.pendingVia = chainVia;
