@@ -126,8 +126,8 @@ at +0.2, prismarine-physics collision). +1 landings are impossible there
 (sentinel row), flat hops keep ~0.86 usable flight and drops most of their
 reach — 2-high tunnel gap-hops and drops off ledges under an overhang, like
 real players. The executor needs no change: it holds jump and the per-tick
-rollout simulates the bonk against the real world. Neos and momentum chains
-remain out of scope — the executor only holds jump+sprint+forward.
+rollout simulates the bonk against the real world. Neos remain out of scope
+— the executor only holds jump+sprint+forward; momentum chains are below.
 
 ## Run length, not "standing" vs "running" (`J_RUN`)
 
@@ -268,6 +268,50 @@ the human line through the first fence cluster and across the stair peaks
 in simulation; four 5-centre hops there still fall 0.7–1.2 blocks short of
 the engine even chained, which is either an engine/vanilla gap or a
 technique not yet modelled (a recorded human run decides).
+
+## Momentum in the search (`allowParkourMomentum`)
+
+Opt-in on top of `allowParkourExtended` (`docs/VelocityInSearch.md` has the
+measurements). Off, everything above is the whole model, byte for byte. On:
+
+- **A search node is `(cell, momentum)`.** A parkour landing on a NARROW
+  support (head, pot, post — `topCatchClass ≥ 1`) that does not hurt (rise
+  ≥ −1.75: the 1.25 apex plus that is the 3-block fall vanilla starts hurting
+  at, and with the damage the server sends the client a velocity packet that
+  zeroes its motion on the landing tick) carries its exact primitive flight
+  direction into the node. From that state every table offset within the
+  chain cone (`CHAIN_MIN_COS`) that the support's own run cannot make is
+  tried on the `J_CHAIN` row from the far-side landing point, less the
+  measured turn loss (`CHAIN_TURN_LOSS`, 0.8 per unit cos at the executor's
+  landing-tick cadence), and pushed as `META_CHAIN` with `via` = the node
+  itself. The compound `momentumChains` edge above is the flag-off model;
+  with the flag on it is this, for chains of any length, with no
+  `CHAIN_CAP`. Momentum states live in a sparse secondary region of the
+  solver arena (`solver.ts slotFor`), so memory follows the landings, not the
+  snapshot. A full block carries no momentum: its lip take-off (next) reaches
+  further than a re-jump in every bucket, and a state there only doubled the
+  cell's expansion — measured 1.1–5× visited on the route book, within 5%
+  narrow-only.
+- **Lip take-offs.** The engine resolves the y axis, which sets `onGround`,
+  before a tick's horizontal move, so a jump input on the first airborne tick
+  still fires (vanilla's late jump): a running body leaves from the overhang
+  limit `half + 0.3` plus a tick phase in `[0, 0.28)`, not from the 0.6 creep
+  point. A jump the creep credit refuses is re-judged from the lip at the
+  median phase (`LIP_PHASE`) against the same run row, bounded by a lip
+  corridor (`mfLip`/`mfLowLip` in the table: the running corridor floored by
+  the later, lower rising arc). Every edge the plain model emits keeps its
+  arc and corridor. This is what plans the arena stair `(0,5)` onto its low
+  step and the post-to-post `(3,−3,5)`. The executor needs nothing new for
+  it — the delayed-jump rollout already fires on that tick; the back-off
+  resamples the phase when a run-in falls short.
+
+What the executor learned flying it, all traced on parkouradv1: sit out the
+landing tick (plus the ping) after a damaging fall, so the next decision sees
+the velocity the server actually left; sneak while caught on a ladder
+mid-flight (the body slides down 0.15 a tick and a catch at the lowest cell
+with the wall on the far side slid out before touching it); a spiral-ladder
+transfer climbs to the ladder's standable top edge first and steps from
+there; and the wall-slide standoff never steers toward air.
 
 ## Slime bounce (`META_BOUNCE`, `via`)
 

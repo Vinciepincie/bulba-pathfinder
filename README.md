@@ -629,6 +629,7 @@ matches upstream until you ask for more):
 | flag | what it buys |
 |---|---|
 | `allowParkourExtended` | the full sprint-jump repertoire (`docs/ExtendedParkour.md`) |
+| `allowParkourMomentum` | needs `allowParkourExtended`; momentum-aware search — a landing on a narrow support carries its speed into the search node, so chained re-jumps of any length plan as states, and running take-offs are credited from the lip (`docs/VelocityInSearch.md`) |
 | `allowSprintHop` | the hopping gait — 7.05 blocks/s against 5.59 sprinting, taken only where a rollout of both gaits down the same path says the hop gets further without losing height |
 | `allowLowCeilingHop` | needs `allowSprintHop`; hop through low headroom instead of round it — 9.68 blocks/s under a 2-block roof |
 
