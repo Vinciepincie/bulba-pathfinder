@@ -56,12 +56,7 @@ export class Movements {
   useBubbleColumns: boolean
   /** Cost per block of bubble-column ride (default 1; true ride is faster). */
   bubbleCost: number
-  /**
-   * Improvement (allowParkourExtended): how far short of the physics limit
-   * a planned jump stays, in blocks (default 0.1). 0 plans frame-tight
-   * jumps — a practised player's course — at the price of more refused
-   * take-offs; the executor's rollout still gates every one.
-   */
+  /** Blocks of jump reach left unused as a buffer for tick timing and lagbacks. 0 = frame-perfect. */
   parkourSafetyMargin: number
 
   dontCreateFlow: boolean
