@@ -388,7 +388,9 @@ translation layer.
 | `--max-drop N` | 4 | `maxDropDown` for both engines |
 | `--countdown S` | 3 | seconds held before "GO" |
 | `--wait-for N` | 0 | hold until N spectators have joined |
-| `--parity` | off | disable extended parkour (upstream-equivalent rules) |
+| `--parity` | off | disable extended parkour and momentum (upstream-equivalent rules) |
+| `--no-momentum` | off | keep extended parkour but turn the momentum-aware search off (`allowParkourMomentum`, `docs/VelocityInSearch.md`) |
+| `--risky` | off | plan frame-tight jumps (`parkourSafetyMargin` 0) — parkouradv1's finish beam needs it |
 | `--attach` | off | use a server that is already running |
 | `--keep` | off | leave the server up after the run |
 | `--debug auto\|off\|always` | `auto` | write a debug bundle for a flagged route |
