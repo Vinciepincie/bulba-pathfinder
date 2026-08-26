@@ -65,7 +65,12 @@ heights one block off (the analyzer reports the support cell; the stand
 node is one above it) — with the right heights the brute force lands it, as
 it lands `(0,5)` and `(−1,4)`. The finish beam `(1,5)` is *not* a course
 block short: from the column's rear edge the run-back gives a consistent
-phase and the beam is landed every run with `--risky`.
+phase and the beam is landed every run with `--risky`. It is, though, the
+one hop outside the default margin, and a run-up block does not move it
+(the run rows saturate; +0.02). The course now has one block at
+`-111,263,135` extending the beam toward the column, so the last hop is a
+`(1,4)` and the whole route plans and arrives at the default margin —
+2/2 live, 17.7 s, first solves 21–72 ms, `--risky` no longer needed.
 
 **Two things the live server taught (executor, all traced tick by tick with
 `PF_EXEC_TRACE`, which now records the velocity and the server's own-entity
