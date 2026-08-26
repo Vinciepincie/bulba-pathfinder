@@ -167,6 +167,22 @@
         137
       ],
       "notes": "defined by in-world !PF signs"
+    },
+    {
+      "id": "basic3",
+      "name": "basic3",
+      "scenario": "mixed",
+      "start": [
+        -90,
+        233,
+        94
+      ],
+      "end": [
+        -144,
+        233,
+        115
+      ],
+      "notes": "defined by in-world !PF signs"
     }
   ]
 }

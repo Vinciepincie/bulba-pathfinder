@@ -2362,6 +2362,62 @@
         "planIdentical": false,
         "bundle": "C:\\Projects\\bulba-pathfinder\\bench\\arena\\.run\\debug\\2026-08-25T20-21-21-439Z-tunnel1-a1"
       }
+    ],
+    "basic3": [
+      {
+        "at": "2026-08-26T19:11:59.410Z",
+        "attempt": 1,
+        "verdict": [
+          "bulba stalled 3.17s at -137.3 231.0 109.3",
+          "bulba-wasm stalled 3.17s at -137.3 231.0 109.3",
+          "bulba-nohop stalled 3.08s at -137.3 231.0 109.3"
+        ],
+        "engines": [
+          {
+            "impl": "bulba-nohop",
+            "outcome": "arrived",
+            "wallMs": 21149,
+            "travelled": 98.8,
+            "replans": 1,
+            "worstStallMs": 3081,
+            "endDistance": 0.1
+          },
+          {
+            "impl": "upstream",
+            "outcome": "arrived",
+            "wallMs": 24697,
+            "travelled": 122.4,
+            "replans": 1,
+            "worstStallMs": 2749,
+            "endDistance": 0.2
+          }
+        ],
+        "planIdentical": false,
+        "stuckAt": [
+          -138,
+          231,
+          109
+        ],
+        "bundle": "C:\\Projects\\bulba-pathfinder\\bench\\arena\\.run\\debug\\2026-08-26T19-10-21-831Z-basic3-a1"
+      },
+      {
+        "at": "2026-08-26T19:25:33.379Z",
+        "attempt": 1,
+        "verdict": [],
+        "engines": [
+          {
+            "impl": "bulba-wasm",
+            "outcome": "arrived",
+            "wallMs": 16124,
+            "travelled": 89.2,
+            "replans": 0,
+            "worstStallMs": 922,
+            "endDistance": 0.1
+          }
+        ],
+        "planIdentical": false,
+        "bundle": "C:\\Projects\\bulba-pathfinder\\bench\\arena\\.run\\debug\\2026-08-26T19-24-49-707Z-basic3-a1"
+      }
     ]
   }
 }
