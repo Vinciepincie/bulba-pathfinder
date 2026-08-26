@@ -24,6 +24,7 @@
 #![allow(static_mut_refs)]
 
 use core::f64::consts::SQRT_2;
+use std::collections::BTreeMap;
 
 // ── LutFlags (must match src/types.ts) ─────────────────────────────────────
 const SAFE: u8 = 1;
@@ -53,6 +54,9 @@ const META_PARKOUR: u8 = 1;
 const META_USEONE: u8 = 2;
 const META_BOUNCE: u8 = 4;
 const META_CHAIN: u8 = 8;
+/// The jump needs a run-up (mirror of moveGen.ts META_RUN): executor
+/// information only, never a search input.
+const META_RUN: u8 = 16;
 
 const CARDINAL: [(i32, i32); 4] = [(-1, 0), (1, 0), (0, -1), (0, 1)];
 const DIAGONAL: [(i32, i32); 4] = [(-1, -1), (-1, 1), (1, -1), (1, 1)];
@@ -463,7 +467,13 @@ struct SolverState {
     meta: Vec<u8>,
     stamp: Vec<u32>,
     closed: Vec<u8>,
-    breaks: Vec<Option<Vec<i32>>>,
+    /// Per-slot toBreak lists (canDig only), SPARSE and cleared per solve. It
+    /// used to be a dense Vec<Option<Vec<i32>>> — 24 bytes per slot, 44 MB
+    /// allocated and zeroed for a 1.6M-cell box whose solve visited 145
+    /// nodes — and was the largest single cost of a first solve (measured
+    /// 45 ms of solve_init on the arena's basic2, of which the search itself
+    /// was 12 ms). Rebuilt from 0 every solve, so no epoch stamp is needed.
+    breaks: BTreeMap<i32, Vec<i32>>,
     /// Slime stand cell per META_BOUNCE node (-1 otherwise); stamped like g.
     vias: Vec<i32>,
     heap: MinHeap,
@@ -536,7 +546,7 @@ impl SolverState {
             meta: Vec::new(),
             stamp: Vec::new(),
             closed: Vec::new(),
-            breaks: Vec::new(),
+            breaks: BTreeMap::new(),
             vias: Vec::new(),
             heap: MinHeap::new(4096),
             n_cells: 0,
@@ -605,7 +615,6 @@ impl SolverState {
         self.meta.resize(need, 0);
         self.stamp.resize(need, 0);
         self.closed.resize(need, 0);
-        self.breaks.resize_with(need, || None);
         self.vias.resize(need, -1);
     }
 
@@ -744,6 +753,25 @@ pub unsafe extern "C" fn dig_labor_ptr() -> *mut u8 {
 #[no_mangle]
 pub unsafe extern "C" fn dig_flags_ptr() -> *mut u8 {
     state().dig_flags.as_mut_ptr()
+}
+
+// ── warm-up ───────────────────────────────────────────────────────────────
+/// Size the arena for `n` cells NOW (worker prewarm), so the first solve of
+/// up to that size skips the allocation. The arena is grow-only, so this is
+/// exactly the work that solve would otherwise do inside the first goal:
+/// measured 8-17 ms of solve_init for 350k-870k-cell boxes on the arena,
+/// with the search itself at 11-38 ms.
+#[no_mangle]
+pub unsafe extern "C" fn arena_reserve(n: u32, momentum: u32) {
+    let st = state();
+    let n = n as usize;
+    let need = if momentum != 0 { n + momentum_reserve(n) } else { n };
+    if st.g.len() < need {
+        st.grow_slots(need);
+    }
+    if momentum != 0 && st.mom_head.len() < n {
+        st.mom_head.resize(n, -1);
+    }
 }
 
 // ── solver impl ───────────────────────────────────────────────────────────
@@ -1680,6 +1708,14 @@ impl SolverState {
         };
         let mut feasible = fn_needed <= usable;
         let mut needs_running = row >= 1;
+        // Would the standing row fly it? META_RUN for the executor only
+        // (mirror of moveGen.ts runNeeded).
+        let stand_base = if low { 70 } else { 0 };
+        let mut usable_stand = self.ext_reach[stand_base + bucket];
+        if frac > 0.0 {
+            usable_stand = usable_stand + (self.ext_reach[stand_base + bucket - 1] - usable_stand) * frac;
+        }
+        let run_needed = fn_needed > usable_stand + self.cfg.margin_credit;
         let mut chained = false;
         let mut lip_jump = false;
         if chain_via < 0 {
@@ -1775,14 +1811,15 @@ impl SolverState {
         if self.momentum && land_catch >= 1 && rise >= -MOMENTUM_MAX_DROP {
             self.pending_mom = momentum_of(e.tx * sx, e.tz * sz);
         }
+        let run_bit = if run_needed || lip_jump { META_RUN } else { 0 };
         if chain_via >= 0 {
             self.pending_via = chain_via;
-            self.push_out(tx, node_y, tz, chain_base + cost, META_PARKOUR | META_CHAIN);
+            self.push_out(tx, node_y, tz, chain_base + cost, META_PARKOUR | META_CHAIN | META_RUN);
         } else if chained {
             self.pending_via = self.cell_index(x, y, z);
-            self.push_out(tx, node_y, tz, cost, META_PARKOUR | META_CHAIN);
+            self.push_out(tx, node_y, tz, cost, META_PARKOUR | META_CHAIN | META_RUN);
         } else {
-            self.push_out(tx, node_y, tz, cost, META_PARKOUR);
+            self.push_out(tx, node_y, tz, cost, META_PARKOUR | run_bit);
         }
     }
 
@@ -2233,10 +2270,12 @@ impl SolverState {
                 self.meta[ni] = self.out.meta[i];
                 self.vias[ni] = self.out.via[i];
                 match self.out.breaks[i].take() {
-                    Some(b) => self.breaks[ni] = Some(b),
+                    Some(b) => {
+                        self.breaks.insert(n_idx, b);
+                    }
                     None => {
-                        if self.breaks[ni].is_some() {
-                            self.breaks[ni] = None;
+                        if !self.breaks.is_empty() {
+                            self.breaks.remove(&n_idx);
                         }
                     }
                 }
@@ -2302,7 +2341,7 @@ impl SolverState {
                 out.extend_from_slice(&self.decode_y(via).to_le_bytes());
                 out.extend_from_slice(&self.decode_z(via).to_le_bytes());
             }
-            match &self.breaks[ni] {
+            match self.breaks.get(&n) {
                 Some(b) => {
                     out.extend_from_slice(&(b.len() as u16).to_le_bytes());
                     for &cell in b {
@@ -2483,6 +2522,7 @@ pub unsafe extern "C" fn solve_init(params: *const u8) -> i32 {
     let momentum = ext_on && st.cfg.allow_parkour_momentum;
     st.arena_prepare(n, momentum);
     st.heap.clear();
+    st.breaks.clear();
     st.chunk_set.fill(0);
     st.chunk_list.clear();
     st.visited = 0;
@@ -2506,9 +2546,6 @@ pub unsafe extern "C" fn solve_init(params: *const u8) -> i32 {
         st.parent[ui] = -1;
         st.meta[ui] = 0;
         st.vias[ui] = -1;
-        if st.breaks[ui].is_some() {
-            st.breaks[ui] = None;
-        }
         st.heap.push(s_idx, h0);
         st.open_count = 1;
     } else {

@@ -109,6 +109,22 @@ const WALK_STEP_REACH = 1.8
 const SLIDE_PROBE = 0.35
 
 /**
+ * Sideways probe for a body FLUSH with a wall it is walking along. Slightly
+ * more than SPRINT_WALL_MARGIN plus playerCollides' own inset, so the probe
+ * fires on exactly the contact the sprint gate refuses.
+ */
+const SIDE_TOUCH = 0.06
+
+/**
+ * Consecutive airborne ticks before "not on the ground" is believed. Both
+ * mineflayer (after any server position packet) and prismarine-physics (on a
+ * post's edge) report onGround=false for a single tick while the body is
+ * standing still; a jump or a fall shows in the velocity or the height on
+ * that same tick, a flicker does not.
+ */
+const AIRBORNE_TICKS = 2
+
+/**
  * Steering bias AWAY from a wall we are sliding along, as a fraction of the
  * along-wall component. Sliding with a heading exactly parallel is not enough:
  * whatever momentum the bot still carries into the wall gets clamped, and a
@@ -127,8 +143,33 @@ const WALL_STANDOFF = 0.25
  * wall-slide turns a one-block step-up into an unreachable node.
  */
 const STEP_UP_MIN = 0.1
-/** Ticks of stepping back for a run-in before a parkour jump no gate authorises from the lip (see the creep branch). */
-const RUN_BACK_TICKS = 24
+/**
+ * Run-up line-up (the creep branch). A jump the planner flagged META_RUN is
+ * given RUN_UP_ATTEMPTS lines-ups (any other parkour node one); each backs
+ * off for at most RUN_UP_MAX_TICKS to RUN_UP_REAR blocks behind the take-off
+ * cell's centre (a post: its own rear lip), then sprints in for at most
+ * RUN_UP_MAX_TICKS more while the gates look for the take-off tick.
+ */
+const RUN_UP_ATTEMPTS = 2
+const RUN_UP_MAX_TICKS = 12
+const RUN_UP_REAR = 1.5
+
+/**
+ * The creep sneaks only this close to its cap and WALKS the rest: sneaking
+ * is 1.3 b/s against 4.3, and the edge guard is only needed near the lip. A
+ * walking body a third of a block short of the cap cannot leave the block in
+ * the one tick before sneak engages (0.22 per tick at most, the cap is 0.1
+ * past the edge and the box half-width 0.3 beyond that).
+ */
+const CREEP_SNEAK_ZONE = 0.35
+
+/**
+ * How far inside a narrow support's physical overhang limit (half-width +
+ * 0.30) the executor keeps the body's centre when creeping to, or backing to,
+ * its lip. A sneaking tick moves at most ~0.05, so one tick without the
+ * edge-guard (a server position packet clears onGround) cannot leave it.
+ */
+const NARROW_LIP_SAFETY = 0.08
 
 /** Ground distance one sprinting tick covers, the sprint gate's look-ahead. */
 const SPRINT_TICK = 0.3
@@ -306,12 +347,21 @@ export function createPathfinder (options: PathfinderOptions = {}) {
     let chainNode: Move | null = null
     let chainFired = false
     /** Run-up back-off, one attempt per parkour node (see the creep branch). */
-    let runBackNode: Move | null = null
-    let runBackTicks = 0
+    /** Run-up line-up state (see the creep branch): node, attempts used, phase (0 idle, 1 backing, 2 sprinting in), ticks in phase. */
+    let runUpNode: Move | null = null
+    let runUpAttempts = 0
+    let runUpPhase = 0
+    let runUpTicks = 0
+    let runUpLastPos: Vec3 | null = null
+    /** The parkour node `creepCell` was latched for. */
+    let creepNode: Move | null = null
     /** Highest point of the current flight, for the fall-damage settle (FALL_DAMAGE_DISTANCE). */
     let airPeakY = -Infinity
     let wasAirborne = false
     let landSettle = 0
+    /** Consecutive ticks with onGround=false (see AIRBORNE_TICKS). */
+    let airTicks = 0
+    let prevTickY = 0
     /**
      * Decision trace (PF_EXEC_TRACE=<file prefix>): which branch of the tick
      * loop drove this tick. Written by a second physicsTick listener so every
@@ -382,11 +432,39 @@ export function createPathfinder (options: PathfinderOptions = {}) {
 
     // ── async solve state ────────────────────────────────────────────────
     let solveGeneration = 0
+    // PF_SOLVE_TIMING=1: per-solve latency breakdown on stdout (snapshot
+    // build, engine time, wall from dispatch to path install, ticks to the
+    // first controls). Diagnostic only; costs nothing when unset.
+    const solveTimingOn = process.env.PF_SOLVE_TIMING === '1'
+    let solveDispatchedAt = 0
+    let goalSetAt = 0
+    let firstDriveLogged = false
+    /**
+     * Eager start (improvement): a goal starts solving the moment it is set,
+     * and the first path drives the bot the moment it lands, instead of each
+     * waiting for the next physicsTick. mineflayer runs the simulation and
+     * THEN emits physicsTick, so controls written between ticks are used by
+     * the very next simulation — a path installed between ticks that waits
+     * for the tick handler loses a whole tick, and setGoal waiting for a tick
+     * to dispatch loses up to another. Upstream computes in-tick and walks in
+     * the same tick; measured on the arena, our first move trailed upstream's
+     * by 20-150 ms on every route despite faster solves. PF_NO_EAGER=1
+     * restores the tick-aligned behaviour for A/B runs.
+     */
+    const eagerStart = process.env.PF_NO_EAGER !== '1'
+    /** True while monitorMovement is running (reentrancy guard for the eager drive). */
+    let inTick = false
+    /** Wall time of the last tick handler, for the exec trace. */
+    let lastTickMs = 0
+    /** Diagonal squeeze on a refused flat step, before the jump gates (see the squeeze block). PF_NO_EARLY_SQUEEZE=1 for A/B. */
+    const earlySqueeze = process.env.PF_NO_EARLY_SQUEEZE !== '1'
     let activeSolveCancel: (() => void) | null = null
     let activeSolveGeneration = -1
     let mainSolver: Solver | null = null
     let growFactor = 1
     let growAttempts = 0
+    /** When the current growth sequence's first solve was dispatched. */
+    let growStartedAt = 0
     let lastTouchedChunks: Set<string> | null = null
 
     // ── snapshot cache ───────────────────────────────────────────────────
@@ -754,8 +832,12 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       if (generation !== solveGeneration) return // stale (goal changed etc.)
 
       // Transparent snapshot growth: a boundary-limited noPath is retried
-      // with a larger box before anything is emitted.
-      if (final && raw.status === 'noPath' && raw.boundaryLimited && growAttempts < 5) {
+      // with a larger box before anything is emitted — within ONE think
+      // budget for the whole sequence. A goal that is genuinely cut off
+      // (the arena's parkouradv1 after a fall to the floor) used to grow
+      // five times to the 8M-cell cap, ~1.5 s of exhaustive search each.
+      if (final && raw.status === 'noPath' && raw.boundaryLimited && growAttempts < 5 &&
+          performance.now() - growStartedAt < (pf.thinkTimeout as number)) {
         const snap = cachedSnapshot
         if (snap && snap.cellCount < opts.maxSnapshotCells) {
           growAttempts++
@@ -801,9 +883,16 @@ export function createPathfinder (options: PathfinderOptions = {}) {
 
       const results = toResult(raw, contextFromRaw(raw))
       lastTouchedChunks = results.context?.visitedChunks ?? null
+      const postT0 = solveTimingOn ? performance.now() : 0
+      if (!inTick) physics.beginTick?.() // between ticks: never reuse the last tick's block cache
       results.path = postProcessPath(results.path)
       pathFromPlayer(results.path)
+      if (solveTimingOn) {
+        const now = performance.now()
+        console.log(`[pf-timing] result ${raw.status} engine=${raw.engine ?? 'js'} final=${final} engineMs=${raw.time.toFixed(1)} visited=${raw.visitedNodes} nodes=${results.path.length} postMs=${(now - postT0).toFixed(2)} wallSinceDispatch=${(now - solveDispatchedAt).toFixed(1)} sinceGoal=${(now - goalSetAt).toFixed(1)}`)
+      }
       bot.emit('path_update' as never, results as never)
+      const wasEmpty = path.length === 0
       path = results.path
       if (final) {
         pathUpdated = true
@@ -824,6 +913,15 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       // node was last genuinely reached", it is what bounds how long server
       // corrections may excuse a lack of progress, and a path_update is not
       // an arrival.
+      //
+      // The first path of a goal drives NOW (see eagerStart). Only when it
+      // arrived between ticks — inside the tick the handler runs anyway — and
+      // only for the empty→path transition, so a streamed partial that
+      // replaces a path the bot is already walking changes nothing about
+      // when controls are written.
+      if (eagerStart && wasEmpty && path.length > 0 && !inTick && stateGoal !== null) {
+        monitorMovement()
+      }
     }
 
     /** Has the bot left the block the last solve was dispatched from? */
@@ -849,6 +947,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       const generation = ++solveGeneration
       const startPos = bot.entity.position
       const start = computeStartMove(startPos)
+      if (growAttempts === 0) growStartedAt = performance.now()
 
       if (stateMovements.allowEntityDetection) {
         stateMovements.clearCollisionIndex()
@@ -868,8 +967,15 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         !workerHost.unavailable
 
       const needStates = (descriptor !== null && goalNeedsRaycast(descriptor)) || stateMovements.canDig
+      const snapT0 = solveTimingOn ? performance.now() : 0
+      const hadSnapshot = cachedSnapshot !== null && !snapshotStale
       const snapshot = ensureSnapshot(startPos, descriptor, needStates)
       bakeEntityIndex(snapshot, stateMovements)
+      if (solveTimingOn) {
+        solveDispatchedAt = performance.now()
+        const m = snapshot.meta
+        console.log(`[pf-timing] dispatch gen=${generation} snapshot=${hadSnapshot && cachedSnapshot === snapshot ? 'cached' : 'built'} ${m.w}x${m.h}x${m.l}=${snapshot.cellCount} cells snapMs=${(solveDispatchedAt - snapT0).toFixed(1)} sinceGoal=${(solveDispatchedAt - goalSetAt).toFixed(1)}`)
+      }
       const digData = stateMovements.canDig ? getDigDataCached(stateMovements) : null
 
       if (canUseWorker && descriptor) {
@@ -1379,8 +1485,13 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       bounceRisen = false
       chainNode = null
       chainFired = false
-      runBackNode = null
-      runBackTicks = 0
+      runUpNode = null
+      runUpAttempts = 0
+      runUpPhase = 0
+      runUpTicks = 0
+      runUpLastPos = null
+      creepNode = null
+      creepCell = null
       stopDiggingIfNeeded()
       placing = false
       placingBlock = null
@@ -1422,10 +1533,21 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       stateGoal = goal
       dynamicGoal = dynamic
       goalSetTime = performance.now()
+      goalSetAt = goalSetTime
+      firstDriveLogged = false
       growFactor = 1
       growAttempts = 0
       bot.emit('goal_updated' as never, goal as never, dynamic as never)
       resetPath('goal_updated')
+      // Dispatch the solve now rather than on the next tick (eagerStart). The
+      // tick handler's own guards (a goal already at its end, a solve already
+      // in flight) apply unchanged; a bot whose entity is not in the world
+      // yet keeps the tick-aligned path.
+      if (eagerStart && stateGoal !== null && stateMovements !== undefined && !stopPathing &&
+          bot.entity?.position !== undefined && Number.isFinite(bot.entity.position.x) &&
+          !solveInFlight() && !stateGoal.isEnd(bot.entity.position.floored())) {
+        startSolve()
+      }
     }
 
     pf.setMovements = (movements: Movements) => {
@@ -1440,7 +1562,21 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       // result is cached by profile fingerprint, so this is one-time per
       // profile and a no-op on every later call; failures are not fatal, the
       // solve would rebuild it anyway.
-      try { getLut(bot, movements) } catch { /* the solve path will retry */ }
+      try {
+        const lut = getLut(bot, movements)
+        // Warm buildSnapshot's loops while the bot is idle: a cold first
+        // build ran 1.6-3x slower than a warm one (V8 tiers the row loops
+        // up on use), and the first goal's build is the one that counts.
+        // Three small boxes around the body; unloaded chunks cost nothing.
+        const p = bot.entity?.position
+        if (p !== undefined && Number.isFinite(p.x) && Number.isFinite(p.y)) {
+          const box: Box = {
+            x0: Math.floor(p.x) - 12, y0: Math.floor(p.y) - 8, z0: Math.floor(p.z) - 12,
+            x1: Math.floor(p.x) + 12, y1: Math.floor(p.y) + 8, z1: Math.floor(p.z) + 12
+          }
+          for (let i = 0; i < 3; i++) buildSnapshot(bot, lut, box, false, nextSnapshotGeneration())
+        }
+      } catch { /* the solve path will retry */ }
       resetPath('movements_updated')
     }
 
@@ -1675,6 +1811,22 @@ export function createPathfinder (options: PathfinderOptions = {}) {
     // ── the tick loop (upstream monitorMovement port) ────────────────────
 
     function monitorMovement (): void {
+      // Reentrancy guard: the eager first drive (handleDriveResult) may call
+      // this between ticks, and a path_update listener may set a new goal
+      // from inside it — never run two tick bodies nested.
+      if (inTick) return
+      inTick = true
+      const t0 = performance.now()
+      try {
+        physics.beginTick?.()
+        monitorMovementInner()
+      } finally {
+        inTick = false
+        lastTickMs = performance.now() - t0
+      }
+    }
+
+    function monitorMovementInner (): void {
       // Improvement: a requested stop takes effect within one tick, even
       // mid-edge — controls are always released.
       if (stopPathing) {
@@ -1808,6 +1960,10 @@ export function createPathfinder (options: PathfinderOptions = {}) {
 
       let nextPoint: Move = path[0]
       const p = bot.entity.position
+      if (solveTimingOn && !firstDriveLogged) {
+        firstDriveLogged = true
+        console.log(`[pf-timing] first drive tick sinceGoal=${(performance.now() - goalSetAt).toFixed(1)} inTick=${inTick}`)
+      }
 
       // Handle digging (canDig solves only): stand still and hand the block
       // to the interaction table, which equips, aims, guards and verifies.
@@ -1916,6 +2072,14 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       // only ever run once (two nodes inside one 0.7-wide box and within a
       // block of each other would have to be the same cell).
       const arriveDy = hopHold ? HOP_ARRIVE_DY : 1
+      // Landed, by any of the means the planner counts as a landing (see
+      // PhysicsSim.caught): read once for the arrival loop.
+      const caughtNow = (() => {
+        const ent = bot.entity as { onGround?: boolean, isInWater?: boolean }
+        if (ent.onGround === true || ent.isInWater === true) return true
+        const feet = bot.blockAt(p) as BlockLike | null
+        return feet !== null && (feet.type === ladderId || feet.type === vineId)
+      })()
       for (;;) {
         // Improvement: never finish a path mid-air. The arrival box has no
         // ground requirement, so a goal satisfied at jump apex would cut
@@ -2016,6 +2180,25 @@ export function createPathfinder (options: PathfinderOptions = {}) {
             (dx * cx + dz * cz) / clen < 0 &&
             Math.hypot(dx, dz) <= CUT_RETIRE
         }
+        // A parkour landing the body came down PAST (improvement). The
+        // arrival box is 0.35 wide; a running jump lands up to a block
+        // beyond its node, which is exactly what `landsThere` authorised.
+        // Outside the box the node is not retired, so the bot turns round,
+        // walks back into it, and takes the next jump from rest: on the
+        // arena's basic1 every 2-block hop of a chain of four cost 8 ticks
+        // from landing to the next take-off instead of 2. Landed (caught),
+        // within that block, and beyond the node along the leg to the next
+        // one: the landing happened. Not for a momentum-chain stone, whose
+        // re-jump is pressed from ON the stone.
+        if (!passed && !swimming && path.length > 1 && caughtNow && Math.abs(dy) < 1 &&
+            (nextPoint as { parkour?: boolean }).parkour === true &&
+            (path[1] as Move).chain !== true &&
+            nextPoint.toBreak.length === 0 && nextPoint.toPlace.length === 0 &&
+            Math.hypot(dx, dz) <= 1.0) {
+          const lx = path[1].x - nextPoint.x
+          const lz = path[1].z - nextPoint.z
+          passed = (p.x - nextPoint.x) * lx + (p.z - nextPoint.z) * lz > 0
+        }
         if (!passed && !(Math.abs(dx) <= 0.35 && Math.abs(dz) <= 0.35 && Math.abs(dy) < arriveDy)) break
 
         // arrived at next point
@@ -2050,8 +2233,23 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       // take away (FALL_DAMAGE_DISTANCE): no take-off decision on that tick.
       // Standing still for a tick costs nothing on a full block, and on a
       // post it is the only thing that does not walk off it.
+      //
+      // `airborne` is the tick's believed flight state (improvement): a lone
+      // onGround=false with no upward velocity and no height change is a
+      // flicker, not a flight. Traced on parkouradv1: the body landed on a
+      // pot, onGround blinked off for one tick at 258.50 with vel.y −0.078,
+      // the in-flight branch held forward+sprint for that tick, and the body
+      // walked off the pot's 0.375 top before any gate could refuse it.
+      let airborne = false
       {
         const grounded = (bot.entity as { onGround?: boolean }).onGround === true
+        if (!grounded && !swimming) {
+          airTicks++
+          airborne = airTicks >= AIRBORNE_TICKS || bot.entity.velocity.y > 0.05 || p.y < prevTickY - 0.02
+        } else {
+          airTicks = 0
+        }
+        prevTickY = p.y
         if (!grounded && !swimming) {
           wasAirborne = true
           if (p.y > airPeakY) airPeakY = p.y
@@ -2341,9 +2539,25 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       // climb into a staircase of 1-block sidesteps. Measured on the arena's
       // climb2: a 0.9-block x zig-zag on every step, 127 blocks walked
       // against upstream's 105 on the same 62-node plan, and 4.4 s lost.
+      //
+      // One exception to "only once wedged" (improvement, earlySqueeze): a
+      // FLAT diagonal walk step whose straight line the physics already
+      // refuses, with exactly one corner open. Left to the gate cascade the
+      // jump gates take it — a 12-tick arc for a 5-tick step — and the arc
+      // overshoots the node, so the bot then turns round and walks back to
+      // collect it, and takes the next jump from rest. Traced on the arena's
+      // basic3 (-94,233,95 → -95,233,94, corner -95,233,95 solid): 22 ticks
+      // for one block. A step UP is left to the jump gates as before; the
+      // staircase wobble that ruled out pre-emptive waypoints came from
+      // steps, and a flat squeeze the physics refuses head-on has no
+      // straight alternative to wobble away from.
       let squeezed = false
-      if (wedged && (nextPoint as { parkour?: boolean }).parkour !== true &&
-          nextPoint.toBreak.length === 0 && nextPoint.toPlace.length === 0) {
+      const walkNode = (nextPoint as { parkour?: boolean }).parkour !== true &&
+        nextPoint.toBreak.length === 0 && nextPoint.toPlace.length === 0
+      const flatDiagonal = walkNode && !swimming && !wedged && earlySqueeze && Math.abs(dy) <= 0.1 &&
+        Math.abs(Math.floor(nextPoint.x) - Math.floor(p.x)) === 1 &&
+        Math.abs(Math.floor(nextPoint.z) - Math.floor(p.z)) === 1
+      if ((wedged && walkNode) || flatDiagonal) {
         const bx = Math.floor(p.x)
         const by = Math.floor(p.y + 0.001)
         const bz = Math.floor(p.z)
@@ -2353,7 +2567,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
           const yTest = Math.max(by, Math.floor(nextPoint.y + 0.001))
           const openA = !geometry.playerCollides(bot, tx + 0.5, yTest, bz + 0.5)
           const openB = !geometry.playerCollides(bot, bx + 0.5, yTest, tz + 0.5)
-          if (openA !== openB) {
+          if (openA !== openB && (wedged || !physics.canStraightLine(path, false))) {
             const wx = openA ? tx : bx
             const wz = openA ? bz : tz
             if (geometry.isStandable(bot, new Vec3(wx, by, wz))) {
@@ -2416,6 +2630,35 @@ export function createPathfinder (options: PathfinderOptions = {}) {
               break
             }
           }
+        }
+      }
+
+      // Side-wall standoff (improvement). A body FLUSH with a wall it is
+      // walking ALONG cannot sprint — the gate below refuses it, and rightly:
+      // the server refuses those positions — and a heading at a node on the
+      // same line never peels it off, because the node is 0.2 from the wall
+      // and the heading's sideways component is a fraction of that. The
+      // wall-slide further down only fires on a wall AHEAD. Traced on the
+      // arena's tunnel1: the turn into a 2-high corridor left the body
+      // against one wall and it walked 57 ticks of the corridor unsprinted;
+      // climb2 the same on its landings. Steer away by the same standoff the
+      // slide uses, on the chord being walked (a corner cut included), and
+      // only where the ground continues that way. Before the sprint gate, so
+      // its one-tick look-ahead probes the heading actually taken.
+      if (!climbing && !swimming && (nextPoint as { parkour?: boolean }).parkour !== true &&
+          dy <= STEP_UP_MIN && Math.hypot(dx, dz) > 0.15) {
+        const floorAway = (ox: number, oz: number): boolean =>
+          geometry.playerCollides(bot, p.x + ox, p.y - 0.55, p.z + oz)
+        const negX = geometry.playerCollides(bot, p.x - SIDE_TOUCH, p.y, p.z)
+        const posX = geometry.playerCollides(bot, p.x + SIDE_TOUCH, p.y, p.z)
+        const negZ = geometry.playerCollides(bot, p.x, p.y, p.z - SIDE_TOUCH)
+        const posZ = geometry.playerCollides(bot, p.x, p.y, p.z + SIDE_TOUCH)
+        if (negX !== posX && Math.abs(dz) >= Math.abs(dx)) {
+          const away = negX ? 1 : -1
+          if (floorAway(away * 0.3, 0)) dx += away * Math.abs(dz) * WALL_STANDOFF
+        } else if (negZ !== posZ && Math.abs(dx) >= Math.abs(dz)) {
+          const away = negZ ? 1 : -1
+          if (floorAway(0, away * 0.3)) dz += away * Math.abs(dx) * WALL_STANDOFF
         }
       }
 
@@ -2547,6 +2790,11 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       bot.look(Math.atan2(-dx, -dz), 0)
       bot.setControlState('forward', true)
       bot.setControlState('jump', false)
+      // A flat walking step (no rise to jump for): the angled-walk branch
+      // below may steer it round a clipped corner instead of jumping it.
+      const flatWalkStep = walkNode && !swimming && !climbing && dy <= STEP_UP_MIN &&
+        Math.hypot(nodeDx, nodeDz) <= WALK_STEP_REACH
+      let walkBias: number | null = null
       // Sneak is only ever engaged by the corner-creep branch below; every
       // other branch (including the jump itself) must take off un-sneaked.
       bot.setControlState('sneak', false)
@@ -2609,6 +2857,16 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         bot.setControlState('jump', hopHold && (bot.entity as { onGround?: boolean }).onGround === true)
         bot.setControlState('sprint', true)
         execBranch = hopHold ? 'hop' : 'sprint'
+      } else if (flatWalkStep && (walkBias = physics.bestWalkHeading(path, maySprint)) !== null) {
+        // Angled walk (improvement): a flat step whose straight line grinds
+        // on a corner is WALKED round it, before the jump gates get it. See
+        // PhysicsSim.bestWalkHeading; the offset is re-solved every tick, so
+        // the moment the straight line works again the branch above wins.
+        hopHold = false
+        bot.look(Math.atan2(-nodeDx, -nodeDz) + walkBias, 0)
+        bot.setControlState('jump', false)
+        bot.setControlState('sprint', maySprint)
+        execBranch = 'walk-angled'
       } else if (maySprint && physics.canSprintJump(path)) {
         hopHold = false
         bot.setControlState('jump', true)
@@ -2635,8 +2893,24 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         // walking off the block physically impossible, so the overhang
         // stance is safe; the jump fires from another branch with sneak off.
         let creep = false
-        if ((nextPoint as { parkour?: boolean }).parkour === true &&
-            (bot.entity as { onGround?: boolean }).onGround === true) {
+        // Take-off geometry, shared by the creep and the run-up below: the
+        // support's half-width class, the creep cap along the flight line,
+        // and how far along that line the body already is (from the cell the
+        // approach started in). takeoffCap stays 0 when there is none.
+        let takeoffHalf = 0.5
+        let takeoffCap = 0
+        let takeoffProj = 0
+        /** Body offset from the take-off cell centre, and the per-axis limit a narrow support allows. */
+        let takeoffPx = 0
+        let takeoffPz = 0
+        let takeoffLip = Infinity
+        const parkourNode = (nextPoint as { parkour?: boolean }).parkour === true
+        const grounded = (bot.entity as { onGround?: boolean }).onGround === true
+        if (creepNode !== nextPoint) {
+          creepNode = nextPoint
+          creepCell = null
+        }
+        if (parkourNode && grounded) {
           const len = Math.sqrt(dx * dx + dz * dz)
           if (len > 0.01) {
             // Measured against the cell the creep STARTED in, not against
@@ -2663,18 +2937,51 @@ export function createPathfinder (options: PathfinderOptions = {}) {
                 break
               }
             }
-            const sCap = Math.min(TAKEOFF_STAND, half + TAKEOFF_NARROW_MARGIN) * len / Math.max(Math.abs(dx), Math.abs(dz))
-            creep = (px * dx + pz * dz) / len < sCap
+            takeoffHalf = half
+            // Never past the support's PHYSICAL limit less a margin. The
+            // planner's lip credit (TAKEOFF_NARROW_MARGIN, 0.28) is two
+            // centimetres inside the 0.30 the hitbox can overhang — and a
+            // fence post's is past it — which is one server position packet
+            // from a fall: a packet clears onGround, the sneak edge-guard
+            // needs onGround, and the unguarded tick walks off. Traced on
+            // parkouradv1 (both a head and a post). The margin is more than
+            // a sneaking tick moves, so a single unguarded tick stays on.
+            const physicalLip = half + 0.3 - NARROW_LIP_SAFETY
+            takeoffCap = Math.min(TAKEOFF_STAND, half + TAKEOFF_NARROW_MARGIN, physicalLip) * len / Math.max(Math.abs(dx), Math.abs(dz))
+            takeoffProj = (px * dx + pz * dz) / len
+            takeoffPx = px
+            takeoffPz = pz
+            creep = takeoffProj < takeoffCap
+            // On a narrow support the limit is PER AXIS: the projection on a
+            // mostly-z flight line read 0.29 while the body's x offset was
+            // already 0.56 — past the head's 0.55 of support (parkouradv1);
+            // the same for the back-off, which fell off the far side.
+            if (half < 0.5) {
+              takeoffLip = physicalLip
+              if (Math.abs(px) >= physicalLip || Math.abs(pz) >= physicalLip) creep = false
+            }
           }
         }
-        if (!creep) creepCell = null
+        // Sneak only near the cap (CREEP_SNEAK_ZONE); walk the rest of the
+        // way — on a full block. A narrow support (head, pot, post) is
+        // crossed entirely under sneak: its cap is under half a block from
+        // its centre, and a walking tick there is the difference between
+        // standing on it and falling off it (traced on parkouradv1).
+        const narrowSupport = takeoffHalf < 0.5
+        const creepSneak = creep && (narrowSupport || takeoffProj >= takeoffCap - CREEP_SNEAK_ZONE)
+        // Lip brake: a body at the lip with speed slides 2.2 times its
+        // velocity before friction stops it — off the block, from a sprint.
+        // Sneaking there costs nothing and the edge guard makes leaving the
+        // block impossible; the jump itself fires from another branch with
+        // sneak off.
+        const atLip = parkourNode && grounded && takeoffCap > 0 && takeoffProj >= takeoffCap - 0.5
         // A body already in the air keeps flying the heading it took off on.
         // Whatever the gates think from here, releasing forward mid-flight
         // throws away the air control the jump was approved with and lands
         // the bot short of a node the planner routed through — and there is
         // nothing else this branch could usefully do about a bot that is not
         // touching the ground.
-        const inFlight = (bot.entity as { onGround?: boolean }).onGround !== true && !swimming
+        const inFlight = airborne
         // Caught on a ladder or vine mid-flight (the extended repertoire's
         // gap-jump into a climbable): a body on a climbable slides DOWN at
         // 0.15 a tick until it presses into the wall, and a catch planned at
@@ -2713,39 +3020,95 @@ export function createPathfinder (options: PathfinderOptions = {}) {
           dy > STEP_UP_MIN && (nextPoint as { parkour?: boolean }).parkour !== true &&
           physics.canNudge({ back: true }, 3)
 
-        // Run-up back-off (improvement): a parkour jump no gate authorises
+        // Run-up line-up (improvement): a parkour jump no gate authorises
         // from where the body stands is flown the way a player flies it —
         // from the REAR of the support, sprinting across it and jumping at
         // the lip (the planner's run-length envelope, parkourEnvelope.ts
         // J_RUN: even 0.4 blocks of run adds half a block of flight, a post
-        // gives 0.8, a full block 1.4). So before creeping forward to jump
-        // from rest, back off to the rear edge — one attempt per node, only
-        // while the physics says each step back is safe (the rollout stops
-        // at the edge) — and let the ordinary gates re-decide every tick:
-        // the delayed-jump rollout (canStraightLine → canSprintJump(path, i))
-        // authorises the sprint-in as soon as it fits. If it never does, the
-        // creep resumes and the futility timer has the last word.
+        // gives 0.8, a full block 1.4). The planner says which jumps NEED
+        // that (Move.run, META_RUN: the standing row cannot fly them); a jump
+        // from rest at the corner can never make one of those, and creeping
+        // there is how the arena's basic3 stood 2.5-3.2 s in front of a (4,4)
+        // diagonal until the futility timer replanned. So: back off to the
+        // rear of the run (a post: its rear lip, under sneak), then sprint
+        // in while the ordinary gates look for the take-off tick — the
+        // delayed-jump rollout (canStraightLine → canSprintJump(path, i))
+        // takes over the moment a jump within its horizon lands, and this
+        // code is not reached again. A line-up that reaches the lip without
+        // one is over; run-flagged nodes get three, any other parkour node
+        // one (the old single run-back), and after that the creep resumes
+        // and the futility timer has the last word.
+        //
+        // The old run-back was armed ONCE per node, at whatever tick the node
+        // became path[0] — usually the landing of the previous jump, where a
+        // step back is refused (the body is still settling) or wasted (the
+        // body is not yet in the take-off cell) — and then never again.
         let runBack = false
-        if (!inFlight && !climbing && !swimming &&
-            (nextPoint as { parkour?: boolean }).parkour === true &&
-            (bot.entity as { onGround?: boolean }).onGround === true) {
-          if (runBackNode !== nextPoint) {
-            runBackNode = nextPoint
-            runBackTicks = physics.canNudge({ back: true }, 3) ? RUN_BACK_TICKS : 0
+        let runIn = false
+        let runSneak = false
+        if (!inFlight && !climbing && !swimming && parkourNode && grounded && takeoffCap > 0) {
+          if (runUpNode !== nextPoint) {
+            runUpNode = nextPoint
+            runUpAttempts = 0
+            runUpPhase = 0
+            runUpTicks = 0
+            runUpLastPos = null
           }
-          if (runBackTicks > 0) {
-            runBackTicks--
-            runBack = physics.canNudge({ back: true }, 2)
-            if (!runBack) runBackTicks = 0
+          // A narrow support gets ONE line-up and no sprint-in phase: its
+          // run is the support itself (0.8 on a post), the delayed-jump
+          // gates cover that from the rear lip, and a forward press there
+          // is a fall. A full block gets RUN_UP_ATTEMPTS for a run-flagged
+          // node, one otherwise (the old single run-back).
+          const narrow = narrowSupport
+          const maxAttempts = narrow ? 1 : (nextPoint as Move).run ? RUN_UP_ATTEMPTS : 1
+          if (runUpPhase === 0 && runUpAttempts < maxAttempts) {
+            runUpAttempts++
+            runUpPhase = 1
+            runUpTicks = 0
+            runUpLastPos = null
+          }
+          if (runUpPhase === 1) {
+            // Backing: to the rear point, or as far as the physics says a
+            // step back is safe, or until the body stops moving (a post's
+            // edge guard, a wall).
+            const rear = narrow ? -(takeoffHalf + 0.3 - NARROW_LIP_SAFETY) : -RUN_UP_REAR
+            // A sneaking body moves ~0.06 a tick, a walking one 0.2: the
+            // stall test is sized to the gait, or a narrow back-off ends
+            // after two ticks and leaves half the run on the table.
+            const stalled = runUpLastPos !== null && runUpTicks >= 2 &&
+              p.distanceTo(runUpLastPos) < (narrow ? 0.02 : WEDGE_MOVE)
+            runUpLastPos = p.clone()
+            const axisOut = narrow && (Math.abs(takeoffPx) >= takeoffLip || Math.abs(takeoffPz) >= takeoffLip)
+            if (runUpTicks < RUN_UP_MAX_TICKS && takeoffProj > rear && !stalled && !axisOut &&
+                (narrow || physics.canNudge({ back: true }, 2))) {
+              runUpTicks++
+              runBack = true
+              runSneak = narrow
+            } else {
+              runUpPhase = narrow ? 0 : 2
+              runUpTicks = 0
+            }
+          }
+          if (runUpPhase === 2) {
+            // Sprinting in: well short of the lip (the gates' own horizon
+            // is six ticks, and the brake below holds the body there) and
+            // never onto ground the physics cannot find.
+            if (runUpTicks < RUN_UP_MAX_TICKS && takeoffProj < takeoffCap - 0.35 &&
+                physics.canNudge({ forward: true }, 3)) {
+              runUpTicks++
+              runIn = true
+            } else {
+              runUpPhase = 0 // this line-up is over: creep from here, or line up again
+            }
           }
         }
-        if (runBack) creep = false
+        if (runBack || runIn) creep = false
 
-        bot.setControlState('forward', creep || inFlight)
+        bot.setControlState('forward', creep || inFlight || runIn)
         bot.setControlState('back', stepBack || runBack)
-        bot.setControlState('sneak', creep || caughtOnClimbable)
-        bot.setControlState('sprint', flyingParkour && !caughtOnClimbable)
-        execBranch = caughtOnClimbable ? 'catch' : inFlight ? 'inflight' : runBack ? 'runback' : creep ? 'creep' : stepBack ? 'stepback' : 'wait'
+        bot.setControlState('sneak', (creep && creepSneak) || caughtOnClimbable || runSneak || (atLip && !runIn))
+        bot.setControlState('sprint', (flyingParkour && !caughtOnClimbable) || runIn)
+        execBranch = caughtOnClimbable ? 'catch' : inFlight ? 'inflight' : runBack ? 'runback' : runIn ? 'runin' : creep ? 'creep' : stepBack ? 'stepback' : 'wait'
       }
 
       futile(swimming)
@@ -2774,10 +3137,14 @@ export function createPathfinder (options: PathfinderOptions = {}) {
           execBranch, c.forward ? 1 : 0, c.sprint ? 1 : 0, c.jump ? 1 : 0, c.sneak ? 1 : 0, c.back ? 1 : 0,
           cutTarget !== null ? 1 : 0, path.length,
           n ? [+n.x.toFixed(1), +n.y.toFixed(1), +n.z.toFixed(1), (n as { parkour?: boolean }).parkour ? 1 : 0] : null,
-          [+v.x.toFixed(3), +v.y.toFixed(3), +v.z.toFixed(3)]
+          [+v.x.toFixed(3), +v.y.toFixed(3), +v.z.toFixed(3)],
+          +lastTickMs.toFixed(2),
+          execBranch === 'sprint' ? ((physics as { hopRefusal?: string }).hopRefusal ?? '') : ''
         ]))
         execBranch = 'idle'
-        if (execTraceBuf.length >= 40) {
+        // Flush on the batch, and on every idle tick (a race's last ticks
+        // were lost in the buffer when the process exited on arrival).
+        if (execTraceBuf.length >= 40 || (execTraceBuf.length > 0 && path.length === 0)) {
           fs.appendFileSync(execTraceFile, execTraceBuf.join('\n') + '\n')
           execTraceBuf.length = 0
         }

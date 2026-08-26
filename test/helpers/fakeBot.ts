@@ -290,6 +290,7 @@ export function makeFakePhysics (world: VoxelWorld, bot: DriveableBot): PhysicsL
     canBackOff: () => false,
     canNudge: () => false,
     bestHeading: () => null,
+    bestWalkHeading: () => null,
     sprintHopBetter: () => false
   }
 }

@@ -22,7 +22,7 @@ import {
   MANGROVE_STAIRS,
   CREEPER_HEAD
 } from './helpers/voxelWorld.js'
-import { MoveGen, META_PARKOUR, META_BOUNCE, META_CHAIN, MOM_NONE, momentumOf, momentumDx, momentumDz } from '../src/moveGen.js'
+import { MoveGen, META_PARKOUR, META_BOUNCE, META_CHAIN, META_RUN, MOM_NONE, momentumOf, momentumDx, momentumDz } from '../src/moveGen.js'
 import { Snapshot } from '../src/snapshot.js'
 
 interface GenMove {
@@ -764,7 +764,7 @@ describe('MoveGen', () => {
       const moves = movesOf(ctx, 0, 1, 0)
       const chain = at(moves, 8, 0, 2)
       expect(chain).to.have.length(1)
-      expect(chain[0].meta).to.equal(META_PARKOUR | META_CHAIN)
+      expect(chain[0].meta).to.equal(META_PARKOUR | META_CHAIN | META_RUN)
       expect(chain[0].via).to.equal(ctx.snap.index(3, 1, 0))
       expect(chain[0].cost).to.be.closeTo(3.5 + Math.hypot(5, 2) + 0.5, 1e-12)
       // B itself is a plain parkour landing, and its own expansion cannot reach C.
@@ -896,7 +896,7 @@ describe('momentum search state (allowParkourMomentum)', () => {
     const fromB = movesFrom(ctx, 3, 1, 0, momentumOf(3, 0))
     const c = at(fromB, 8, 0, 0)
     expect(c).to.have.length(1)
-    expect(c[0].meta).to.equal(META_PARKOUR | META_CHAIN)
+    expect(c[0].meta).to.equal(META_PARKOUR | META_CHAIN | META_RUN)
     expect(c[0].via).to.equal(ctx.snap.index(3, 1, 0))
     expect(c[0].cost).to.be.closeTo(5.5, 1e-12)
     expect((c[0] as { mom: number }).mom).to.equal(momentumOf(5, 0))
@@ -908,7 +908,7 @@ describe('momentum search state (allowParkourMomentum)', () => {
     // The compound model still exists with the flag off, as A → C via B.
     const compound = at(movesFrom(makeGen(world, FLAG), 0, 1, 0, MOM_NONE), 8, 0, 0)
     expect(compound).to.have.length(1)
-    expect(compound[0].meta).to.equal(META_PARKOUR | META_CHAIN)
+    expect(compound[0].meta).to.equal(META_PARKOUR | META_CHAIN | META_RUN)
   })
 
   it('chains chain: the second landing re-jumps again, and without momentum it cannot', () => {
@@ -918,7 +918,7 @@ describe('momentum search state (allowParkourMomentum)', () => {
     // C landed from (5,0): the chain row covers it (4.185 against 4.205).
     const d = at(movesFrom(ctx, 8, 0, 0, momentumOf(5, 0)), 13, -1, 0)
     expect(d).to.have.length(1)
-    expect(d[0].meta).to.equal(META_PARKOUR | META_CHAIN)
+    expect(d[0].meta).to.equal(META_PARKOUR | META_CHAIN | META_RUN)
     expect(d[0].via).to.equal(ctx.snap.index(8, 0, 0))
     expect((d[0] as { mom: number }).mom).to.equal(momentumOf(5, 0))
     // A momentum too far off the line does not.
@@ -977,7 +977,7 @@ describe('momentum search state (allowParkourMomentum)', () => {
     expect(at(movesOf(makeGen(world, FLAG), 0, 2, 0), 0, 2, 5)).to.have.length(0)
     const lip = at(movesFrom(makeGen(world, MOM), 0, 2, 0, MOM_NONE), 0, 2, 5)
     expect(lip).to.have.length(1)
-    expect(lip[0].meta).to.equal(META_PARKOUR)
+    expect(lip[0].meta).to.equal(META_PARKOUR | META_RUN) // a lip take-off is a running take-off
     expect(lip[0].cost).to.be.closeTo(5.5, 1e-12)
     // A stair is a full-width top: its own lip out-reaches a re-jump, no momentum state.
     expect((lip[0] as { mom: number }).mom).to.equal(MOM_NONE)

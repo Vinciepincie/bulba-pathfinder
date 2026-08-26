@@ -53,7 +53,13 @@ interface SolveMessage {
   digFingerprint: string | null
 }
 
-type InMessage = LutMessage | DigMessage | SolveMessage
+/** Prewarm: size the wasm arena for a box of this many cells now. */
+interface ReserveMessage {
+  t: 'reserve'
+  cells: number
+}
+
+type InMessage = LutMessage | DigMessage | SolveMessage | ReserveMessage
 
 if (!parentPort) {
   throw new Error('@bulba/pathfinder worker entry must run inside a worker_thread')
@@ -73,12 +79,23 @@ const digTables = new Map<string, { labor: Float32Array, flags: Uint8Array }>()
 // ready (or when it is unavailable) run on the JS solver — the reference
 // implementation and permanent fallback. PF_NO_WASM=1 disables it.
 let wasmSolver: WasmSolver | null = null
+/** A reserve request that arrived before the core was instantiated. */
+let pendingReserve = 0
 if (process.env.PF_NO_WASM !== '1') {
-  WasmSolver.create().then(ws => { wasmSolver = ws }, () => {})
+  WasmSolver.create().then(ws => {
+    wasmSolver = ws
+    if (ws && pendingReserve > 0) ws.reserve(pendingReserve)
+  }, () => {})
 }
 
 port.on('message', (msg: InMessage) => {
   try {
+    if (msg.t === 'reserve') {
+      if (wasmSolver) wasmSolver.reserve(msg.cells)
+      else pendingReserve = Math.max(pendingReserve, msg.cells)
+      return
+    }
+
     if (msg.t === 'lut') {
       lut = {
         maxStateId: msg.maxStateId,

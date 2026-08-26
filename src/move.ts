@@ -32,6 +32,12 @@ export class Move extends Vec3 {
   via: Vec3 | null
   chain: boolean
   /**
+   * Parkour jump that needs a RUN-UP (planner META_RUN): the standing reach
+   * cannot fly it, so the executor lines up a sprint from the rear of the
+   * support instead of creeping to the lip and jumping from rest.
+   */
+  run = false
+  /**
    * Aim offset (XZ, blocks) applied after the aim point is set on the
    * support's top: a momentum-chain stepping stone is landed on its FAR side
    * so the re-jump starts with the creep credit the planner assumed.
@@ -68,7 +74,9 @@ export class Move extends Vec3 {
       : []
     const toBreak: Vec3[] = raw.toBreak ? raw.toBreak.map(b => new Vec3(b.x, b.y, b.z)) : []
     const via = raw.via ? new Vec3(raw.via.x, raw.via.y, raw.via.z) : null
-    return new Move(raw.x, raw.y, raw.z, 0, raw.cost, toBreak, toPlace, raw.parkour, via, raw.chain === true)
+    const move = new Move(raw.x, raw.y, raw.z, 0, raw.cost, toBreak, toPlace, raw.parkour, via, raw.chain === true)
+    move.run = raw.run === true
+    return move
   }
 
   /**

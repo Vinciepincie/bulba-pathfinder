@@ -114,7 +114,14 @@ export function computeBox (
   // distance-per-cost, which the boundary-growth retry absorbs. Unbounded
   // searches start moderate and grow on boundary contact — a small first box
   // keeps the snapshot build in the low-millisecond range.
-  let margin = Math.ceil((slack >= 0 ? slack / 2 + 16 : maxDist * 0.5 + 32) * growFactor)
+  //
+  // Every cell costs ~60 ns before the search starts (LUT resolution here,
+  // the copy into wasm memory, the arena arrays), and the search itself
+  // touches a few thousand. Measured on the arena's basic2 (93-block route):
+  // the old 0.5·d + 32 margin made a 1.63M-cell box, 100 ms of setup around
+  // a 12 ms search that visited 145 nodes. 0.3·d + 20 halves the box; the
+  // boundary-growth retry still covers the rare route that needs more.
+  let margin = Math.ceil((slack >= 0 ? slack / 2 + 16 : maxDist * 0.3 + 20) * growFactor)
   // A close goal doesn't need a slack-sized box — the boundary-growth retry
   // covers the rare long detour, so first builds stay small and fast.
   if (targets.length > 0) margin = Math.min(margin, Math.ceil((maxDist + 24) * growFactor))
@@ -160,6 +167,86 @@ interface WorldLike {
   getColumn (cx: number, cz: number): ColumnLike | null | undefined
 }
 
+/**
+ * A section's packed cells plus its palette resolved through the LUT: the
+ * per-value flags/heights/special/state that a palette index maps to (a
+ * direct container's "palette" is the state id itself, resolved on demand
+ * over the LUT — its arrays are the LUT's own).
+ */
+interface NoSpanBits {
+  words: Uint32Array
+  bitsPerValue: number
+  valuesPerLong: number
+  valueMask: number
+  flags: Uint8Array
+  heights: Uint8Array
+  special: Uint8Array
+  states: Uint16Array
+}
+
+const NO_SPECIAL = new Uint8Array(0)
+
+/**
+ * Recognise a prismarine-chunk palette container backed by BitArrayNoSpan
+ * (1.16+ block storage) and resolve its palette once. Null when the object
+ * does not look exactly like that — the caller then falls back to `get`.
+ * `cache` is per build: the same section object serves all 16 of its rows.
+ */
+function noSpanBits (container: unknown, lut: BlockLut, cache: Map<unknown, NoSpanBits | null>): NoSpanBits | null {
+  const hit = cache.get(container)
+  if (hit !== undefined) return hit
+  let out: NoSpanBits | null = null
+  const c = container as { data?: unknown, palette?: unknown }
+  const ba = c.data as { data?: unknown, bitsPerValue?: unknown, valuesPerLong?: unknown, valueMask?: unknown, capacity?: unknown } | undefined
+  if (ba && ba.data instanceof Uint32Array &&
+      typeof ba.bitsPerValue === 'number' && typeof ba.valuesPerLong === 'number' &&
+      typeof ba.valueMask === 'number' && ba.capacity === 4096 &&
+      ba.valuesPerLong === Math.floor(64 / ba.bitsPerValue) &&
+      ba.valueMask === (1 << ba.bitsPerValue) - 1 &&
+      ba.data.length >= Math.ceil(4096 / ba.valuesPerLong) * 2) {
+    const palette = c.palette
+    if (Array.isArray(palette)) {
+      const n = palette.length
+      const flags = new Uint8Array(n)
+      const heights = new Uint8Array(n)
+      const special = new Uint8Array(n)
+      const states = new Uint16Array(n)
+      let ok = true
+      for (let i = 0; i < n; i++) {
+        const s = palette[i]
+        if (typeof s !== 'number' || s < 0 || s > lut.maxStateId) { ok = false; break }
+        flags[i] = lut.flags[s]
+        heights[i] = lut.heights[s]
+        special[i] = lut.special ? lut.special[s] : 0
+        states[i] = s
+      }
+      if (ok) {
+        out = {
+          words: ba.data, bitsPerValue: ba.bitsPerValue, valuesPerLong: ba.valuesPerLong, valueMask: ba.valueMask,
+          flags, heights, special, states
+        }
+      }
+    } else if (palette === undefined) {
+      // Direct container: the packed value IS the state id.
+      const n = lut.maxStateId + 1
+      if (directStates === null || directStates.length !== n) {
+        directStates = new Uint16Array(n)
+        for (let i = 0; i < n; i++) directStates[i] = i
+      }
+      // No special table → the snapshot has no special grid either, so the
+      // empty array is never indexed.
+      out = {
+        words: ba.data, bitsPerValue: ba.bitsPerValue, valuesPerLong: ba.valuesPerLong, valueMask: ba.valueMask,
+        flags: lut.flags, heights: lut.heights, special: lut.special ?? NO_SPECIAL, states: directStates
+      }
+    }
+  }
+  cache.set(container, out)
+  return out
+}
+
+let directStates: Uint16Array | null = null
+
 /** Build a snapshot of the box, resolving every cell through the LUT. */
 export function buildSnapshot (bot: Bot, lut: BlockLut, box: Box, needStates: boolean, generation: number = nextSnapshotGeneration()): Snapshot {
   const meta: SnapshotMeta = {
@@ -190,6 +277,14 @@ export function buildSnapshot (bot: Bot, lut: BlockLut, box: Box, needStates: bo
   const cz0 = box.z0 >> 4
   const cz1 = box.z1 >> 4
   const probe = { x: 0, y: 0, z: 0 }
+  const bitsCache = new Map<unknown, NoSpanBits | null>()
+  // PF_SOLVE_TIMING=1: how many rows each path resolved (diagnostic).
+  const counting = process.env.PF_SOLVE_TIMING === '1'
+  let rowsUniform = 0
+  let rowsFast = 0
+  let rowsGet = 0
+  let rowsGeneric = 0
+  let colsMissing = 0
 
   for (let cx = cx0; cx <= cx1; cx++) {
     const bx0 = Math.max(box.x0, cx << 4)
@@ -203,7 +298,7 @@ export function buildSnapshot (bot: Bot, lut: BlockLut, box: Box, needStates: bo
       } catch {
         column = null
       }
-      if (!column) continue // unloaded → cells stay 0 (upstream null-block: unsafe, not physical)
+      if (!column) { colsMissing++; continue } // unloaded → cells stay 0 (upstream null-block: unsafe, not physical)
 
       // Fast path: read section containers directly (prismarine-chunk 1.18+).
       // A SingleValueContainer section (all air, all stone) resolves without
@@ -220,6 +315,7 @@ export function buildSnapshot (bot: Bot, lut: BlockLut, box: Box, needStates: bo
 
         let uniformState = -1
         let getCell: ((idx: number) => number) | null = null
+        let bits: NoSpanBits | null = null
         let sectionOk = false
         if (useSections) {
           const sec = sections[(y - (colMinY as number)) >> 4]
@@ -230,9 +326,18 @@ export function buildSnapshot (bot: Bot, lut: BlockLut, box: Box, needStates: bo
           } else if (typeof sec.data.value === 'number') {
             uniformState = sec.data.value
             sectionOk = true
-          } else if (typeof sec.data.get === 'function') {
-            getCell = sec.data.get.bind(sec.data)
-            sectionOk = true
+          } else {
+            // Fastest path: unpack the section's no-span bit array directly
+            // (prismarine-chunk 1.16+ BitArrayNoSpan), the palette resolved
+            // through the LUT once per section. Two method calls per cell
+            // become a few integer ops; measured 27 ns/cell → well under 10.
+            bits = noSpanBits(sec.data, lut, bitsCache)
+            if (bits !== null) {
+              sectionOk = true
+            } else if (typeof sec.data.get === 'function') {
+              getCell = sec.data.get.bind(sec.data)
+              sectionOk = true
+            }
           }
         }
         const secY = ((y - (colMinY as number || 0)) & 15) << 8
@@ -241,6 +346,7 @@ export function buildSnapshot (bot: Bot, lut: BlockLut, box: Box, needStates: bo
           probe.z = z & 15
           const base = (rowBase + (z - meta.z0)) * meta.w - meta.x0
           if (sectionOk && uniformState >= 0) {
+            rowsUniform++
             if (uniformState <= maxStateId) {
               const f = lutFlags[uniformState]
               const h = lutHeights[uniformState]
@@ -255,7 +361,42 @@ export function buildSnapshot (bot: Bot, lut: BlockLut, box: Box, needStates: bo
             }
             continue
           }
+          if (sectionOk && bits !== null) {
+            rowsFast++
+            const zPart = secY | ((z & 15) << 4)
+            const words = bits.words
+            const bpv = bits.bitsPerValue
+            const vpl = bits.valuesPerLong
+            const mask = bits.valueMask
+            const pf = bits.flags
+            const ph = bits.heights
+            const ps = bits.special
+            const pst = bits.states
+            for (let x = bx0; x <= bx1; x++) {
+              const ci = zPart | (x & 15)
+              // Mirror of BitArrayNoSpan.get: values never straddle a long.
+              const li = (ci / vpl) | 0
+              const inLong = (ci - li * vpl) * bpv
+              let v: number
+              if (inLong >= 32) {
+                v = (words[li * 2 + 1] >>> (inLong - 32)) & mask
+              } else {
+                v = words[li * 2] >>> inLong
+                if (inLong + bpv > 32) v |= words[li * 2 + 1] << (32 - inLong)
+                v &= mask
+              }
+              if (v < pf.length) {
+                const idx = base + x
+                flags[idx] = pf[v]
+                heights[idx] = ph[v]
+                if (states) states[idx] = pst[v]
+                if (special) special[idx] = ps[v]
+              }
+            }
+            continue
+          }
           if (sectionOk && getCell) {
+            rowsGet++
             const zPart = secY | ((z & 15) << 4)
             try {
               for (let x = bx0; x <= bx1; x++) {
@@ -273,6 +414,7 @@ export function buildSnapshot (bot: Bot, lut: BlockLut, box: Box, needStates: bo
               // fall through to the generic path for this row
             }
           }
+          rowsGeneric++
           for (let x = bx0; x <= bx1; x++) {
             probe.x = x & 15
             let stateId: number
@@ -294,6 +436,9 @@ export function buildSnapshot (bot: Bot, lut: BlockLut, box: Box, needStates: bo
     }
   }
 
+  if (counting) {
+    console.log(`[pf-timing] snapshot rows: fast=${rowsFast} uniform=${rowsUniform} get=${rowsGet} generic=${rowsGeneric} missingColumns=${colsMissing}`)
+  }
   return snap
 }
 

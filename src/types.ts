@@ -217,6 +217,8 @@ export interface RawPathNode {
    */
   via?: { x: number, y: number, z: number }
   chain?: boolean
+  /** Parkour jump the standing (creep-to-the-lip) reach cannot fly: the executor lines up a run. */
+  run?: boolean
 }
 
 export interface SolveResult {
@@ -301,6 +303,8 @@ export interface NoPathDump {
 
 /** The sprint/jump decision surface the executor consumes. */
 export interface PhysicsLike {
+  /** Optional: the executor calls this once per tick so the physics may cache world reads within it. */
+  beginTick? (): void
   canStraightLine (path: XYZ[], sprint?: boolean): boolean
   canSprintJump (path: XYZ[], jumpAfter?: number): boolean
   canWalkJump (path: XYZ[], jumpAfter?: number): boolean
@@ -313,6 +317,8 @@ export interface PhysicsLike {
   canNudge (control: { forward?: boolean, back?: boolean, left?: boolean, right?: boolean, jump?: boolean, sneak?: boolean }, ticks?: number): boolean
   /** A take-off heading offset that lands this jump, or null. */
   bestHeading (path: XYZ[], jump: boolean, sprint: boolean): number | null
+  /** A heading offset that WALKS a flat step round a clipped corner, or null. */
+  bestWalkHeading (path: XYZ[], sprint: boolean): number | null
   /** Does hopping while sprinting get further down this path, safely? */
   sprintHopBetter (path: XYZ[], lowCeilingHop?: boolean, horizon?: number): boolean
 }

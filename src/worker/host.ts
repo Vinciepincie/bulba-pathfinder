@@ -56,12 +56,21 @@ interface ActiveWorker {
 
 const MAX_SPAWN_FAILURES = 3
 
+/**
+ * Cells the wasm arena is pre-sized for at prewarm. A 60-100 block route on
+ * the arena builds a 350k-870k-cell box after the 0.3·d + 20 margin; this
+ * covers those with room, at ~26 bytes a cell (~30 MB in the worker).
+ */
+const DEFAULT_RESERVE_CELLS = 1_200_000
+
 export class SolverWorkerHost {
   private active: ActiveWorker | null = null
   private spawning: Promise<ActiveWorker | null> | null = null
   private nextId = 1
   private spawnFailures = 0
   private entryPath: string | null = null
+  /** Arena size every spawned worker is asked to reserve (0 = none). */
+  private reserveCells = 0
 
   /** Permanently unavailable (spawn kept failing) — callers use main-thread. */
   get unavailable (): boolean {
@@ -128,6 +137,7 @@ export class SolverWorkerHost {
       })
       worker.on('error', (err) => this.retire(aw, 'errored', err?.message ?? err))
       worker.on('exit', (code) => this.retire(aw, 'exited', code !== 0 ? code : undefined))
+      if (this.reserveCells > 0) worker.postMessage({ t: 'reserve', cells: this.reserveCells })
       this.active = aw
       return aw
     } catch (error) {
@@ -163,8 +173,15 @@ export class SolverWorkerHost {
    * spawn failure is already handled (callers fall back to the main thread),
    * and the worker is unref()ed so an idle process still exits.
    */
-  prewarm (): void {
+  prewarm (cells = DEFAULT_RESERVE_CELLS): void {
     if (this.unavailable) return
+    // The arena allocation is the other one-time cost of a first solve
+    // (lib.rs arena_reserve): size it for a typical box now, and again for
+    // every worker spawned after this one.
+    if (cells > this.reserveCells) {
+      this.reserveCells = cells
+      if (this.active && !this.active.gone) this.active.worker.postMessage({ t: 'reserve', cells })
+    }
     void this.ensureWorker().catch(() => {})
   }
 

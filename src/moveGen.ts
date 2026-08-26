@@ -94,6 +94,11 @@ export const META_BOUNCE = 4;
 /** Momentum-chain move: jump to `via` (a stepping stone) and re-jump on the
  * landing tick to reach the node. Always paired with META_PARKOUR. */
 export const META_CHAIN = 8;
+/** The jump needs a RUN-UP: the standing (creep-to-the-lip) row cannot fly
+ * it, only the running rows, a lip take-off or a chain can. Tells the
+ * executor to line up a run instead of creeping to the corner and jumping
+ * from rest. Always paired with META_PARKOUR. Never affects the search. */
+export const META_RUN = 16;
 const SAFE = LutFlags.SAFE;
 const PHYSICAL = LutFlags.PHYSICAL;
 const LIQUID = LutFlags.LIQUID;
@@ -1355,6 +1360,13 @@ export class MoveGen {
         let feasible = fn <= usable;
         // Any run at all flies the running arc (the corridor curves).
         let needsRunning = row >= 1;
+        // Would the STANDING row (a creep to the lip, jump from rest) fly it?
+        // Executor information only (META_RUN); never changes what is emitted.
+        const standRows = (low ? J_LOW_RUN : J_RUN)[0];
+        let usableStand = standRows[bucket];
+        if (frac > 0)
+            usableStand = usableStand + (standRows[bucket - 1] - usableStand) * frac;
+        const runNeeded = fn > usableStand + this.marginCredit;
         let chained = false;
         let lipJump = false;
         if (chainVia < 0) {
@@ -1453,18 +1465,19 @@ export class MoveGen {
         // arena's route book for no edge the cell lacks.
         if (this.parkourMomentum && landCatch >= 1 && rise >= -MOMENTUM_MAX_DROP)
             this.pendingMom = momentumOf(t.tx * sx, t.tz * sz);
+        const runBit = (runNeeded || lipJump) ? META_RUN : 0;
         if (chainVia >= 0) {
             this.pendingVia = chainVia;
-            this.push(tx, nodeY, tz, chainBase + cost, META_PARKOUR | META_CHAIN);
+            this.push(tx, nodeY, tz, chainBase + cost, META_PARKOUR | META_CHAIN | META_RUN);
         }
         else if (chained) {
             // The stone is this node itself: the path shows it as the previous
             // node, and the executor lands it far-side and re-jumps from it.
             this.pendingVia = this.cellIndex(x, y, z);
-            this.push(tx, nodeY, tz, cost, META_PARKOUR | META_CHAIN);
+            this.push(tx, nodeY, tz, cost, META_PARKOUR | META_CHAIN | META_RUN);
         }
         else {
-            this.push(tx, nodeY, tz, cost, META_PARKOUR);
+            this.push(tx, nodeY, tz, cost, META_PARKOUR | runBit);
         }
     }
     /**

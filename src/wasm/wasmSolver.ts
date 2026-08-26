@@ -30,6 +30,7 @@ interface WasmExports {
   solve_run (maxExpansions: number): number
   finalize (status: number): number
   result_ptr (): number
+  arena_reserve (n: number, momentum: number): void
 }
 
 const GOAL_KINDS: Record<string, number> = {
@@ -51,6 +52,9 @@ interface GoalSpec {
 }
 
 const MAX_GOAL_SPECS = 4096 // matches the solve_init cap in lib.rs
+
+/** The serialised extended-parkour table, built on first use (a process constant). */
+let cachedExtBlob: ArrayBuffer | null = null
 
 /**
  * Flatten a descriptor into wasm goal specs. Coordinate goals map 1:1;
@@ -132,6 +136,16 @@ export class WasmSolver {
   }
 
   /**
+   * Pre-size the core's arena for a box of `cells` cells (see lib.rs
+   * arena_reserve). Grow-only, so calling it with a smaller number later is
+   * a no-op. Tolerates a core built without the export.
+   */
+  reserve (cells: number): void {
+    if (typeof this.exports.arena_reserve !== 'function') return
+    this.exports.arena_reserve(Math.max(0, Math.floor(cells)), 1)
+  }
+
+  /**
    * Full solve loop with host-side slicing: between expansion batches the
    * host checks its cancel flag + think budget and emits interim partials
    * (same cadence contract as the JS solver path).
@@ -167,6 +181,9 @@ export class WasmSolver {
     const startTime = performance.now()
     const m = snap.meta
     const n = m.w * m.h * m.l
+    const timing = process.env.PF_SOLVE_TIMING === '1'
+    let uploadMs = 0
+    let initMs = 0
 
     const specs = flattenGoalSpecs(goal)
     if (!specs) throw new Error(`wasm solver does not support goal type ${goal.type}`)
@@ -195,6 +212,7 @@ export class WasmSolver {
       }
       ex.snap_set_meta(m.x0, m.y0, m.z0, m.w, m.h, m.l, m.worldMinY)
       this.lastSnapKey = snapKey
+      if (timing) uploadMs = performance.now() - startTime
     }
 
     // ── dig residency: upload once per fingerprint ────────────────────────
@@ -216,10 +234,11 @@ export class WasmSolver {
     const entityCount = snap.entityIdx.length
     const entitySize = entityCount * 8
     const paramsSize = 4 * 4 + specs.length * 36 + 4 * 2 + 8 * 6 + 4 * 2 + 4 * 2
-    // The extended-parkour table travels with the solve (~2.5KB) so the core
-    // consumes the exact table the JS reference builds — one geometry source.
+    // The extended-parkour table travels with the solve so the core consumes
+    // the exact table the JS reference builds — one geometry source. It is a
+    // process constant (~25 KB), serialised once and re-uploaded per solve.
     const extBlob = cfg.allowParkourExtended && cfg.allowParkour && cfg.allowSprinting
-      ? serializeParkourTable(getParkourExtTable(), J_RUN, J_LOW_RUN, J_CHAIN)
+      ? (cachedExtBlob ??= serializeParkourTable(getParkourExtTable(), J_RUN, J_LOW_RUN, J_CHAIN))
       : null
     // Allocs before any view — each may grow (and detach views of) wasm
     // memory; resident snapshot/dig data stays valid (growth extends).
@@ -272,18 +291,33 @@ export class WasmSolver {
     u32(extPtr); u32(extBlob !== null ? extBlob.byteLength : 0)
 
     try {
+      const initT0 = timing ? performance.now() : 0
       const rc = ex.solve_init(paramsPtr)
       if (rc !== 0) {
         throw new Error(`wasm solve_init rejected the parameters (code ${rc})`)
       }
+      if (timing) initMs = performance.now() - initT0
+      const done = (status: number): RawSolveResult => {
+        const runT1 = timing ? performance.now() : 0
+        const r = this.readResult(status, startTime)
+        if (timing) {
+          console.log(`[pf-timing] wasm n=${n} uploadMs=${uploadMs.toFixed(2)} initMs=${initMs.toFixed(2)} runMs=${(runT1 - startTime - uploadMs - initMs).toFixed(2)} readMs=${(performance.now() - runT1).toFixed(2)} visited=${r.visitedNodes} status=${r.status}`)
+        }
+        return r
+      }
 
       // ── slice loop: cancel + budget between expansion batches ──────────
-      const BATCH = 16384
+      // 2048, not 16384: a batch is the cancel/partial granularity, and at
+      // ~20 µs an expansion the old batch let a replan's cancel queue behind
+      // up to ~330 ms of dead work while the "40 ms partial cadence" was
+      // never met on a route-book-sized solve. A performance.now() every
+      // 2048 expansions is noise.
+      const BATCH = 2048
       let lastPartial = performance.now()
       for (;;) {
         const runRc = ex.solve_run(BATCH)
-        if (runRc === 1) return this.readResult(0, startTime)
-        if (runRc === 2) return this.readResult(3, startTime)
+        if (runRc === 1) return done(0)
+        if (runRc === 2) return done(3)
 
         const now = performance.now()
         if (opts.cancelFlag !== null && Atomics.load(opts.cancelFlag, 0) !== 0) {
@@ -342,6 +376,7 @@ export class WasmSolver {
         parkour: (meta & 1) !== 0,
         useOne: (meta & 2) !== 0 ? { x, y, z } : null
       }
+      if ((meta & 16) !== 0) node.run = true // META_RUN
       if ((meta & (4 | 8)) !== 0) {
         // META_BOUNCE / META_CHAIN: the via cell follows the meta byte
         // (lib.rs serialize_result), before the toBreak list.

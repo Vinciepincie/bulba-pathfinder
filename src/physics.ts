@@ -55,15 +55,95 @@ const OVERHEAD_HAZARDS = new Set([
  */
 const CAUGHT_FEET = new Set(['ladder', 'vine'])
 
+/** Half-extent of the per-tick block cache around the body, in blocks. */
+const CACHE_REACH = 64
+
+/** Height tolerance for reaching a WALKING node in a rollout (see getReached). */
+const WALK_REACH_DY = 0.5
+
+/**
+ * Nodes ahead the sprint-hop gait needs backed by path and free of rises
+ * and jumps (see sprintHopBetter). PF_HOP_LOOK overrides it for A/B runs.
+ */
+const HOP_LOOK = Math.max(2, Number(process.env.PF_HOP_LOOK ?? 6) || 6)
+
 export class PhysicsSim {
   private readonly bot: Bot
   private readonly world: { getBlock: (pos: Vec3) => unknown }
   /** Set by the last simulateUntil that hit its refusal predicate. */
   private refused = false
+  /**
+   * Per-tick caches (improvement). Every rollout tick asks the world for the
+   * ~30 blocks around the body, and every rollout rebuilds a PlayerState —
+   * effect lookups and a boots-NBT parse each time. A refused parkour node
+   * runs ~1,300 simulated ticks and ~15 rollouts per executor tick, all
+   * against a world that cannot change inside the tick. `beginTick` opens
+   * a tick: blocks are memoised by cell and the state is built once and
+   * cloned. Without it (tests, out-of-tick callers) nothing is cached.
+   */
+  private tickSerial = 0
+  private cacheX0 = 0
+  private cacheY0 = 0
+  private cacheZ0 = 0
+  private readonly blockCache = new Map<number, unknown>()
+  private seed: PlayerState | null = null
+  /** Why the last sprintHopBetter said no ('' = it said yes). Trace diagnostics. */
+  hopRefusal = ''
 
   constructor (bot: Bot) {
     this.bot = bot
-    this.world = { getBlock: (pos: Vec3) => bot.blockAt(pos, false) }
+    this.world = { getBlock: (pos: Vec3) => this.blockAt(pos) }
+  }
+
+  /** Open a tick: forget the last tick's blocks and state template. */
+  beginTick (): void {
+    this.tickSerial++
+    this.blockCache.clear()
+    this.seed = null
+    const p = this.bot.entity?.position
+    if (p !== undefined) {
+      this.cacheX0 = Math.floor(p.x) - CACHE_REACH
+      this.cacheY0 = Math.floor(p.y) - CACHE_REACH
+      this.cacheZ0 = Math.floor(p.z) - CACHE_REACH
+    }
+  }
+
+  private blockAt (pos: Vec3): unknown {
+    if (this.tickSerial === 0) return this.bot.blockAt(pos, false)
+    const x = Math.floor(pos.x) - this.cacheX0
+    const y = Math.floor(pos.y) - this.cacheY0
+    const z = Math.floor(pos.z) - this.cacheZ0
+    if (x < 0 || x >= 2 * CACHE_REACH || y < 0 || y >= 2 * CACHE_REACH || z < 0 || z >= 2 * CACHE_REACH) {
+      return this.bot.blockAt(pos, false)
+    }
+    const key = (x << 14) | (y << 7) | z
+    let b = this.blockCache.get(key)
+    if (b === undefined) {
+      b = this.bot.blockAt(pos, false)
+      this.blockCache.set(key, b)
+    }
+    return b
+  }
+
+  /**
+   * A fresh PlayerState for a rollout starting from the body's state now.
+   * Inside a tick the expensive, tick-invariant parts (effects, attributes,
+   * enchantments) come from one template; position, velocity, look and the
+   * controls are always taken fresh.
+   */
+  private newState (control: SimControl): PlayerState {
+    if (this.tickSerial === 0) return new PlayerState(this.bot, control)
+    if (this.seed === null) this.seed = new PlayerState(this.bot, control)
+    const seed = this.seed
+    const s = Object.create(Object.getPrototypeOf(seed) as object) as PlayerState
+    Object.assign(s, seed)
+    s.pos = this.bot.entity.position.clone()
+    s.vel = this.bot.entity.velocity.clone()
+    s.yaw = this.bot.entity.yaw
+    ;(s as unknown as { pitch: number }).pitch = this.bot.entity.pitch
+    s.onGround = this.bot.entity.onGround
+    s.control = control
+    return s
   }
 
   simulateUntil (
@@ -83,7 +163,7 @@ export class PhysicsSim {
         sprint: this.bot.controlState.sprint,
         sneak: this.bot.controlState.sneak
       }
-      state = new PlayerState(this.bot, simulationControl)
+      state = this.newState(simulationControl)
     }
 
     this.refused = false
@@ -178,7 +258,7 @@ export class PhysicsSim {
       sprint: this.bot.controlState.sprint,
       sneak: this.bot.controlState.sneak
     }
-    const state = new PlayerState(this.bot, simulationControl)
+    const state = this.newState(simulationControl)
     state.pos.update(n1)
     this.simulateUntil(reached, this.getController(n2, false, true), Math.floor(5 * n1.distanceTo(n2)), state)
     return reached(state)
@@ -327,8 +407,9 @@ export class PhysicsSim {
     // a flight off the end of the plan — and near the goal that is an
     // overshoot of the goal itself. On the arena's basic1 the last few nodes
     // sit on the far side of a chasm; there is nothing to hop toward there.
-    const look = Math.min(6, path.length)
-    if (path.length < 6) return false
+    const look = Math.min(HOP_LOOK, path.length)
+    this.hopRefusal = ''
+    if (path.length < HOP_LOOK) { this.hopRefusal = 'short'; return false }
 
     // Ground that is level or falling away, and only where the planner is
     // walking rather than jumping. A rise is the planner's business — the
@@ -339,7 +420,8 @@ export class PhysicsSim {
     let floor = y0
     for (let i = 0; i < look; i++) {
       const n = path[i] as { y: number, parkour?: boolean }
-      if (n.parkour === true || n.y > y0 + 0.1) return false
+      if (n.parkour === true) { this.hopRefusal = 'jump-ahead'; return false }
+      if (n.y > y0 + 0.1) { this.hopRefusal = 'rise-ahead'; return false }
       floor = Math.min(floor, n.y)
     }
 
@@ -384,23 +466,25 @@ export class PhysicsSim {
       const nz = Math.floor(n.z)
       for (let dy = 2; dy <= 3; dy++) {
         const b = this.bot.blockAt(new Vec3(nx, ny + dy, nz), false) as { name?: string } | null
-        if (b === null) return false // unloaded: assume the worst
-        if (OVERHEAD_HAZARDS.has(b.name ?? '')) return false
+        if (b === null) { this.hopRefusal = 'unloaded'; return false } // unloaded: assume the worst
+        if (OVERHEAD_HAZARDS.has(b.name ?? '')) { this.hopRefusal = 'hazard'; return false }
       }
-      if (i < reach && this.ceilingAbove(nx, ny, nz) < roofHere) return false
+      if (i < reach && this.ceilingAbove(nx, ny, nz) < roofHere) { this.hopRefusal = 'roof-drop'; return false }
     }
 
     const run = this.followPath(path, false, horizon)
     const hop = this.followPath(path, true, horizon)
-    if (hop === null || run === null) return false
+    if (hop === null || run === null) { this.hopRefusal = 'lava'; return false }
     // Absolute, and measured against the PATH's own floor rather than the two
     // gaits' relative heights. Comparing the gaits was not enough: on the
     // arena's climb1 tower both of them fell off a 1-wide pillar, so the hop
     // was "no worse", and the bot flew off the side of a 46-block climb it
     // had been walking correctly (91.8 blocks travelled, y 141 down to 102,
     // 15 damage). A hop may follow the path down; it may not leave it.
-    if (hop.minY < floor - HOP_MAX_DIP || !hop.endedOnGround) return false
-    return hop.score > run.score + HOP_MARGIN
+    if (hop.minY < floor - HOP_MAX_DIP) { this.hopRefusal = 'dip'; return false }
+    if (!hop.endedOnGround) { this.hopRefusal = 'airborne-end'; return false }
+    if (!(hop.score > run.score + HOP_MARGIN)) { this.hopRefusal = 'no-gain'; return false }
+    return true
   }
 
   /**
@@ -435,7 +519,7 @@ export class PhysicsSim {
     jump: boolean,
     horizon: number
   ): { score: number, minY: number, endedOnGround: boolean } | null {
-    const state = new PlayerState(this.bot, {
+    const state = this.newState({
       forward: true, back: false, left: false, right: false, jump, sprint: true, sneak: false
     })
     const simulatePlayer = (this.bot.physics as unknown as { simulatePlayer: (s: PlayerState, w: unknown) => void }).simulatePlayer
@@ -509,6 +593,33 @@ export class PhysicsSim {
   }
 
   /**
+   * The walking counterpart of `bestHeading`: a heading a few degrees off
+   * the node that WALKS to it where the straight line grinds on a corner.
+   *
+   * A body a hair off its line clips a block beside the step — 0.03 of
+   * overlap is enough — the per-axis collision stops it dead on that axis,
+   * and the straight-line gate refuses. Left there, the cascade hands a flat
+   * one-block walk to the JUMP gates: a 12-tick arc for a 5-tick step that
+   * then overshoots the node and walks back for it (arena basic3, 22 ticks
+   * for one block). A player just angles round the corner. Offsets are
+   * tried smallest first; the first that reaches wins. Short horizon: a walk
+   * step reaches in a few ticks or not at all, and the grind guard ends a
+   * hopeless one early.
+   */
+  bestWalkHeading (path: Array<{ x: number, y: number, z: number }>, sprint: boolean): number | null {
+    const reached = this.getReached(path)
+    for (const offset of HEADING_OFFSETS) {
+      if (offset === 0) continue
+      const state = this.simulateUntil(
+        reached, this.getController(path[0], false, sprint, 0, offset), 40, null,
+        this.grindGuard(path[0], this.bot.entity.position)
+      )
+      if (reached(state)) return offset
+    }
+    return null
+  }
+
+  /**
    * Would holding `control` for a few ticks actually get the body somewhere,
    * and leave it standing where it can carry on? This is the question the
    * wedge recovery asks of each escape it is considering — a step back, a
@@ -537,14 +648,22 @@ export class PhysicsSim {
     return this.canNudge({ back: true }, ticks)
   }
 
-  private getReached (path: Array<{ x: number, y: number, z: number }>): (state: PlayerState) => boolean {
+  private getReached (path: Array<{ x: number, y: number, z: number, parkour?: boolean }>): (state: PlayerState) => boolean {
+    // Upstream's box is |dy| < 1 for everything. For a WALKING node that
+    // lets a rollout "reach" it from on top of the block beside it — on the
+    // arena's climb2 a same-level diagonal was answered with a sprint-jump
+    // ONTO the adjacent +1 block, followed by walking off it: 18 ticks and
+    // 3.5 blocks for a 1.4-block step. A walk node is arrived at on its own
+    // level (postProcessPath puts it on the support's top); a parkour node
+    // keeps the full box, `landsThere` settles it.
+    const dyTol = path[0].parkour === true ? 1 : WALK_REACH_DY
     return (state: PlayerState) => {
       const delta = {
         x: path[0].x - state.pos.x,
         y: path[0].y - state.pos.y,
         z: path[0].z - state.pos.z
       }
-      return Math.abs(delta.x) <= 0.35 && Math.abs(delta.z) <= 0.35 && Math.abs(delta.y) < 1
+      return Math.abs(delta.x) <= 0.35 && Math.abs(delta.z) <= 0.35 && Math.abs(delta.y) < dyTol
     }
   }
 

@@ -14,7 +14,7 @@
 // arena by the momentum count.
 import { performance } from 'node:perf_hooks'
 import { MinHeap } from './heap.js'
-import { MoveGen, META_PARKOUR, META_USEONE, META_BOUNCE, META_CHAIN, MOM_NONE } from './moveGen.js'
+import { MoveGen, META_PARKOUR, META_USEONE, META_BOUNCE, META_CHAIN, META_RUN, MOM_NONE } from './moveGen.js'
 import type { SnapshotView, StepExclusionFn, DigContext } from './moveGen.js'
 import type { MovementsConfig, RawPathNode, SolveStatus } from './types.js'
 
@@ -324,6 +324,7 @@ export class Solver {
           parkour: (meta & META_PARKOUR) !== 0,
           useOne: (meta & META_USEONE) !== 0 ? { x, y, z } : null
         }
+        if ((meta & META_RUN) !== 0) node.run = true
         const breakCells = this.breaks?.get(cur)
         if (breakCells !== undefined) {
           node.toBreak = breakCells.map(idx => ({
