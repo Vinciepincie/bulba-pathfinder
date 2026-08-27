@@ -260,6 +260,11 @@ export function applyProfile (
     // Bisect switch: ARENA_NO_CUT=1 races the same build with node-by-node
     // following, which is the only honest way to price the corner cut.
     if (process.env.ARENA_NO_CUT === '1') movements.allowCornerCut = false
+    // The run-up line-up and the landing-past retirement (both executor
+    // only, opt-in) are ON here; ARENA_NO_RUNUP=1 / ARENA_NO_LANDRETIRE=1
+    // race the profile a conservative consumer (the shop bot) runs.
+    movements.allowRunUp = process.env.ARENA_NO_RUNUP !== '1'
+    movements.allowLandingRetire = process.env.ARENA_NO_LANDRETIRE !== '1'
     // Bisect switch for the sprint-hop gait on any engine (bulba-nohop is JS only).
     if (process.env.ARENA_NO_HOP === '1') {
       movements.allowSprintHop = false

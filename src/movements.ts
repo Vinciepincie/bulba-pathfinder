@@ -120,6 +120,24 @@ export class Movements {
    * node-by-node following exactly.
    */
   allowCornerCut: boolean
+  /**
+   * Improvement (opt-in, executor only): line up a RUN for a parkour jump no
+   * gate authorises from where the body stands — back off to the rear of the
+   * support, sprint in, let the gates pick the take-off tick — instead of
+   * creeping to the lip and jumping from rest. The planner marks the jumps
+   * that need it (Move.run). Off, the executor keeps the single run-back
+   * attempt it always had. Measured on the arena's basic3 (a 4x4 diagonal
+   * the standing reach cannot fly): 2.5-3.2 s of standing at the lip gone.
+   */
+  allowRunUp: boolean
+  /**
+   * Improvement (opt-in, executor only): retire a parkour landing the body
+   * came down PAST — just landed, within a block, beyond the node along its
+   * flight — instead of turning round to enter its 0.35 box. Measured on the
+   * arena's basic1 (a chain of 2-block hops): 8 ticks per hop from landing to
+   * the next take-off became 2, 11.3 s → 10.0 s.
+   */
+  allowLandingRetire: boolean
   allowEntityDetection: boolean
 
   entitiesToAvoid: Set<string>
@@ -181,6 +199,8 @@ export class Movements {
     this.allowSprintHop = false // improvement, opt-in (executor gait only)
     this.allowLowCeilingHop = false // improvement, opt-in (executor gait only)
     this.allowCornerCut = true // improvement, on (executor steering only; plan unchanged)
+    this.allowRunUp = false // improvement, opt-in (executor take-off only)
+    this.allowLandingRetire = false // improvement, opt-in (executor arrival only)
     this.allowEntityDetection = true
 
     this.entitiesToAvoid = new Set()

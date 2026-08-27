@@ -362,6 +362,11 @@ export function createPathfinder (options: PathfinderOptions = {}) {
     /** Consecutive ticks with onGround=false (see AIRBORNE_TICKS). */
     let airTicks = 0
     let prevTickY = 0
+    /** Grounded ticks since the last touchdown (large while airborne); read by the arrival loop. */
+    let landedTicksAgo = 99
+    let lastTickGrounded = false
+    /** The node most recently retired by the arrival loop — the take-off of the next parkour node. */
+    let prevRetired: { x: number, y: number, z: number } | null = null
     /**
      * Decision trace (PF_EXEC_TRACE=<file prefix>): which branch of the tick
      * loop drove this tick. Written by a second physicsTick listener so every
@@ -1492,6 +1497,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       runUpLastPos = null
       creepNode = null
       creepCell = null
+      prevRetired = null
       stopDiggingIfNeeded()
       placing = false
       placingBlock = null
@@ -2080,6 +2086,13 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         const feet = bot.blockAt(p) as BlockLike | null
         return feet !== null && (feet.type === ladderId || feet.type === vineId)
       })()
+      {
+        const groundedNow = (bot.entity as { onGround?: boolean }).onGround === true
+        if (!groundedNow) landedTicksAgo = 99
+        else if (lastTickGrounded) landedTicksAgo = Math.min(99, landedTicksAgo + 1)
+        else landedTicksAgo = 0
+        lastTickGrounded = groundedNow
+      }
       for (;;) {
         // Improvement: never finish a path mid-air. The arrival box has no
         // ground requirement, so a goal satisfied at jump apex would cut
@@ -2180,30 +2193,38 @@ export function createPathfinder (options: PathfinderOptions = {}) {
             (dx * cx + dz * cz) / clen < 0 &&
             Math.hypot(dx, dz) <= CUT_RETIRE
         }
-        // A parkour landing the body came down PAST (improvement). The
-        // arrival box is 0.35 wide; a running jump lands up to a block
-        // beyond its node, which is exactly what `landsThere` authorised.
-        // Outside the box the node is not retired, so the bot turns round,
-        // walks back into it, and takes the next jump from rest: on the
-        // arena's basic1 every 2-block hop of a chain of four cost 8 ticks
-        // from landing to the next take-off instead of 2. Landed (caught),
-        // within that block, and beyond the node along the leg to the next
-        // one: the landing happened. Not for a momentum-chain stone, whose
+        // A parkour landing the body came down PAST (improvement,
+        // allowLandingRetire). The arrival box is 0.35 wide; a running jump
+        // lands up to a block beyond its node, which is exactly what
+        // `landsThere` authorised. Outside the box the node is not retired,
+        // so the bot turns round, walks back into it, and takes the next
+        // jump from rest: on the arena's basic1 every 2-block hop of a chain
+        // of four cost 8 ticks from landing to the next take-off instead of
+        // 2. The rule is deliberately narrow: the body touched down THIS tick
+        // or the last (a standing body beside the node is not a landing),
+        // within a block, and beyond the node along the FLIGHT — from the
+        // node it took off from, never the leg to the next node: on a
+        // switchback that leg points back at the take-off and the test
+        // retired the landing before the jump (the bot then walked at the
+        // node after it, across the gap — a fall loop on a tree-crown climb
+        // in production, 2026-08-26). Not for a momentum-chain stone, whose
         // re-jump is pressed from ON the stone.
-        if (!passed && !swimming && path.length > 1 && caughtNow && Math.abs(dy) < 1 &&
+        if (!passed && stateMovements.allowLandingRetire && !swimming && path.length > 1 &&
+            caughtNow && landedTicksAgo <= 1 && prevRetired !== null && Math.abs(dy) < 1 &&
             (nextPoint as { parkour?: boolean }).parkour === true &&
             (path[1] as Move).chain !== true &&
             nextPoint.toBreak.length === 0 && nextPoint.toPlace.length === 0 &&
             Math.hypot(dx, dz) <= 1.0) {
-          const lx = path[1].x - nextPoint.x
-          const lz = path[1].z - nextPoint.z
-          passed = (p.x - nextPoint.x) * lx + (p.z - nextPoint.z) * lz > 0
+          const fx = nextPoint.x - prevRetired.x
+          const fz = nextPoint.z - prevRetired.z
+          passed = fx * fx + fz * fz > 1 && (p.x - nextPoint.x) * fx + (p.z - nextPoint.z) * fz > 0
         }
         if (!passed && !(Math.abs(dx) <= 0.35 && Math.abs(dz) <= 0.35 && Math.abs(dy) < arriveDy)) break
 
         // arrived at next point
         lastNodeTime = performance.now()
         lastNodeArrival = lastNodeTime
+        prevRetired = { x: nextPoint.x, y: nextPoint.y, z: nextPoint.z }
         path.shift()
         if (path.length === 0) { // done
           if (!dynamicGoal && stateGoal && (stateGoal.isEnd(p.floored()) || stateGoal.isEnd(p.floored().offset(0, 1, 0)))) {
@@ -2974,7 +2995,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         // Sneaking there costs nothing and the edge guard makes leaving the
         // block impossible; the jump itself fires from another branch with
         // sneak off.
-        const atLip = parkourNode && grounded && takeoffCap > 0 && takeoffProj >= takeoffCap - 0.5
+        const atLip = stateMovements.allowRunUp && parkourNode && grounded && takeoffCap > 0 && takeoffProj >= takeoffCap - 0.5
         // A body already in the air keeps flying the heading it took off on.
         // Whatever the gates think from here, releasing forward mid-flight
         // throws away the air control the jump was approved with and lands
@@ -3060,7 +3081,10 @@ export function createPathfinder (options: PathfinderOptions = {}) {
           // is a fall. A full block gets RUN_UP_ATTEMPTS for a run-flagged
           // node, one otherwise (the old single run-back).
           const narrow = narrowSupport
-          const maxAttempts = narrow ? 1 : (nextPoint as Move).run ? RUN_UP_ATTEMPTS : 1
+          // Without allowRunUp this is the single run-back the executor
+          // always had (phase 1 once, no sprint-in, no brake).
+          const lineUp = stateMovements.allowRunUp
+          const maxAttempts = narrow || !lineUp ? 1 : (nextPoint as Move).run ? RUN_UP_ATTEMPTS : 1
           if (runUpPhase === 0 && runUpAttempts < maxAttempts) {
             runUpAttempts++
             runUpPhase = 1
@@ -3085,7 +3109,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
               runBack = true
               runSneak = narrow
             } else {
-              runUpPhase = narrow ? 0 : 2
+              runUpPhase = narrow || !lineUp ? 0 : 2
               runUpTicks = 0
             }
           }
