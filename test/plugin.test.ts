@@ -12,7 +12,7 @@ import { makeDriveableBot, makeFakePhysics } from './helpers/fakeBot.js'
 import type { DriveableBot } from './helpers/fakeBot.js'
 
 interface PF {
-  goto: (goal: unknown) => Promise<void>
+  goto: (goal: unknown, options?: { bestEffort?: boolean, maxBestEffortLegs?: number }) => Promise<void>
   setGoal: (goal: unknown, dynamic?: boolean) => void
   setMovements: (m: Movements) => void
   stop: () => void
@@ -114,6 +114,46 @@ describe('plugin executor', function () {
     expect(outcome.status).to.equal('rejected')
     expect(outcome.error?.name).to.equal('NoPath')
     expect(outcome.error?.message).to.equal('No path to the goal!')
+  })
+
+  it('bestEffort resolves at the closest reachable cell instead of rejecting NoPath', async () => {
+    const world = makeWorld()
+    // Same walled goal as the NoPath test above: unreachable, but the solver
+    // still hands back the path to its closest node.
+    world.fill(9, 0, -3, 15, 2, 3, STONE)
+    world.fill(11, 0, -1, 13, 2, 1, AIR)
+    const { bot, pf } = setup(world)
+    pf.searchRadius = 64
+    const start = bot.entity.position.clone()
+    const outcome = await driveUntilSettled(bot, pf.goto(new GoalBlock(12, 0, 0), { bestEffort: true }))
+    expect(outcome.status).to.equal('resolved')
+    // It walked: away from the start, and up against the wall it cannot pass
+    // (the wall's near face is x=9, so the last standable cell is x=8).
+    const end = bot.entity.position
+    expect(end.distanceTo(start)).to.be.greaterThan(4)
+    expect(end.x).to.be.greaterThan(6)
+    expect(end.x).to.be.lessThan(9)
+    expect(Object.values(bot.controlState).some(v => v)).to.equal(false)
+  })
+
+  it('bestEffort still resolves normally when the goal IS reachable', async () => {
+    const world = makeWorld()
+    const { bot, pf } = setup(world)
+    const outcome = await driveUntilSettled(bot, pf.goto(new GoalBlock(8, 0, 0), { bestEffort: true }))
+    expect(outcome.status).to.equal('resolved')
+    expect(bot.entity.position.distanceTo(new Vec3(8.5, 0, 0.5))).to.be.lessThan(1.2)
+    expect(pf.goal).to.equal(null)
+  })
+
+  it('bestEffort is off by default (NoPath contract is unchanged)', async () => {
+    const world = makeWorld()
+    world.fill(9, 0, -3, 15, 2, 3, STONE)
+    world.fill(11, 0, -1, 13, 2, 1, AIR)
+    const { bot, pf } = setup(world)
+    pf.searchRadius = 64
+    const outcome = await driveUntilSettled(bot, pf.goto(new GoalBlock(12, 0, 0), {}))
+    expect(outcome.status).to.equal('rejected')
+    expect(outcome.error?.name).to.equal('NoPath')
   })
 
   it('stop() rejects PathStopped within a tick and clears controls', async () => {

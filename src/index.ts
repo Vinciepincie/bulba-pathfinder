@@ -14,7 +14,7 @@ export type { ComputedPathResult } from './plugin.js'
 export { Movements } from './movements.js'
 export * as goals from './goals.js'
 export { Move } from './move.js'
-export type { PathfinderOptions, MovementsConfig, RawPathNode, SolveStatus } from './types.js'
+export type { PathfinderOptions, MovementsConfig, RawPathNode, SolveStatus, GotoOptions } from './types.js'
 
 // Internals exported for tests / advanced embedding (reachability oracle use
 // per plan §6 M1); NOT part of the stable upstream-parity API surface.

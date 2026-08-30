@@ -50,7 +50,7 @@ import type {
 import type { ActionContext, DiggingBot } from './actions/context.js'
 import { resolveBlock, toVec3, inReach } from './actions/reach.js'
 import { GoalLookAtBlock, GoalNear } from './goals.js'
-import type { PathfinderOptions, GoalDescriptor, PhysicsLike } from './types.js'
+import type { PathfinderOptions, GoalDescriptor, PhysicsLike, GotoOptions } from './types.js'
 
 // Upstream lib/lock.js.
 class Lock {
@@ -1594,13 +1594,17 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       stopPathing = true
     }
 
-    pf.goto = (goal: Goal) => {
-      return gotoImpl(goal)
+    pf.goto = (goal: Goal, options?: GotoOptions) => {
+      return gotoImpl(goal, options)
     }
 
-    function gotoImpl (goal: Goal): Promise<void> {
+    function gotoImpl (goal: Goal, options: GotoOptions = {}): Promise<void> {
       // Port of upstream lib/goto.js — verbatim event contract and error
       // names; the wrapper string-matches these, keep them byte-identical.
+      // The one addition is `bestEffort` (see GotoOptions in types.ts).
+      const bestEffort = options.bestEffort === true
+      const maxLegs = options.maxBestEffortLegs ?? 3
+      let legs = 0
       return new Promise((resolve, reject) => {
         function makeError (name: string, message: string): Error {
           const err = new Error(message)
@@ -1616,7 +1620,24 @@ export function createPathfinder (options: PathfinderOptions = {}) {
           if (results.path.length === 0) {
             cleanup()
           } else if (results.status === 'noPath') {
-            cleanup(makeError('NoPath', 'No path to the goal!'))
+            // BEST EFFORT: a noPath is not empty-handed. Solver.finish returns
+            // the path to bestIdx — the closest node the search actually
+            // reached — exactly as it does for a timeout. Rejecting here throws
+            // that away, and every caller that wants "get as close as you can"
+            // then re-derives it by hand.
+            //
+            // Instead let the drive walk this leg. When it runs out the tick
+            // loop re-solves from the new block (see the movedSinceLastSolve
+            // branch), and the solve that finds nothing better returns an EMPTY
+            // path, which resolves above. So a best-effort goto ends with the
+            // bot parked on the closest cell this profile could reach.
+            //
+            // Bounded, because convergence is not guaranteed: a shifting goal
+            // or a moving world can hand back a fresh leg every time. Past the
+            // cap we resolve where we stand rather than reject, so callers get
+            // one outcome to handle instead of two.
+            if (bestEffort && ++legs <= maxLegs) return
+            cleanup(bestEffort ? undefined : makeError('NoPath', 'No path to the goal!'))
           } else if (results.status === 'timeout') {
             cleanup(makeError('Timeout', 'Took to long to decide path to goal!'))
           }

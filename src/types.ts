@@ -288,6 +288,30 @@ export interface PathfinderOptions {
   onNoPath?: (dump: NoPathDump) => void
 }
 
+/** Per-call options for `bot.pathfinder.goto(goal, options)`. */
+export interface GotoOptions {
+  /**
+   * Walk to the closest reachable cell instead of rejecting when the goal
+   * itself cannot be reached, and resolve there.
+   *
+   * The search already computes this: a noPath result carries the path to
+   * bestIdx, the closest node the search reached. Default `false` keeps the
+   * upstream contract (a NoPath error), because callers that route around an
+   * unreachable target must not silently get a partial walk.
+   *
+   * Turn it on where "as close as you can get" is the actual intent — reaching
+   * a block over broken ground, climbing as far up a canopy as walking allows —
+   * so the caller stops re-deriving by hand what the solver already knows.
+   */
+  bestEffort?: boolean
+  /**
+   * Best-effort legs to walk before resolving where we stand (default 3).
+   * Each leg is one noPath solve whose partial path the bot walks out; the cap
+   * bounds the case where the closest node keeps moving and never converges.
+   */
+  maxBestEffortLegs?: number
+}
+
 /** Payload of PathfinderOptions.onNoPath — serializable solver inputs. */
 export interface NoPathDump {
   meta: SnapshotMeta
