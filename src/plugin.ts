@@ -182,30 +182,102 @@ const SPRINT_TICK = 0.3
 const HOP_ARRIVE_DY = 1.45
 
 /**
- * How many nodes ahead the corner cut will look. One hop covers about four
- * blocks and the nodes are a block apart, so five is a whole arc's worth of
- * line to aim down — past that the scan costs more than the zig it saves,
- * and a cut that long is usually stopped by terrain anyway.
+ * Cosine of the largest angle between the body's velocity and the commanded
+ * heading at which a sprint-hop may still take off (20°). See the take-off
+ * decision in the sprint branch: a hop into a sharper turn flies the OLD
+ * heading and lands off the line. PF_HOP_TURN_DEG overrides it for A/B runs.
  */
-const CUT_LOOKAHEAD = 5
+const HOP_TURN_COS = Math.cos((Number(process.env.PF_HOP_TURN_DEG ?? 20) || 20) * Math.PI / 180)
 
 /**
- * How far off the cut line a node may sit and still count as gone by. An
- * eight-direction path approximating a straight run leaves its nodes up to
- * half a block off the line the body actually takes; 0.9 covers that and a
- * hop's landing scatter without reaching sideways for a node on a branch the
- * bot never went down.
+ * Parkour nodes this close ahead switch the corner cut off. A cut ends with
+ * the body lined up on the CHORD, which is not the line the take-off wants;
+ * measured on the two jump-dense routes, cutting into a jump made both of
+ * them walk further and finish later (simple3 +0.32 s, basic1 +0.37 s).
  */
-const CUT_RETIRE = 0.9
+const CUT_JUMP_GUARD = Number(process.env.PF_CUT_JUMP_GUARD ?? 5) || 5
 
 /**
- * How far off the new line a skipped node may sit for the cut to be TAKEN.
- * Deliberately tighter than CUT_RETIRE: the body does not walk the ideal
- * chord (turn radius, air control mid-hop, server rounding), so selecting all
- * the way out to the retirement disc leaves nodes that miss it in practice —
- * and a node that misses it is stranded for the rest of the path.
+ * Nodes scanned on the tick a cut is (re)picked. The line is then EXTENDED
+ * by up to CUT_EXTEND nodes a tick while the body walks it, so the target
+ * runs out to the visibility horizon within a few ticks without any one tick
+ * paying for the whole scan. Extension only ever moves the aim further along
+ * the same path, so the heading turns once, onto the line, and never flicks.
  */
-const CUT_SELECT = 0.55
+const CUT_SCAN_INIT = 8
+const CUT_EXTEND = 4
+
+/**
+ * Consecutive candidates whose chord the body does not fit down before a
+ * scan stops. Visibility is not monotonic in path order: a corner can mask
+ * the nearer node and clear the further one.
+ */
+const CUT_MISSES = 2
+
+/**
+ * Longest chord the cut steers down, in blocks. Past this the heading is
+ * already the straight line to within a degree, and every re-validation
+ * costs a sweep of this length per tick.
+ */
+const CUT_MAX_CHORD = 32
+
+/**
+ * Spacing of the synthetic nodes the physics gates are shown along a live
+ * chord (gatePath in the tick loop): the block-a-node density the rollouts
+ * and the hop score were tuned on, laid along the line actually being walked
+ * instead of the zig-zag being skipped.
+ */
+const CUT_GATE_STEP = 1.0
+
+/**
+ * How far ahead of the body's foot on the cut LINE the steering point sits
+ * (pure pursuit). The line is fixed when the target is picked and the anchor
+ * slides along it; steering at a point 1.5 blocks up the line pulls a body
+ * knocked sideways back onto it at a strong angle, where steering straight at
+ * a target 30 blocks out barely turns for a block of error. That feedback is
+ * what the physics rollouts assume — they re-aim at a node every block — and
+ * without it a hop taken into a turn carried its old momentum 1.4 blocks off
+ * the line and off a ledge (arena simple1, the first taut-cut run).
+ */
+const CUT_CARROT = Number(process.env.PF_CUT_CARROT ?? 1.5) || 1.5
+
+/** Lateral error from the line past which the cut is dropped and re-picked from where the body is. */
+const CUT_MAX_OFF = 0.6
+
+/**
+ * Ground required either side of a NEW line, in blocks, over its first
+ * CUT_MARGIN_LEN blocks — OFF by default, kept as an A/B knob
+ * (PF_CUT_SIDE_MARGIN / PF_CUT_MARGIN_LEN).
+ *
+ * It was the first answer to the simple1 fall (a hop into a turn drifting
+ * off a one-wide ledge): refuse a line that skims an edge where the body is
+ * still turning onto it. Measured on the arena it is the wrong answer. 2b2t
+ * spawn is one-wide ledges and holes, and a half-block margin — even held
+ * only for the first five blocks of a line and never on re-validation —
+ * refused most lines: simple2 14.46 s against 13.87 s without it, simple3
+ * 8.73 against 8.15, basic2 17.50 against 16.16. Pure pursuit (CUT_CARROT)
+ * alone removed the fall (simple1 10.69 s, from 19.9 s falling and 11.08 s
+ * on the old cut), because the fall was a steering problem, not a geometry
+ * one. Applied, when on, at pick and extension only.
+ */
+const CUT_SIDE_MARGIN = Number(process.env.PF_CUT_SIDE_MARGIN ?? 0)
+const CUT_MARGIN_LEN = Number(process.env.PF_CUT_MARGIN_LEN ?? 5) || 5
+
+/**
+ * A server correction that moved the body no further than this, with a cut
+ * live, keeps the cut. Under a cut the body is legitimately off every node
+ * (the chord runs across the zig-zag, up to a few blocks from its corner), so
+ * the lagback handler's node-distance test would read a routine sub-block
+ * correction as "snapped away" and replan the whole route.
+ */
+const CUT_LAG_NEAR = 2
+
+/**
+ * Under a live cut the wall-slide probes only the axes the chord actually
+ * moves along: a component below this fraction of the heading is a line
+ * running a few degrees off a wall, not into it.
+ */
+const SLIDE_AXIS_MIN = 0.2
 
 /**
  * How far ABOVE a parkour node the body may be and still retire it in the
@@ -225,21 +297,6 @@ const PARKOUR_LAND_DY = 0.5
  * needs, and decides from the velocity it actually has.
  */
 const FALL_DAMAGE_DISTANCE = 3
-
-/** Horizontal distance from a point to a segment, in the XZ plane. */
-function pointToSegment (
-  q: { x: number, z: number },
-  a: { x: number, z: number },
-  b: { x: number, z: number }
-): number {
-  const abx = b.x - a.x
-  const abz = b.z - a.z
-  const len2 = abx * abx + abz * abz
-  if (len2 < 1e-9) return Math.hypot(q.x - a.x, q.z - a.z)
-  let t = ((q.x - a.x) * abx + (q.z - a.z) * abz) / len2
-  t = Math.max(0, Math.min(1, t))
-  return Math.hypot(q.x - (a.x + abx * t), q.z - (a.z + abz * t))
-}
 
 /**
  * Air (of mineflayer's 0..20) below which the executor abandons the node and
@@ -325,6 +382,10 @@ export function createPathfinder (options: PathfinderOptions = {}) {
     let hopHold = false
     /** The node the corner cut is steering at, held until reached or invalid. */
     let cutTarget: Move | null = null
+    /** Anchor of the cut line (slides along it each grounded tick); the line is cutFrom → cutTarget. */
+    let cutFrom: Vec3 | null = null
+    /** Body position at the last tick, for the lagback handler's cut-aware near test (CUT_LAG_NEAR). */
+    let prevTickPos: Vec3 | null = null
     // Wedge recovery state — see the tick loop's recovery block.
     let wedgeAnchor: Vec3 | null = null
     let wedgeTicks = 0
@@ -1797,8 +1858,13 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       lastForcedMoveAt = performance.now()
       if (path.length === 0) return
       const at = bot.entity.position.floored()
-      if (isPositionNearPath(at, path)) {
-        pathFromPlayer(path)
+      // Under a live cut the body is off every node by design, and the
+      // skipped nodes retire on their own as it draws level with them, so a
+      // small correction changes nothing: keep the line (CUT_LAG_NEAR).
+      const nearCut = cutTarget !== null && prevTickPos !== null &&
+        bot.entity.position.distanceTo(prevTickPos) <= CUT_LAG_NEAR
+      if (nearCut || isPositionNearPath(at, path)) {
+        if (!nearCut) pathFromPlayer(path)
         // A correction is not "stuck" — but only for as long as the bot is
         // otherwise making progress. A bot WEDGED in geometry gets corrected
         // every tick, and refreshing unconditionally meant the 3.5 s futility
@@ -1846,8 +1912,10 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       const t0 = performance.now()
       try {
         physics.beginTick?.()
+        geometry.beginTick()
         monitorMovementInner()
       } finally {
+        geometry.endTick()
         inTick = false
         lastTickMs = performance.now() - t0
       }
@@ -2114,6 +2182,10 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         else landedTicksAgo = 0
         lastTickGrounded = groundedNow
       }
+      // A target from a path that has since been replaced, or one that has
+      // become path[0] itself, is no line at all — and the retirement rule
+      // below measures skipped nodes against it.
+      if (cutTarget !== null && path.indexOf(cutTarget) < 1) cutTarget = null
       for (;;) {
         // Improvement: never finish a path mid-air. The arrival box has no
         // ground requirement, so a goal satisfied at jump apex would cut
@@ -2199,20 +2271,32 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         //     was reported for.
         //
         // Projecting onto the chord cannot have an empty window: the body
-        // advances along it monotonically, and selection already bounded the
-        // node's distance FROM it to CUT_SELECT, which is inside the
-        // retirement disc with margin to spare. Never the last node: the goal
-        // is always arrived at.
+        // advances along it monotonically. A skipped node is done the moment
+        // the body draws LEVEL with it — behind the plane square to the chord
+        // through the body — however far off the line it sits: the cut
+        // committed to reaching the target directly, and a node behind that
+        // plane can only be collected by turning round. (The old rule also
+        // wanted the node within 0.9 of the body, which is why selection had
+        // to keep every skipped node hugging the chord, and why a run four
+        // across and thirteen along walked the zig-zag's 45° leg and then its
+        // straight leg instead of the line between the ends.) Or the body is
+        // inside the TARGET's own box with skipped nodes still queued — a
+        // path that wiggled back on itself — and they are all behind it by
+        // construction. Never the target itself, and never the last node:
+        // the goal is always arrived at.
         let passed = false
-        if (cutTarget !== null && !swimming && path.length > 1 && Math.abs(dy) < arriveDy &&
+        if (cutTarget !== null && cutTarget !== nextPoint && !swimming && path.length > 1 &&
+            Math.abs(dy) < arriveDy &&
             (nextPoint as { parkour?: boolean }).parkour !== true &&
             nextPoint.toBreak.length === 0 && nextPoint.toPlace.length === 0) {
-          const cx = cutTarget.x - p.x
-          const cz = cutTarget.z - p.z
-          const clen = Math.hypot(cx, cz)
-          passed = clen > 1e-6 &&
-            (dx * cx + dz * cz) / clen < 0 &&
-            Math.hypot(dx, dz) <= CUT_RETIRE
+          // The line's own direction, so a body knocked off it does not tilt
+          // the plane; body-to-target when no anchor is known.
+          const from = cutFrom ?? p
+          const cx = cutTarget.x - from.x
+          const cz = cutTarget.z - from.z
+          passed = dx * cx + dz * cz <= 0 ||
+            (Math.abs(cutTarget.x - p.x) <= 0.35 && Math.abs(cutTarget.z - p.z) <= 0.35 &&
+             Math.abs(cutTarget.y - p.y) < arriveDy)
         }
         // A parkour landing the body came down PAST (improvement,
         // allowLandingRetire). The arrival box is 0.35 wide; a running jump
@@ -2247,6 +2331,10 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         lastNodeArrival = lastNodeTime
         prevRetired = { x: nextPoint.x, y: nextPoint.y, z: nextPoint.z }
         path.shift()
+        // The target itself just retired: the nodes beyond it are not
+        // "behind" anything, and the retirement rule above must not measure
+        // them against a chord that no longer exists.
+        if (cutTarget === nextPoint) cutTarget = null
         if (path.length === 0) { // done
           if (!dynamicGoal && stateGoal && (stateGoal.isEnd(p.floored()) || stateGoal.isEnd(p.floored().offset(0, 1, 0)))) {
             // A soft-replan solve may still be in flight (we kept walking the
@@ -2292,6 +2380,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
           airTicks = 0
         }
         prevTickY = p.y
+        prevTickPos = p.clone()
         if (!grounded && !swimming) {
           wasAirborne = true
           if (p.y > airPeakY) airPeakY = p.y
@@ -2443,11 +2532,10 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       // exclusion zones stops the scan, because those carry planner reasoning
       // a swept box cannot re-derive.
       //
-      // The nodes are STEERED PAST, not spliced out. Dropping them ahead of
-      // time leaves the body behind its own path[0], and upstream's lagback
-      // recovery reads exactly that — `isPositionNearPath` compares against
-      // the first node directly — so a routine sub-block correction stopped
-      // splicing and forced a full replan instead.
+      // The nodes are STEERED PAST, not spliced out: each retires as the body
+      // draws level with it (the arrival loop), so path[0] stays the first
+      // node still ahead, and everything that reads path[0] — the lagback
+      // recovery, the parkour approach, the trace — keeps its meaning.
       // Kept pointing at path[0] whatever the cut does below. The angle
       // solver's offset is measured from the heading to path[0], so adding it
       // to a heading aimed several nodes further on would fly the jump at
@@ -2458,16 +2546,13 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       // entity avoidance are cost fields the planner paid to detour around,
       // and geometry cannot see either — a mob the profile is avoiding leaves
       // a one-cell detour that the cut would happily straighten right back
-      // through it.
+      // through it. Liquids likewise: the swept box reads a pond's bed as
+      // floor, and the planner priced the swim.
       //
-      // And never on the approach to a jump. A cut ends with the body lined
-      // up on the CHORD, which is not the line the take-off wants; measured
-      // on the two jump-dense routes, cutting into a jump made both of them
-      // walk further and finish later (simple3 +0.32 s, basic1 +0.37 s) while
-      // the plain-running routes gained half a second each. So the cut owns
+      // And never on the approach to a jump (CUT_JUMP_GUARD): the cut owns
       // the running and the node-by-node follower owns the jumps.
       let jumpAhead = false
-      for (let k = 0; k < Math.min(CUT_LOOKAHEAD, path.length); k++) {
+      for (let k = 0; k < Math.min(CUT_JUMP_GUARD, path.length); k++) {
         if ((path[k] as { parkour?: boolean }).parkour === true) { jumpAhead = true; break }
       }
       const mayCut = stateMovements.allowCornerCut && !swimming && path.length > 1 &&
@@ -2476,73 +2561,163 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         (nextPoint as { parkour?: boolean }).parkour !== true &&
         nextPoint.toBreak.length === 0 && nextPoint.toPlace.length === 0 &&
         Math.abs(nextPoint.y - p.y) <= HOP_ARRIVE_DY
-      /** Is this node still a legal thing to be steering at from here? */
-      const cuttableTo = (n: Move & { parkour?: boolean }, upTo: number): boolean => {
-        if (n.parkour === true || n.toBreak.length > 0 || n.toPlace.length > 0) return false
-        if (Math.abs(n.y - nextPoint.y) > 0.1) return false
-        // Never steer BACKWARDS. Without this the re-pick can answer with a
-        // node the body has already gone by — the shortest legal chord is the
-        // one behind you — and the bot turns round, collects it, cuts forward
-        // and turns round again.
-        if ((n.x - p.x) * nodeDx + (n.z - p.z) * nodeDz <= 0) return false
-        // Only cut a corner whose skipped nodes can still be COLLECTED. They
-        // retire by being gone by rather than by being stood on, and that
-        // test has a reach; a node further off the new line than that reach
-        // is never reached and never retired, so the bot turns round for it.
-        // Cutting without this check made every route LONGER and added
-        // replans — simple2 went from 105 blocks and 15.7 s to 111 and 19.9.
-        //
-        // j starts at ZERO. path[0] is a skipped node like any other — the
-        // chord runs from the BODY, not from path[0] — and it is the only one
-        // the arrival loop can ever retire, so leaving it unmeasured is the
-        // one omission that strands a node with certainty.
-        //
-        // Selection is bounded tighter than retirement on purpose. Equal
-        // bounds leave no margin for the body deviating from the ideal chord
-        // — turn radius, air control during a hop, server rounding — and the
-        // real offset is routinely larger than the geometric one measured
-        // here.
-        for (let j = 0; j < upTo; j++) {
-          if (pointToSegment(path[j], p, n) > CUT_SELECT) return false
+      const cutAvoid = new Set(stateMovements.blocksToAvoid)
+      for (const id of stateMovements.liquids) cutAvoid.add(id)
+      /**
+       * Can the body steer at path[k] from here? A rise, a jump or work to do
+       * at the node ends a scan outright ('stop'): those carry planner
+       * reasoning a swept box cannot re-derive, and nothing past them is one
+       * line away either. A chord the body does not fit down is a 'miss', and
+       * the scan looks a little further (CUT_MISSES). `ref` is the direction
+       * that counts as forwards — never steer BACKWARDS, or the pick answers
+       * with a node the body has already gone by (the shortest legal chord is
+       * the one behind you) and the bot turns round, collects it, cuts forward
+       * and turns round again.
+       *
+       * The skipped nodes are NOT required to hug the chord. They used to be
+       * (within 0.55), because they retired only within 0.9 of the body; they
+       * now retire as the body draws level with them, so the line may run
+       * straight across a whole zig-zag — the diagonal leg and the straight
+       * leg of an L become one chord between its ends.
+       */
+      const cuttableTo = (k: number, ox: number, oz: number, refDx: number, refDz: number, margin: boolean): 'ok' | 'miss' | 'stop' => {
+        const n = path[k]
+        if (n.toBreak.length > 0 || n.toPlace.length > 0) return 'stop'
+        if (Math.abs(n.y - nextPoint.y) > 0.1) return 'stop'
+        // A cut ends CUT_JUMP_GUARD nodes short of a jump, so that it ends by
+        // REACHING a node on the path and the approach is walked on the
+        // planner's own cells. Ending it only when the jump comes within the
+        // guard of path[0] (the per-tick check above) left the body wherever
+        // the taut line had it — off the node line by up to a couple of
+        // blocks — at the moment node-by-node following took the take-off.
+        for (let j = k; j < Math.min(k + CUT_JUMP_GUARD, path.length); j++) {
+          if (path[j].parkour) return 'stop'
         }
+        const cx = n.x - ox
+        const cz = n.z - oz
+        const clen = Math.hypot(cx, cz)
+        if (clen > CUT_MAX_CHORD) return 'stop'
+        if (clen < 0.3 || cx * refDx + cz * refDz <= 0) return 'miss'
         return geometry.walkableLine(
-          bot, p.x, p.z, n.x, n.z, nextPoint.y, stateMovements.blocksToAvoid,
-          (cx, cy, cz) => stateMovements.getNumEntitiesAt({ x: cx, y: cy, z: cz }, 0, 0, 0))
+          bot, ox, oz, n.x, n.z, nextPoint.y, cutAvoid,
+          (ex, ey, ez) => stateMovements.getNumEntitiesAt({ x: ex, y: ey, z: ez }, 0, 0, 0),
+          0.25, margin ? CUT_SIDE_MARGIN : 0, CUT_MARGIN_LEN)
+          ? 'ok'
+          : 'miss'
+      }
+      /** The furthest legal node among path[from .. from+count) seen from (ox, oz), or null. */
+      const scanCut = (from: number, count: number, ox: number, oz: number, refDx: number, refDz: number): Move | null => {
+        let best: Move | null = null
+        let misses = 0
+        const end = Math.min(from + count, path.length)
+        for (let k = from; k < end; k++) {
+          const verdict = cuttableTo(k, ox, oz, refDx, refDz, true)
+          if (verdict === 'stop') break
+          if (verdict === 'miss') {
+            if (++misses >= CUT_MISSES) break
+            continue
+          }
+          misses = 0
+          best = path[k]
+        }
+        return best
       }
       if (!mayCut) cutTarget = null
       else {
-        // COMMIT to a target. Re-picking the furthest legal node every tick
-        // makes the heading flick between path[1] and path[4] as the line
-        // scan flickers on and off near terrain, which is a wobble on the
-        // screen and a waste of momentum. The target is kept until the body
-        // reaches it (it retires like any other node) or it stops being
-        // legal, and only then is a new one chosen.
+        // COMMIT to a target, and only ever trade it for one FURTHER along
+        // the same path. Re-picking the furthest legal node every tick made
+        // the heading flick between path[1] and path[4] as the line scan
+        // flickered on and off near terrain — a wobble on the screen and a
+        // waste of momentum. Extension has no such failure: the aim moves in
+        // one direction, onto the straight line, and stops at the horizon.
+        // The target is dropped only when it stops being legal (the chord
+        // from where the body now is no longer fits), when the body has been
+        // knocked too far off its line (CUT_MAX_OFF), or when it is reached.
+        //
+        // The line is FIXED: anchor → target, with the anchor sliding along
+        // it to the body's foot each grounded tick, so the direction never
+        // changes underneath the body and lateral error is a real quantity
+        // the steering below can correct. Re-anchoring the chord at the body
+        // every tick (the first taut cut did) has no memory of the line: a
+        // body pushed sideways simply gets a new, rotated chord, and steering
+        // straight at a far target never pulls it back.
         //
         // A body in the air keeps the target it took off with, unrevalidated.
-        // Mid-arc the geometry moves under it — a skipped node clamps past
-        // the selection bound as the body draws level with it — so a live
-        // re-pick swings the yaw by up to 180 degrees with only air control
-        // (0.02 per tick) to answer it, and the bot lands off the line. This
-        // is the same reasoning as biasFlight: a line committed to on the
-        // ground is flown on the ground's terms.
+        // Mid-arc a live re-pick swings the yaw with only air control (0.02
+        // per tick) to answer it, and the bot lands off the line. This is the
+        // same reasoning as biasFlight: a line committed to on the ground is
+        // flown on the ground's terms.
         const airborne = (bot.entity as { onGround?: boolean }).onGround !== true
         if (cutTarget !== null && !airborne) {
           const at = path.indexOf(cutTarget)
-          if (at < 1 || !cuttableTo(cutTarget as Move & { parkour?: boolean }, at)) cutTarget = null
-        }
-        if (cutTarget !== null && path.indexOf(cutTarget) < 1) cutTarget = null
-        if (cutTarget === null && !airborne) {
-          for (let k = 1; k < Math.min(CUT_LOOKAHEAD, path.length); k++) {
-            if (!cuttableTo(path[k] as Move & { parkour?: boolean }, k)) break
-            cutTarget = path[k]
+          const from = cutFrom ?? p
+          const ldx = cutTarget.x - from.x
+          const ldz = cutTarget.z - from.z
+          const llen2 = ldx * ldx + ldz * ldz
+          const t = llen2 > 1e-9 ? Math.max(0, Math.min(1, ((p.x - from.x) * ldx + (p.z - from.z) * ldz) / llen2)) : 1
+          const fx = from.x + ldx * t
+          const fz = from.z + ldz * t
+          if (at < 1 || llen2 < 1e-9 || Math.hypot(p.x - fx, p.z - fz) > CUT_MAX_OFF) cutTarget = null
+          else {
+            if (cutFrom === null) cutFrom = new Vec3(fx, cutTarget.y, fz)
+            else { cutFrom.x = fx; cutFrom.z = fz }
+            if (cuttableTo(at, fx, fz, ldx, ldz, false) !== 'ok') cutTarget = null
+            else {
+              const further = scanCut(at + 1, CUT_EXTEND, fx, fz, ldx, ldz)
+              if (further !== null) cutTarget = further
+            }
           }
         }
-        if (cutTarget !== null) {
-          // Steer at it; the gates below still reason about path[0], which is
-          // on this same line and closer, so nothing is authorised that the
-          // node-by-node follower would not have authorised.
-          dx = cutTarget.x - p.x
-          dz = cutTarget.z - p.z
+        if (cutTarget !== null && path.indexOf(cutTarget) < 1) cutTarget = null
+        // Forwards, for a fresh pick, is the path's own next leg from here:
+        // path[1] is always ahead of itself, and a node lying behind that
+        // direction is one the body overshot and must go back for.
+        if (cutTarget === null && !airborne) {
+          cutTarget = scanCut(1, CUT_SCAN_INIT, p.x, p.z, path[1].x - p.x, path[1].z - p.z)
+          if (cutTarget !== null) cutFrom = p.clone()
+        }
+      }
+
+      // What the physics gates are asked about. Node by node, the path
+      // itself. Under a live cut, the LINE being walked: synthetic nodes a
+      // block apart up the line from the body's foot to the target, then the
+      // real path beyond it. Every rollout — sprint, hop, grind, the jump
+      // gates — then drives the heading the body is about to take rather than
+      // the zig-zag it is skipping, and the node-count heuristics (HOP_LOOK,
+      // the hop score, the rise scan) see the block-a-node density they were
+      // tuned on. With the old bounded cut path[0] was always within half a
+      // block of the chord, so asking about it was asking about the line; a
+      // taut cut leaves path[0] up to several blocks off to the side, where a
+      // rollout would authorise the wrong heading or refuse the right one.
+      //
+      // And the steering itself (pure pursuit, CUT_CARROT): aim at the point
+      // on the line CUT_CARROT ahead of the body's foot, not at the target.
+      // On the line the two headings are identical; off it, the carrot pulls
+      // the body back at atan(error / CUT_CARROT), which is the same feedback
+      // the rollouts model when they re-aim node by node.
+      let gatePath: Array<{ x: number, y: number, z: number, parkour?: boolean }> = path
+      if (cutTarget !== null) {
+        const at = path.indexOf(cutTarget)
+        const from = cutFrom ?? p
+        const ldx = cutTarget.x - from.x
+        const ldz = cutTarget.z - from.z
+        const llen = Math.hypot(ldx, ldz)
+        if (llen < 1e-6) cutTarget = null
+        else {
+          const ux = ldx / llen
+          const uz = ldz / llen
+          const t = Math.max(0, Math.min(1, ((p.x - from.x) * ldx + (p.z - from.z) * ldz) / (llen * llen)))
+          const fx = from.x + ldx * t
+          const fz = from.z + ldz * t
+          const ahead = llen * (1 - t)
+          const reach = Math.min(CUT_CARROT, ahead)
+          dx = fx + ux * reach - p.x
+          dz = fz + uz * reach - p.z
+          const line: Array<{ x: number, y: number, z: number, parkour?: boolean }> = []
+          for (let s = CUT_GATE_STEP; s < ahead - 0.01; s += CUT_GATE_STEP) {
+            line.push({ x: fx + ux * s, y: cutTarget.y, z: fz + uz * s, parkour: false })
+          }
+          gatePath = [...line, ...path.slice(at)]
         }
       }
 
@@ -2556,7 +2731,15 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       const stillTicks = updateWedge(p)
       const wedged = stillTicks > WEDGE_TICKS ||
         (stillTicks >= 1 && (bot.entity as { onGround?: boolean }).onGround === true &&
-         physics.isGrinding(path))
+         physics.isGrinding(gatePath))
+      // A wedged body has just contradicted the swept line its target was
+      // chosen on, and the recovery below reasons about path[0]: give it path[0].
+      if (wedged && cutTarget !== null) {
+        cutTarget = null
+        gatePath = path
+        dx = nodeDx
+        dz = nodeDz
+      }
 
       // Diagonal squeeze: go round the corner that is actually open
       // (improvement).
@@ -2596,7 +2779,10 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       let squeezed = false
       const walkNode = (nextPoint as { parkour?: boolean }).parkour !== true &&
         nextPoint.toBreak.length === 0 && nextPoint.toPlace.length === 0
-      const flatDiagonal = walkNode && !swimming && !wedged && earlySqueeze && Math.abs(dy) <= 0.1 &&
+      // Not under a live cut: its chord is verified, and a waypoint pushed in
+      // front of path[0] would override the heading it is walking.
+      const flatDiagonal = walkNode && !swimming && !wedged && cutTarget === null && earlySqueeze &&
+        Math.abs(dy) <= 0.1 &&
         Math.abs(Math.floor(nextPoint.x) - Math.floor(p.x)) === 1 &&
         Math.abs(Math.floor(nextPoint.z) - Math.floor(p.z)) === 1
       if ((wedged && walkNode) || flatDiagonal) {
@@ -2743,16 +2929,26 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       // rollout approved, and re-steering it mid-flight would land the bot
       // somewhere the planner never routed through.
       //
-      // Judged on the step to path[0], not on the corner cut's steering
-      // target: with a cut live, `hypot(dx, dz)` is several blocks and this
-      // whole block was skipped — heading still aimed diagonally into the
+      // Judged on the step being walked, never skipped because a cut is live:
+      // with a cut live, `hypot(dx, dz)` is several blocks, and when this
+      // block gated on that the heading stayed aimed diagonally into the
       // face, which is precisely the 25-corrections state it was written for.
       // A wall in the way also ENDS the cut: geometry has just contradicted
       // the swept line the target was chosen on.
+      //
+      // Under a cut the probes follow the CHORD's axes, not the step to
+      // path[0] (which a taut cut leaves off to the side), and only the axes
+      // the chord actually moves along (SLIDE_AXIS_MIN): a line running a few
+      // degrees off a wall must not read as walking into it, or the cut
+      // flickers off and on against every wall it passes.
+      const slideLive = cutTarget !== null
+      const slideDx = slideLive ? dx : nodeDx
+      const slideDz = slideLive ? dz : nodeDz
       if (!climbing && (nextPoint as { parkour?: boolean }).parkour !== true &&
-          dy <= STEP_UP_MIN && Math.hypot(nodeDx, nodeDz) <= WALK_STEP_REACH) {
-        const sx = Math.sign(nodeDx)
-        const sz = Math.sign(nodeDz)
+          dy <= STEP_UP_MIN && (slideLive || Math.hypot(nodeDx, nodeDz) <= WALK_STEP_REACH)) {
+        const slideLen = Math.hypot(slideDx, slideDz) || 1
+        const sx = slideLive && Math.abs(slideDx) / slideLen < SLIDE_AXIS_MIN ? 0 : Math.sign(slideDx)
+        const sz = slideLive && Math.abs(slideDz) / slideLen < SLIDE_AXIS_MIN ? 0 : Math.sign(slideDz)
         const xBlocked = sx !== 0 && geometry.playerCollides(bot, p.x + sx * SLIDE_PROBE, p.y, p.z)
         const zBlocked = sz !== 0 && geometry.playerCollides(bot, p.x, p.y, p.z + sz * SLIDE_PROBE)
         // The standoff is a fraction of the ALONG-wall component, and it
@@ -2764,6 +2960,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         // the wedge recovery below deal with it if nothing moves.
         if (zBlocked || xBlocked) {
           cutTarget = null
+          gatePath = path
           dx = nodeDx
           dz = nodeDz
         }
@@ -2835,7 +3032,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       // A flat walking step (no rise to jump for): the angled-walk branch
       // below may steer it round a clipped corner instead of jumping it.
       const flatWalkStep = walkNode && !swimming && !climbing && dy <= STEP_UP_MIN &&
-        Math.hypot(nodeDx, nodeDz) <= WALK_STEP_REACH
+        (cutTarget !== null || Math.hypot(nodeDx, nodeDz) <= WALK_STEP_REACH)
       let walkBias: number | null = null
       // Sneak is only ever engaged by the corner-creep branch below; every
       // other branch (including the jump itself) must take off un-sneaked.
@@ -2873,7 +3070,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         bot.setControlState('jump', nextPoint.y > bot.entity.position.y + (inColumn ? 0.25 : -0.1))
         bot.setControlState('sprint', false)
         execBranch = 'swim'
-      } else if (maySprint && physics.canStraightLine(path, true)) {
+      } else if (maySprint && physics.canStraightLine(gatePath, true)) {
         // Sprint-hop (improvement, allowSprintHop): the plain sprint upstream
         // uses here is the SLOWEST way a bot with a jump key crosses open
         // ground — 5.56 blocks/s against 6.97 hopping, measured on the arena
@@ -2883,8 +3080,23 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         // gaits down this same path: the hop has to actually get further,
         // without losing height, or the bot keeps its feet.
         if ((bot.entity as { onGround?: boolean }).onGround === true) {
-          hopHold = stateMovements.allowSprintHop &&
-            physics.sprintHopBetter(path, stateMovements.allowLowCeilingHop)
+          // Never take off INTO a turn (HOP_TURN_MAX). A hop carries the
+          // body's momentum for a whole arc with 0.02 a tick of air control,
+          // so a take-off whose heading differs from the velocity lands off
+          // the line by most of a block: traced on the arena's simple1, a
+          // landing at full sprint onto a 45° line hopped at once, flew at
+          // ~30°, came down 0.64 off the line in the gap between two cells of
+          // a one-wide diagonal ledge and fell seven blocks. The rollout did
+          // not catch it because its yaw is set instantly. Sprinting the turn
+          // costs a few ticks — ground friction realigns the velocity in
+          // three or four — and the hop resumes once aligned.
+          const v = bot.entity.velocity
+          const speed = Math.hypot(v.x, v.z)
+          const head = Math.hypot(dx, dz)
+          const turning = speed > 0.1 && head > 1e-6 &&
+            (v.x * dx + v.z * dz) / (speed * head) < HOP_TURN_COS
+          hopHold = stateMovements.allowSprintHop && !turning &&
+            physics.sprintHopBetter(gatePath, stateMovements.allowLowCeilingHop)
         }
         // PRESS on the landing tick, never hold. prismarine-physics charges a
         // held jump key a 10-tick re-jump cooldown (`autojumpCooldown`) and
@@ -2899,27 +3111,29 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         bot.setControlState('jump', hopHold && (bot.entity as { onGround?: boolean }).onGround === true)
         bot.setControlState('sprint', true)
         execBranch = hopHold ? 'hop' : 'sprint'
-      } else if (flatWalkStep && (walkBias = physics.bestWalkHeading(path, maySprint)) !== null) {
+      } else if (flatWalkStep && (walkBias = physics.bestWalkHeading(gatePath, maySprint)) !== null) {
         // Angled walk (improvement): a flat step whose straight line grinds
         // on a corner is WALKED round it, before the jump gates get it. See
         // PhysicsSim.bestWalkHeading; the offset is re-solved every tick, so
         // the moment the straight line works again the branch above wins.
         hopHold = false
-        bot.look(Math.atan2(-nodeDx, -nodeDz) + walkBias, 0)
+        // Off the line being walked: the chord under a live cut, else the step.
+        if (cutTarget !== null) bot.look(Math.atan2(-dx, -dz) + walkBias, 0)
+        else bot.look(Math.atan2(-nodeDx, -nodeDz) + walkBias, 0)
         bot.setControlState('jump', false)
         bot.setControlState('sprint', maySprint)
         execBranch = 'walk-angled'
-      } else if (maySprint && physics.canSprintJump(path)) {
+      } else if (maySprint && physics.canSprintJump(gatePath)) {
         hopHold = false
         bot.setControlState('jump', true)
         bot.setControlState('sprint', true)
         execBranch = 'sprintjump'
-      } else if (physics.canStraightLine(path)) {
+      } else if (physics.canStraightLine(gatePath)) {
         hopHold = false
         bot.setControlState('jump', false)
         bot.setControlState('sprint', false)
         execBranch = maySprint ? 'walk' : 'walk-nosprint'
-      } else if (physics.canWalkJump(path)) {
+      } else if (physics.canWalkJump(gatePath)) {
         hopHold = false
         bot.setControlState('jump', true)
         bot.setControlState('sprint', false)
@@ -3180,7 +3394,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
           execTick, +p.x.toFixed(2), +p.y.toFixed(2), +p.z.toFixed(2),
           (bot.entity as { onGround?: boolean }).onGround === true ? 1 : 0,
           execBranch, c.forward ? 1 : 0, c.sprint ? 1 : 0, c.jump ? 1 : 0, c.sneak ? 1 : 0, c.back ? 1 : 0,
-          cutTarget !== null ? 1 : 0, path.length,
+          cutTarget !== null ? +Math.hypot(cutTarget.x - p.x, cutTarget.z - p.z).toFixed(1) : 0, path.length,
           n ? [+n.x.toFixed(1), +n.y.toFixed(1), +n.z.toFixed(1), (n as { parkour?: boolean }).parkour ? 1 : 0] : null,
           [+v.x.toFixed(3), +v.y.toFixed(3), +v.z.toFixed(3)],
           +lastTickMs.toFixed(2),

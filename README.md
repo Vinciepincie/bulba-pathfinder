@@ -414,25 +414,64 @@ and `enable`/`disable`, and both `opts` and `options`.
   centre to cell centre over eight directions, so a run a few degrees off a
   cardinal comes back as an alternating zig-zag — and a follower that steers
   at each centre walks every zig and swings its heading ±45° at every one. The
-  executor instead steers at the furthest node it can reach in a straight line
-  the body fits down (full hitbox sampled every quarter block, floor under
-  every sample), and the nodes it skips retire by being gone by rather than by
-  being stood on. Worth 0.2–0.5 s a route on the arena; the plan is untouched,
-  so turning it off restores node-by-node following exactly.
+  executor instead pulls the string taut: it steers along a straight line to
+  the furthest node the body fits down (full hitbox sampled every quarter
+  block, floor under every sample, no liquid or avoided block in any cell),
+  up to 32 blocks out, and the nodes it skips retire as the body draws level
+  with them rather than by being stood on. A run four blocks across and
+  thirteen along is planned as a 45° leg and a straight leg; the bot walks
+  the line between the two ends. The plan is untouched, so turning it off
+  restores node-by-node following exactly. Measured on the arena against the
+  bounded cut it replaced: simple2 14.5 → 13.9 s, simple3 8.9 → 8.2 s, basic2
+  17.1 → 16.2 s, tunnel1 12.0 → 10.4 s, nothing slower.
 
-  Four constraints, each of which cost a measured regression to learn: the
-  skipped nodes must stay within *collecting* range of the new line and are
-  selected on a tighter bound (0.55) than they retire on (0.9), because equal
-  bounds leave a retirement window a quarter of a tick wide and a node that
-  misses it is stranded for good — which looks like the bot vibrating on one
-  spot until the futility timer replans. "Gone by" is measured along the chord
+  The line is *tracked*, not merely aimed at. It is fixed when picked, its
+  anchor slides along it under the body, and the bot steers at a point 1.5
+  blocks up the line from its own foot (pure pursuit), so a body knocked
+  sideways is pulled back at a strong angle. Steering straight at a node 30
+  blocks out has almost no such feedback, and the first taut cut showed why
+  that matters: a hop taken into a turn carried the old heading's momentum
+  1.4 blocks off the line and off a one-wide ledge (simple1, 19.9 s and a
+  7-block fall). Pure pursuit alone removed it (10.7 s). A side-margin floor
+  check was tried for the same fall and measured as the wrong tool on this
+  terrain — half a block of required ground refused most lines and gave back
+  every gain — so it is off, kept as `PF_CUT_SIDE_MARGIN` for A/B runs. A cut
+  also ends five nodes short of any jump, so it ends by reaching a node on
+  the path and the take-off is approached on the planner's own cells.
+
+  Pure pursuit alone was not enough, either: the same corner still fell one
+  run in two, because the drift happens in the AIR. The bot landed at the
+  corner at full sprint, picked the 45° line and hopped on that very tick,
+  and a hop carries the old heading's momentum for a whole arc with 0.02 a
+  tick of air control — it flew at 30°, came down 0.64 off the line in the
+  gap between two cells of the ledge, and the rollout had not seen it because
+  its yaw is set instantly. So a sprint-hop never takes off into a turn: with
+  the commanded heading more than 20° off the body's velocity the bot sprints
+  the turn (ground friction realigns it in three or four ticks) and hops once
+  aligned. Nine of nine clean runs since, at 10.6–10.7 s against 11.1 s on the
+  bounded cut. `PF_HOP_TURN_DEG` overrides the angle for A/B runs.
+
+  How the line is found: on the tick a cut is picked the executor scans eight
+  nodes ahead, and then *extends* the target by up to four nodes every
+  grounded tick while walking, so the aim reaches the visibility horizon
+  within a few ticks without any one tick paying for a long scan. A target is
+  only ever traded for one further along the same path, which is why the
+  heading turns once, onto the line, instead of flickering as the swept-box
+  test wobbles near terrain. A body in the air keeps the target it took off
+  with, because a re-pick mid-hop swings the yaw with only air control to
+  answer it. The cut never runs into a jump — it leaves the body lined up on
+  the chord rather than on the take-off, which cost 0.3 s a route on the
+  jump-dense ones.
+
+  What the physics gates see: under a live cut the sprint, hop, grind and jump
+  rollouts are driven down the *chord* (synthetic nodes a block apart, then
+  the real path beyond the target) rather than at `path[0]`, which a taut cut
+  leaves several blocks off to the side. "Gone by" is measured on the chord
   the body is walking, never along the path's own next leg (where the window
   can be empty outright) and never against velocity (which the wedge recovery
-  reverses). A target committed to on the ground is kept through the whole
-  arc, because a re-pick mid-hop swings the yaw with only air control to
-  answer it. And the cut never runs into a jump — it leaves the body lined up
-  on the chord rather than on the take-off, which cost 0.3 s a route on the
-  jump-dense ones.
+  reverses). A server correction of under two blocks with a cut live keeps
+  the cut; the node-distance test the lagback handler uses would read the
+  body's legitimate offset from the zig-zag as "snapped away" and replan.
 - **Parkour landings are landed on.** The arrival box has no ground
   requirement, so a jump that passes over its node on the way down satisfies
   it in mid-air — and the

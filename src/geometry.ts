@@ -36,30 +36,80 @@ interface ShapedBlock {
   shapes?: number[][]
 }
 
-/** A block's collision boxes in WORLD coordinates. */
-export function blockShapes (bot: Bot, pos: Vec3): number[][] {
-  const b = bot.blockAt(pos) as ShapedBlock | null
+/**
+ * Per-tick block cache, executor only. The corner cut sweeps the body box
+ * down chords of up to ~32 blocks several times a tick, and every sample asks
+ * for the same few hundred blocks; between beginTick and endTick the shape
+ * probes answer from here. The world is fixed within a tick, and outside one
+ * (actions, callers between ticks) the cache is simply off.
+ */
+let shapeCache: Map<number, number[][]> | null = null
+export function beginTick (): void { shapeCache = new Map() }
+export function endTick (): void { shapeCache = null }
+/** Unique within a tick's reach: two cells would have to be 2^20 apart to collide. */
+function cellKey (x: number, y: number, z: number): number {
+  return ((x & 0xFFFFF) * 0x100000 + (z & 0xFFFFF)) * 512 + (y & 0x1FF)
+}
+
+function shapesRaw (bot: Bot, x: number, y: number, z: number): number[][] {
+  const b = bot.blockAt(new Vec3(x, y, z)) as ShapedBlock | null
   if (!b || !b.shapes || b.shapes.length === 0) return []
   return b.shapes.map((s: number[]) => [
-    pos.x + s[0], pos.y + s[1], pos.z + s[2],
-    pos.x + s[3], pos.y + s[4], pos.z + s[5]
+    x + s[0], y + s[1], z + s[2],
+    x + s[3], y + s[4], z + s[5]
   ])
+}
+
+/** A block's collision boxes in WORLD coordinates, by integer cell. */
+export function shapesAt (bot: Bot, x: number, y: number, z: number): number[][] {
+  if (shapeCache === null || !Number.isInteger(x) || !Number.isInteger(y) || !Number.isInteger(z)) {
+    return shapesRaw(bot, x, y, z)
+  }
+  const k = cellKey(x, y, z)
+  let hit = shapeCache.get(k)
+  if (hit === undefined) {
+    hit = shapesRaw(bot, x, y, z)
+    shapeCache.set(k, hit)
+  }
+  return hit
+}
+
+/** A block's collision boxes in WORLD coordinates. */
+export function blockShapes (bot: Bot, pos: Vec3): number[][] {
+  return shapesAt(bot, pos.x, pos.y, pos.z)
 }
 
 /** Does a player standing at (x, feetY, z) overlap any block collision box? */
 export function playerCollides (bot: Bot, x: number, feetY: number, z: number): boolean {
   const half = bodyHalf(bot)
-  const minX = x - half + EPS
-  const maxX = x + half - EPS
-  const minY = feetY + EPS
-  const maxY = feetY + bodyTall(bot) - EPS
-  const minZ = z - half + EPS
-  const maxZ = z + half - EPS
+  return boxCollides(bot,
+    x - half + EPS, feetY + EPS, z - half + EPS,
+    x + half - EPS, feetY + bodyTall(bot) - EPS, z + half - EPS)
+}
 
+/**
+ * Is there floor under a thin column at (x, z) — something a body centred
+ * there would rest on? A body has floor as long as ANY corner of its box
+ * overlaps a block top, which is what the swept-line support probe tests and
+ * is the right answer about standing; this asks the stricter question the
+ * corner cut's side margin needs: is the ground still there half a block to
+ * the side of the line, so that a body knocked off it by a hop's momentum
+ * lands rather than falls.
+ */
+export function floorUnder (bot: Bot, x: number, feetY: number, z: number): boolean {
+  return boxCollides(bot, x - 0.05, feetY - 0.55, z - 0.05, x + 0.05, feetY - EPS, z + 0.05)
+}
+
+/** Does this world-space box overlap any block collision box? */
+export function boxCollides (
+  bot: Bot,
+  minX: number, minY: number, minZ: number,
+  maxX: number, maxY: number, maxZ: number
+): boolean {
   for (let bx = Math.floor(minX); bx <= Math.floor(maxX); bx++) {
     for (let by = Math.floor(minY); by <= Math.floor(maxY); by++) {
       for (let bz = Math.floor(minZ); bz <= Math.floor(maxZ); bz++) {
-        for (const s of blockShapes(bot, new Vec3(bx, by, bz))) {
+        for (const s of shapesAt(bot, bx, by, bz)) {
           if (minX < s[3] && maxX > s[0] &&
               minY < s[4] && maxY > s[1] &&
               minZ < s[5] && maxZ > s[2]) {
@@ -168,33 +218,50 @@ export function walkableLine (
   y: number,
   avoid: Set<number> | null = null,
   cellCost: ((x: number, y: number, z: number) => number) | null = null,
-  step = 0.25
+  step = 0.25,
+  sideMargin = 0,
+  sideMarginLen = Infinity
 ): boolean {
   const dx = x1 - x0
   const dz = z1 - z0
   const len = Math.hypot(dx, dz)
   if (len < 1e-6) return true
   const n = Math.ceil(len / step)
+  const cy = Math.floor(y)
+  // Unit normal to the line, for the side-margin floor probes.
+  const nx = -dz / len * sideMargin
+  const nz = dx / len * sideMargin
+  let lastCx = NaN
+  let lastCz = NaN
   for (let i = 1; i <= n; i++) {
     const t = i / n
     const x = x0 + dx * t
     const z = z0 + dz * t
     if (playerCollides(bot, x, y, z)) return false
     if (!playerCollides(bot, x, y - 0.55, z)) return false
+    // Ground to either side as well, over the first `sideMarginLen` blocks
+    // (the cut's side margin): a line that skims a ledge where the body is
+    // still turning onto it is refused, so a body knocked a little off the
+    // line by a hop's momentum still lands on something.
+    if (sideMargin > 0 && t * len <= sideMarginLen &&
+        (!floorUnder(bot, x + nx, y, z + nz) || !floorUnder(bot, x - nx, y, z - nz))) return false
+    // The per-cell checks, once per cell the centreline enters.
+    const cx = Math.floor(x)
+    const cz = Math.floor(z)
+    if (cx === lastCx && cz === lastCz) continue
+    lastCx = cx
+    lastCz = cz
     // Cost the geometry cannot see — an entity the profile is avoiding, which
     // the planner paid to detour around. Checked PER CELL: a world simply
     // containing entities is every world, so a global "are there any" test
     // switches the cut off permanently.
     if (cellCost !== null) {
-      const cx = Math.floor(x)
-      const cz = Math.floor(z)
-      const cy = Math.floor(y)
       if (cellCost(cx, cy, cz) > 0 || cellCost(cx, cy + 1, cz) > 0) return false
     }
     if (avoid !== null && avoid.size > 0) {
-      const under = bot.blockAt(new Vec3(Math.floor(x), Math.floor(y) - 1, Math.floor(z))) as { type?: number } | null
+      const under = bot.blockAt(new Vec3(cx, cy - 1, cz)) as { type?: number } | null
       if (under !== null && under.type !== undefined && avoid.has(under.type)) return false
-      const at = bot.blockAt(new Vec3(Math.floor(x), Math.floor(y), Math.floor(z))) as { type?: number } | null
+      const at = bot.blockAt(new Vec3(cx, cy, cz)) as { type?: number } | null
       if (at !== null && at.type !== undefined && avoid.has(at.type)) return false
     }
   }
