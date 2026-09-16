@@ -350,6 +350,31 @@ standing. Scenarios: `walk`, `parkour-simple`, `parkour-advanced`, `mixed`.
 `worldDigest` in `routes.json` is the digest `arena:world` prints. Two people
 with the same digest trimmed the same terrain and can compare numbers.
 
+### Imported parkour courses (`parkour-advanced`)
+
+Seven routes are block-for-block copies of sections of published parkour
+maps by [Hielke Maps](https://hielkemaps.com/maps), placed in the empty sky
+at the arena's west edge (y 190–222). Only the signs are in this repo: the
+blocks are Hielke's work and live in the local arena world, like the
+hand-built `parkouradv1`.
+
+| route | source | plan |
+| --- | --- | --- |
+| `spiral3-a`, `spiral3-b` | Parkour Spiral 3, the two checkpoints above y 138 | 17 and 13 jumps |
+| `spiral3-c` | Parkour Spiral 3, checkpoint y 31 → y 35 | 13 jumps |
+| `spiral3-d` | Parkour Spiral 3, checkpoint y 247 → y 250 | 12 jumps |
+| `paradise3-l8`, `paradise3-l49` | Parkour Paradise 3, levels 8 and 49 | 12 jumps each |
+| `pyramid-l85` | Parkour Pyramid, level 85 | 7 jumps |
+
+Most levels of those maps are scripted rooms (levitation, timers, doors,
+teleports); these were picked because they are plain blocks, 4–5 block
+gaps, 3+1 and 4+1 up-jumps, landings on walls, trapdoors, chorus flowers,
+daylight detectors and slabs. They were copied as vanilla structure files
+and placed with `place template … strict`, so no block update ran: floating
+sand and gravel stay where the map author put them. A block diff against
+the source worlds matches everywhere except five daylight detectors' power
+level. Rebuilding the arena world from the 2b2t download removes them.
+
 ## Watching
 
 Join `127.0.0.1:25599` with any username (offline mode). You spawn as a

@@ -153,6 +153,26 @@ const STEP_UP_MIN = 0.1
 const RUN_UP_ATTEMPTS = 2
 const RUN_UP_MAX_TICKS = 12
 const RUN_UP_REAR = 1.5
+/**
+ * Pure-pursuit distance for the run-up line-up: the body steers at a point
+ * this far up the take-off CENTRE LINE from its own foot (mirrored through
+ * the body when backing, since `back` moves away from the look point), so a
+ * run-back and run-in converge onto the line the jump was priced on instead
+ * of running parallel to it. Traced on the arena's basic3: the body lined up
+ * 0.39 off the line and no run-in ever produced a take-off the rollouts
+ * would sign, although the same jump is signed from on the line.
+ */
+const LINE_UP_AHEAD = 1.0
+/**
+ * Grounded ticks waiting at a lip with the line-ups exhausted and every gate
+ * refusing before the take-off is given up: the landing cell is banned
+ * (BAN_MS, BAN_WEIGHT) and the route re-solved round it. The futility timer
+ * alone brought back the same plan and the same jump for the rest of the run
+ * (basic3: three replans, 24 s against 12 on the plan that avoids it).
+ */
+const LIP_WAIT_TICKS = 30
+const BAN_MS = 120_000
+const BAN_WEIGHT = 200
 
 /**
  * The creep sneaks only this close to its cap and WALKS the rest: sneaking
@@ -414,6 +434,10 @@ export function createPathfinder (options: PathfinderOptions = {}) {
     let runUpPhase = 0
     let runUpTicks = 0
     let runUpLastPos: Vec3 | null = null
+    /** Consecutive grounded ticks spent waiting at a lip with nothing left to try (LIP_WAIT_TICKS). */
+    let lipWaitTicks = 0
+    /** Landing cells whose take-off could not be performed: "x,y,z" → expiry (performance.now ms). */
+    const bannedCells = new Map<string, number>()
     /** The parkour node `creepCell` was latched for. */
     let creepNode: Move | null = null
     /** Highest point of the current flight, for the fall-damage settle (FALL_DAMAGE_DISTANCE). */
@@ -867,7 +891,25 @@ export function createPathfinder (options: PathfinderOptions = {}) {
     }
 
     function computeStartMove (startPos: Vec3): { x: number, y: number, z: number } {
-      const p = startPos.floored()
+      let p = startPos.floored()
+      // A body overhanging its block's edge — crept to a lip, landed on a
+      // corner — has its centre over the neighbouring column, and a solve
+      // started there begins in mid-air over whatever lies below: the gap it
+      // was about to jump, which the plan then drops into. Start from the
+      // cell the body actually stands on: the one under its box with a floor.
+      if (bot.entity.onGround === true &&
+          geometry.blockShapes(bot, p).length === 0 &&
+          geometry.blockShapes(bot, p.offset(0, -1, 0)).length === 0) {
+        for (const [ox, oz] of [[-0.29, -0.29], [0.29, -0.29], [-0.29, 0.29], [0.29, 0.29]]) {
+          const c = new Vec3(Math.floor(startPos.x + ox), p.y, Math.floor(startPos.z + oz))
+          if ((c.x !== p.x || c.z !== p.z) &&
+              geometry.blockShapes(bot, c).length === 0 &&
+              geometry.blockShapes(bot, c.offset(0, -1, 0)).length > 0) {
+            p = c
+            break
+          }
+        }
+      }
       const dy = startPos.y - p.y
       const b = bot.blockAt(p) as BlockLike | null
       // Upstream quirk preserved: uses stateMovements.emptyBlocks regardless
@@ -960,6 +1002,12 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       bot.emit('path_update' as never, results as never)
       const wasEmpty = path.length === 0
       path = results.path
+      // A fresh path's first jump takes off from the cell the solve started
+      // in, so that is the "node just retired" the creep anchors on — the
+      // body itself may be overhanging that cell's lip (a give-up leaves it
+      // there), and anchoring on the column under its centre would creep it
+      // forward into the gap.
+      prevRetired = { x: lastSolveStart.x + 0.5, y: lastSolveStart.y, z: lastSolveStart.z + 0.5 }
       if (final) {
         pathUpdated = true
         // A freshly installed COMPLETE path deserves a full futility window:
@@ -1037,6 +1085,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       const hadSnapshot = cachedSnapshot !== null && !snapshotStale
       const snapshot = ensureSnapshot(startPos, descriptor, needStates)
       bakeEntityIndex(snapshot, stateMovements)
+      applyBans(snapshot)
       if (solveTimingOn) {
         solveDispatchedAt = performance.now()
         const m = snapshot.meta
@@ -1439,8 +1488,43 @@ export function createPathfinder (options: PathfinderOptions = {}) {
      * never works would otherwise hold the tick loop forever with the timer
      * that exists to break exactly that never once being read.
      */
+    /**
+     * A take-off the executor could not perform — a jump the planner priced
+     * that no gate would sign from any line-up — is reported back to the
+     * planner as a banned LANDING cell for BAN_MS, so the re-solve routes
+     * round it instead of bringing the same jump back. The ban rides on the
+     * snapshot's per-cell entity weights, which both solver cores read and
+     * treat as impassable above 100; an exclusion area would have forced
+     * the JS solver and switched the corner cut off for the whole route.
+     */
+    function banTakeoff (node: { x: number, y: number, z: number }): void {
+      bannedCells.set(
+        `${Math.floor(node.x)},${Math.floor(node.y + 0.001)},${Math.floor(node.z)}`,
+        performance.now() + BAN_MS)
+    }
+
+    function applyBans (snap: Snapshot): void {
+      if (bannedCells.size === 0) return
+      const now = performance.now()
+      const idxs: number[] = []
+      const weights: number[] = []
+      for (const [key, until] of bannedCells) {
+        if (until <= now) { bannedCells.delete(key); continue }
+        const [x, y, z] = key.split(',').map(Number)
+        if (!snap.contains(x, y, z)) continue
+        idxs.push(snap.index(x, y, z))
+        weights.push(BAN_WEIGHT)
+      }
+      if (idxs.length === 0) return
+      snap.entityIdx = Int32Array.from([...snap.entityIdx, ...idxs])
+      snap.entityWeight = Int32Array.from([...snap.entityWeight, ...weights])
+    }
+
     function futile (swimming: boolean): boolean {
       if (performance.now() - lastNodeTime <= (swimming ? 8000 : 3500)) return false
+      // Stuck at a take-off: without the ban the plan comes back unchanged
+      // and the same jump is tried again for the rest of the run.
+      if (path.length > 0 && path[0].parkour) banTakeoff(path[0])
       resetPath('stuck', !swimming)
       return true
     }
@@ -1556,6 +1640,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       runUpPhase = 0
       runUpTicks = 0
       runUpLastPos = null
+      lipWaitTicks = 0
       creepNode = null
       creepCell = null
       prevRetired = null
@@ -1768,6 +1853,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       const box = computeBox(bot, startPos, targets, searchRadius, 1, opts.maxSnapshotCells)
       const snap = buildSnapshot(bot, lut, box, (descriptor ? goalNeedsRaycast(descriptor) : true) || movements.canDig, nextSnapshotGeneration())
       bakeEntityIndex(snap, movements)
+      applyBans(snap)
 
       const stepExclusion = movements.exclusionAreasStep.length > 0
         ? (x: number, y: number, z: number) => {
@@ -2387,8 +2473,15 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         } else if (wasAirborne) {
           wasAirborne = false
           if (grounded && airPeakY - p.y > FALL_DAMAGE_DISTANCE) {
+            // Two ticks at zero ping, not one: the server processes the
+            // landing position on ITS next tick and the damage velocity
+            // packet comes back a tick after that. Traced on parkouradv1's
+            // fence-post landing: settle at tick N, packet at N+1 — and in
+            // between the gates had approved a delayed jump and pressed
+            // forward, which put the body on the post's edge with the sneak
+            // guard off when the packet flipped onGround. Off it went.
             const ping = (bot as unknown as { player?: { ping?: number } }).player?.ping ?? 0
-            landSettle = 1 + Math.min(5, Math.ceil(ping / 50))
+            landSettle = 2 + Math.min(4, Math.ceil(ping / 50))
           }
           airPeakY = -Infinity
         }
@@ -3175,7 +3268,21 @@ export function createPathfinder (options: PathfinderOptions = {}) {
             // boundary `Math.floor(p)` names the NEXT cell, the offset flips
             // sign, and the bot reads as "not crept far enough" again — it
             // walks off the edge it was carefully standing on.
-            creepCell ??= { x: Math.floor(p.x), z: Math.floor(p.z) }
+            //
+            // And the cell is the TAKE-OFF cell — the node just retired — not
+            // whatever cell the body is in when the creep begins. After a
+            // run-in the body can already overhang the block's edge at that
+            // moment, and anchoring on the neighbouring cell puts every offset
+            // a block out: the sneak zone never arrives and the body walks off
+            // the lip at speed. Traced on the arena's basic3: the creep began
+            // at x −137.02 on the block −137..−136, anchored on −138, and the
+            // bot fell into the gap it was meant to jump.
+            if (creepCell === null) {
+              const anchor = prevRetired !== null && Math.hypot(prevRetired.x - p.x, prevRetired.z - p.z) <= 1.2
+                ? prevRetired
+                : p
+              creepCell = { x: Math.floor(anchor.x), z: Math.floor(anchor.z) }
+            }
             const px = p.x - (creepCell.x + 0.5)
             const pz = p.z - (creepCell.z + 0.5)
             // On a narrow support (fence post, head, pot) the lip is closer:
@@ -3224,7 +3331,37 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         // its centre, and a walking tick there is the difference between
         // standing on it and falling off it (traced on parkouradv1).
         const narrowSupport = takeoffHalf < 0.5
-        const creepSneak = creep && (narrowSupport || takeoffProj >= takeoffCap - CREEP_SNEAK_ZONE)
+        // Landing brake on a narrow support. A body that has just landed on
+        // a post or a head with its flight speed still in it slides 2.2
+        // times that speed before friction stops it — 0.57 blocks from a
+        // sprint-jump, past the 0.425 a post supports. The planner meant
+        // such a landing to re-jump on the landing tick (momentum), and
+        // when the gates sign that the branches above fire it; when they do
+        // not, the run-up used to start here with `back` UNDER SNEAK, which
+        // is a third of a brake, and the body went off the far edge (arena
+        // parkouradv1, landing at +0.11 on the post, gone by +0.43 three
+        // ticks later). So: full `back`, no sneak, along the velocity, until
+        // the speed is walking-slow; the line-up starts from a standing body.
+        const landVel = bot.entity.velocity
+        const landSpeed = Math.hypot(landVel.x, landVel.z)
+        if (parkourNode && grounded && !airborne && narrowSupport && landedTicksAgo <= 3 && landSpeed > 0.1) {
+          bot.look(Math.atan2(-landVel.x, -landVel.z), 0)
+          bot.setControlState('forward', false)
+          bot.setControlState('back', true)
+          bot.setControlState('sneak', false)
+          bot.setControlState('sprint', false)
+          bot.setControlState('jump', false)
+          execBranch = 'brake'
+          futile(swimming)
+          return
+        }
+        // Sneak near ANY edge of the take-off block, not only near the lip
+        // on the flight line: a body left overhanging one edge (a given-up
+        // jump, a corner landing) whose new flight line points elsewhere
+        // reads as "not yet in the sneak zone" along that line and walks
+        // off the edge it is already standing on.
+        const nearEdge = Math.max(Math.abs(takeoffPx), Math.abs(takeoffPz)) >= 0.25
+        const creepSneak = creep && (narrowSupport || nearEdge || takeoffProj >= takeoffCap - CREEP_SNEAK_ZONE)
         // Lip brake: a body at the lip with speed slides 2.2 times its
         // velocity before friction stops it — off the block, from a sprint.
         // Sneaking there costs nothing and the edge guard makes leaving the
@@ -3362,6 +3499,53 @@ export function createPathfinder (options: PathfinderOptions = {}) {
           }
         }
         if (runBack || runIn) creep = false
+
+        // Line up ON the flight line, not merely along it (LINE_UP_AHEAD).
+        // The run-back and run-in steered straight at the node from wherever
+        // the body stood, so a body that reached the take-off cell a third
+        // of a block off the centre line backed off and ran in a third of a
+        // block off it, and a lip take-off onto a one-block target is not
+        // there. Steer at a point up the centre line from the body's foot
+        // (pure pursuit); when backing, `back` moves away from the look
+        // point, so look at the rear point's mirror image through the body
+        // and the body converges as it backs.
+        if (parkourNode && grounded && takeoffCap > 0 && creepCell !== null && (runBack || runIn || creep)) {
+          const cx0 = creepCell.x + 0.5
+          const cz0 = creepCell.z + 0.5
+          const lx = nextPoint.x - cx0
+          const lz = nextPoint.z - cz0
+          const ll = Math.hypot(lx, lz)
+          if (ll > 1e-6) {
+            const ux = lx / ll
+            const uz = lz / ll
+            const foot = (p.x - cx0) * ux + (p.z - cz0) * uz
+            const t = runBack ? foot - LINE_UP_AHEAD : foot + LINE_UP_AHEAD
+            const ax = cx0 + ux * t
+            const az = cz0 + uz * t
+            const lookX = runBack ? 2 * p.x - ax : ax
+            const lookZ = runBack ? 2 * p.z - az : az
+            bot.look(Math.atan2(-(lookX - p.x), -(lookZ - p.z)), 0)
+          }
+        }
+
+        // A take-off nothing will sign. Line-ups exhausted, body at the lip,
+        // every gate refusing, tick after tick: give the jump up now, ban
+        // its landing cell and re-solve, rather than sit out the futility
+        // timer for a replan that brings the same jump back (LIP_WAIT_TICKS).
+        const attemptsDone = runUpAttempts >= (narrowSupport || !stateMovements.allowRunUp ? 1 : (nextPoint as Move).run ? RUN_UP_ATTEMPTS : 1)
+        // A creep the edge guard is holding still counts as waiting: the lip
+        // it wants is past the edge it is on.
+        const creepStalled = creep && stillTicks >= 3
+        const lipWait = parkourNode && grounded && !inFlight && !runBack && !runIn && !stepBack &&
+          (!creep || creepStalled) && takeoffCap > 0 && runUpPhase === 0 && attemptsDone
+        lipWaitTicks = lipWait ? lipWaitTicks + 1 : 0
+        if (lipWaitTicks > LIP_WAIT_TICKS) {
+          lipWaitTicks = 0
+          banTakeoff(nextPoint)
+          execBranch = 'giveup'
+          resetPath('stuck', true)
+          return
+        }
 
         bot.setControlState('forward', creep || inFlight || runIn)
         bot.setControlState('back', stepBack || runBack)

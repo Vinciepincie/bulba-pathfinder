@@ -62,6 +62,26 @@ function solidTop (world: VoxelWorld, x: number, y: number, z: number): number {
   return top
 }
 
+/**
+ * Highest collision top at or below `fromY` under any corner of a 0.6-wide
+ * body centred at (x, z), or -Infinity when nothing is there.
+ */
+function supportUnder (world: VoxelWorld, x: number, fromY: number, z: number): number {
+  let support = -Infinity
+  for (const [ox, oz] of [[-0.29, -0.29], [0.29, -0.29], [-0.29, 0.29], [0.29, 0.29]]) {
+    const cx = Math.floor(x + ox)
+    const cz = Math.floor(z + oz)
+    for (let sy = fromY; sy >= world.box.y0 - 1; sy--) {
+      const top = solidTop(world, cx, sy, cz)
+      if (top > 0) {
+        support = Math.max(support, sy + top)
+        break
+      }
+    }
+  }
+  return support
+}
+
 function blocked (world: VoxelWorld, x: number, feetY: number, z: number): boolean {
   // Body occupies feet + head cells; a collision top > 0.6 in the feet cell
   // or anything substantial in the head cell blocks.
@@ -204,8 +224,19 @@ export function makeDriveableBot (world: VoxelWorld, startPos: Vec3): DriveableB
       const lead = (v: number, from: number): number => v + Math.sign(v - from) * 0.3
       const tryAxis = (nx2: number, nz2: number): boolean =>
         !blocked(world, Math.floor(lead(nx2, e.position.x)), feetY, Math.floor(lead(nz2, e.position.z)))
-      const nx = e.position.x + dx
-      const nz = e.position.z + dz
+      let nx = e.position.x + dx
+      let nz = e.position.z + dz
+      // Vanilla's sneak edge guard: a sneaking body on the ground never moves
+      // its box off its support (the corner cut's creep relies on it to stand
+      // at a lip). Per axis, like the real one.
+      if (bot.controlState.sneak && e.onGround) {
+        const stays = (x: number, z: number): boolean => supportUnder(world, x, feetY, z) >= feetY - 0.6
+        if (!stays(nx, nz)) {
+          if (stays(nx, e.position.z)) nz = e.position.z
+          else if (stays(e.position.x, nz)) nx = e.position.x
+          else { nx = e.position.x; nz = e.position.z }
+        }
+      }
       let collidedH = false
       if (tryAxis(nx, nz)) {
         e.position.x = nx
@@ -234,17 +265,10 @@ export function makeDriveableBot (world: VoxelWorld, startPos: Vec3): DriveableB
         vy *= 0.98
       }
       let ny = e.position.y + vy
-      const cx = Math.floor(e.position.x)
-      const cz = Math.floor(e.position.z)
-      // Find support: the highest collision top at or below the feet.
-      let support = -Infinity
-      for (let sy = Math.floor(ny); sy >= world.box.y0 - 1; sy--) {
-        const top = solidTop(world, cx, sy, cz)
-        if (top > 0) {
-          support = sy + top
-          break
-        }
-      }
+      // Find support: the highest collision top at or below the feet under
+      // any corner of the body's box — a body stands as long as some of it
+      // is over a block, like the real physics.
+      const support = supportUnder(world, e.position.x, Math.floor(ny), e.position.z)
       if (vy <= 0 && ny <= support) {
         ny = support
         vy = 0

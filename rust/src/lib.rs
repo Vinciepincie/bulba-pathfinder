@@ -1686,7 +1686,7 @@ impl SolverState {
                 let f_r2 = self.flags_at(rx, y - 2, rz);
                 if (f_r2 & PHYSICAL) != 0 && self.catch_at(rx, y - 2, rz) == 0 {
                     let h_r = self.height_at(rx, y - 2, rz);
-                    if h_0 - h_r <= 1.05 {
+                    if h_0 - h_r <= 0.6 {
                         run += 1.0;
                     }
                 }

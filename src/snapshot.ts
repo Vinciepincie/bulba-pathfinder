@@ -139,16 +139,44 @@ export function computeBox (
     z1: Math.ceil(maxZ + margin)
   }
 
-  // Respect the memory cap by shrinking the horizontal margin if needed.
-  const cells = (): number => (box.x1 - box.x0 + 1) * (box.y1 - box.y0 + 1) * (box.z1 - box.z0 + 1)
-  let guard = 0
-  while (cells() > maxCells && guard++ < 64) {
-    const shrink = Math.max(1, Math.floor((box.x1 - box.x0) * 0.05))
-    box.x0 += shrink; box.x1 -= shrink
-    box.z0 += shrink; box.z1 -= shrink
-    if (box.x1 - box.x0 < 16 || box.z1 - box.z0 < 16) break
+  // Respect the memory cap: shrink the horizontal margin first, and only when
+  // the start/goal hull alone is over the cap, cut a window of the hull around
+  // the start. Each axis shrinks by its own extent — the old loop shrank z by
+  // 5% of x and turned long narrow boxes inside out, a negative cell count
+  // that SharedArrayBuffer throws on from inside the physics tick.
+  const h = box.y1 - box.y0 + 1
+  const fits = (m: number): boolean =>
+    (Math.ceil(maxX + m) - Math.floor(minX - m) + 1) * h * (Math.ceil(maxZ + m) - Math.floor(minZ - m) + 1) <= maxCells
+  if (!fits(margin)) {
+    let lo = 0
+    let hi = margin
+    while (lo < hi) {
+      const mid = Math.ceil((lo + hi) / 2)
+      if (fits(mid)) lo = mid
+      else hi = mid - 1
+    }
+    box.x0 = Math.floor(minX - lo); box.x1 = Math.ceil(maxX + lo)
+    box.z0 = Math.floor(minZ - lo); box.z1 = Math.ceil(maxZ + lo)
+    if (!fits(lo)) {
+      const w = box.x1 - box.x0 + 1
+      const l = box.z1 - box.z0 + 1
+      const area = Math.floor(maxCells / h)
+      const f = Math.sqrt(area / (w * l))
+      let nw = Math.max(16, Math.floor(w * f))
+      let nl = Math.max(16, Math.floor(l * f))
+      // An axis held at the 16-cell floor leaves the rest of the area to the other.
+      if (nl === 16) nw = Math.max(16, Math.min(w, Math.floor(area / 16)))
+      else if (nw === 16) nl = Math.max(16, Math.min(l, Math.floor(area / 16)))
+      box.x0 = windowStart(box.x0, box.x1, Math.floor(start.x), nw); box.x1 = box.x0 + nw - 1
+      box.z0 = windowStart(box.z0, box.z1, Math.floor(start.z), nl); box.z1 = box.z0 + nl - 1
+    }
   }
   return box
+}
+
+/** First cell of a `size`-wide window of [lo, hi] centred on `s` as far as the range allows. */
+function windowStart (lo: number, hi: number, s: number, size: number): number {
+  return Math.max(lo, Math.min(hi - size + 1, s - Math.floor(size / 2)))
 }
 
 interface ColumnLike {

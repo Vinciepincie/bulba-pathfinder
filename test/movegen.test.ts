@@ -546,6 +546,20 @@ describe('MoveGen', () => {
       world.set(-1, 0, 0, AIR)
       expect(at(movesOf(makeGen(world, FLAG), 0, 2, 0), 5, 1, 1)).to.have.length(1)
     })
+
+    it('run-up one step lower counts, a full block lower does not (arena spiral3-c)', () => {
+      // (4,+1,2) off a lone block needs the block's run plus a cell behind.
+      const MOM = { ...FLAG, allowParkourMomentum: true }
+      const world = new VoxelWorld({ x0: -4, y0: -3, z0: -4, x1: 7, y1: 7, z1: 6 })
+      world.set(0, 0, 0, STONE)
+      world.set(4, 1, 2, STONE)
+      expect(at(movesOf(makeGen(world, MOM), 0, 1, 0), 4, 2, 2)).to.have.length(0)
+      world.set(-1, 0, 0, STONE) // level run-up cell
+      expect(at(movesOf(makeGen(world, MOM), 0, 1, 0), 4, 2, 2)).to.have.length(1)
+      world.set(-1, 0, 0, AIR)
+      world.set(-1, -1, 0, STONE) // a full block lower: getting up it is a jump, not a run
+      expect(at(movesOf(makeGen(world, MOM), 0, 1, 0), 4, 2, 2)).to.have.length(0)
+    })
   })
 
   describe('up (ladder)', () => {

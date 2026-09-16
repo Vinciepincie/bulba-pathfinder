@@ -183,6 +183,118 @@
         115
       ],
       "notes": "defined by in-world !PF signs"
+    },
+    {
+      "id": "paradise3-l49",
+      "name": "paradise3-l49",
+      "scenario": "parkour-advanced",
+      "start": [
+        -672,
+        198,
+        -449
+      ],
+      "end": [
+        -652,
+        211,
+        -444
+      ],
+      "notes": "defined by in-world !PF signs"
+    },
+    {
+      "id": "paradise3-l8",
+      "name": "paradise3-l8",
+      "scenario": "parkour-advanced",
+      "start": [
+        -720,
+        198,
+        -442
+      ],
+      "end": [
+        -702,
+        205,
+        -435
+      ],
+      "notes": "defined by in-world !PF signs"
+    },
+    {
+      "id": "pyramid-l85",
+      "name": "pyramid-l85",
+      "scenario": "parkour-advanced",
+      "start": [
+        -621,
+        205,
+        -439
+      ],
+      "end": [
+        -613,
+        208,
+        -437
+      ],
+      "notes": "defined by in-world !PF signs"
+    },
+    {
+      "id": "spiral3-a",
+      "name": "spiral3-a",
+      "scenario": "parkour-advanced",
+      "start": [
+        -675,
+        198,
+        228
+      ],
+      "end": [
+        -700,
+        204,
+        210
+      ],
+      "notes": "defined by in-world !PF signs"
+    },
+    {
+      "id": "spiral3-b",
+      "name": "spiral3-b",
+      "scenario": "parkour-advanced",
+      "start": [
+        -701,
+        204,
+        209
+      ],
+      "end": [
+        -722,
+        208,
+        217
+      ],
+      "notes": "defined by in-world !PF signs"
+    },
+    {
+      "id": "spiral3-c",
+      "name": "spiral3-c",
+      "scenario": "parkour-advanced",
+      "start": [
+        -622,
+        198,
+        239
+      ],
+      "end": [
+        -637,
+        202,
+        208
+      ],
+      "notes": "defined by in-world !PF signs"
+    },
+    {
+      "id": "spiral3-d",
+      "name": "spiral3-d",
+      "scenario": "parkour-advanced",
+      "start": [
+        -580,
+        198,
+        232
+      ],
+      "end": [
+        -583,
+        201,
+        208
+      ],
+      "notes": "defined by in-world !PF signs"
     }
   ]
 }

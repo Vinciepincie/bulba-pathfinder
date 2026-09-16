@@ -450,6 +450,35 @@ and `enable`/`disable`, and both `opts` and `options`.
   the turn (ground friction realigns it in three or four ticks) and hops once
   aligned. Nine of nine clean runs since, at 10.6–10.7 s against 11.1 s on the
   bounded cut. `PF_HOP_TURN_DEG` overrides the angle for A/B runs.
+- **Take-offs that cannot be made are given up, not retried forever.** On
+  the arena's `basic3` the planner priced a 4×4 diagonal jump from a cell
+  hemmed in by a two-high pillar; the run-up could not line up on the flight
+  line, no rollout ever signed a take-off, the futility timer replanned and
+  the same jump came straight back — three replans and a fall, 24 s against
+  12 s on the plan that avoids it. Four things changed. The run-up now lines
+  up *on* the take-off centre line (pure pursuit while backing off and
+  running in), which is where the frame-tight lip take-off exists; the creep
+  anchors on the take-off node rather than on whatever cell the body is in
+  (after a run-in it can already be over the lip, and the offsets were a
+  block out); it sneaks near any edge of the block, not only near the lip on
+  the flight line; and a lip the executor has waited at for 1.5 s with every
+  line-up spent is given up: the landing cell is banned for two minutes as a
+  wall-weight in the snapshot both solver cores read, and the route is
+  re-solved round it. The re-solve also starts from the block the body stands
+  on rather than the column under its centre, so a body overhanging a lip is
+  not planned as if it were already in the gap. `basic3` now arrives in 15.7 s
+  on the plan that used to stall, every time.
+- **Landings on posts are braked.** A body landing on a fence post or a head
+  with its flight speed still in it slides 0.57 blocks before friction stops
+  it, past the 0.425 a post supports. The planner meant such a landing to
+  re-jump on the landing tick, and when the rollouts sign that it does; when
+  they do not, the run-up used to begin with `back` under sneak — a third of a
+  brake — and the body went off the far edge (`parkouradv1`, one run in two
+  before, three in three after the taut cut moved the landing point). Now the
+  body brakes with full `back` and no sneak until it is walking-slow, then
+  lines up. A damaging landing also sits out two ticks rather than one, since
+  the server's velocity packet arrives a full server tick after the landing
+  it answers. `parkouradv1` arrives three in three at 17.0–17.2 s.
 
   How the line is found: on the tick a cut is picked the executor scans eight
   nodes ahead, and then *extends* the target by up to four nodes every

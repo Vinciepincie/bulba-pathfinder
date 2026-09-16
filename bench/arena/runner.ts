@@ -622,7 +622,10 @@ export class Racer {
       clearInterval(deathTimer)
       result.outcome = outcome
       result.promiseOutcome = outcome
-      if (outcome === 'timeout' || outcome === 'died') {
+      // goto rejecting on no-path / think-timeout leaves the goal set, and the
+      // engine keeps walking toward it — into the next route's staging (arena
+      // spiral3-d: walked off its start into lava, respawned 600 blocks away).
+      if (outcome !== 'arrived') {
         ;(pf.setGoal as (g: unknown) => void)(null)
         goto.catch(() => {}) // the abort makes goto reject; already accounted for
       }

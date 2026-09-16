@@ -1338,9 +1338,11 @@ export class MoveGen {
             }
             else if (this.isSafe(this.flagsAt(rx, y - 1, rz)) &&
                 (this.flagsAt(rx, y - 2, rz) & PHYSICAL) !== 0 && this.catchAt(rx, y - 2, rz) === 0) {
-                // One step lower: sprinting up a step keeps the run.
+                // One step lower: sprinting up a step keeps the run. A full block
+                // is a jump, not a step (arena spiral3-c: a 1x1 post over a
+                // lower ring was credited a run-up no body can make).
                 const hR = this.heightAt(rx, y - 2, rz);
-                if (h0 - hR <= 1.05)
+                if (h0 - hR <= 0.6)
                     run += 1;
             }
         }
