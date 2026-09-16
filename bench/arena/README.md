@@ -350,13 +350,18 @@ standing. Scenarios: `walk`, `parkour-simple`, `parkour-advanced`, `mixed`.
 `worldDigest` in `routes.json` is the digest `arena:world` prints. Two people
 with the same digest trimmed the same terrain and can compare numbers.
 
-### Imported parkour courses (`parkour-advanced`)
+### Imported parkour courses
 
-Seven routes are block-for-block copies of sections of published parkour
-maps by [Hielke Maps](https://hielkemaps.com/maps), placed in the empty sky
-at the arena's west edge (y 190–222). Only the signs are in this repo: the
-blocks are Hielke's work and live in the local arena world, like the
-hand-built `parkouradv1`.
+Routes below are block-for-block copies of published parkour maps. Only the
+signs are in this repo: the blocks are the map authors' work and live in the
+local arena world, like the hand-built `parkouradv1`. Rebuilding the arena
+world from the 2b2t download removes them.
+
+#### `parkour-simple`: Hielke Maps
+
+Seven routes are copies of sections of maps by
+[Hielke Maps](https://hielkemaps.com/maps), placed in the empty sky at the
+arena's west edge (y 190–222). Good parkour, but not advanced technique.
 
 | route | source | plan |
 | --- | --- | --- |
@@ -373,7 +378,30 @@ daylight detectors and slabs. They were copied as vanilla structure files
 and placed with `place template … strict`, so no block update ran: floating
 sand and gravel stay where the map author put them. A block diff against
 the source worlds matches everywhere except five daylight detectors' power
-level. Rebuilding the arena world from the 2b2t download removes them.
+level.
+
+#### `parkour-advanced`: technique maps
+
+Thirty routes above y 266 over the arena's south-east quadrant (nothing of
+2b2t reaches past the old 255 build limit):
+
+| routes | source | what it tests |
+| --- | --- | --- |
+| `mcc-1-1` … `mcc-8-3` | Minecraft Championship practice parkour remake (Hybrid Posts, original by Noxcrew), all 24 stages | neos around pane walls, ladder hops and climbs, trapdoor hoops, the slime Triple Bounce, iron bars, ice |
+| `whpm-1` … `whpm-3` | World's Hardest Parkour Map (CrazyMonkeyChip) | 5-block post jumps, ladder hops round a fence tower, beds and panes, a +1 staircase of single posts |
+| `tenways-ladder` | 10 Ways to Parkour (McDeathStar), level 2 | jumps between single ladder blocks up a room |
+| `tenways-headhitters` | same map, level 4 | a zig-zag climb where every landing has a block three above |
+| `tenways-slime` | same map, level 6 | slime blocks and ladders |
+
+These maps were built for 1.12–1.16, so each world is first upgraded to
+1.21.11 by Paper's own DataFixer (`--forceUpgrade` in a separate world
+container). That is what computes legacy block ids, fence and pane
+connections and stair shapes exactly as the game does; a hand conversion
+would get the collision shapes of connected blocks wrong. Stages are cut at
+the maps' own stage signs, level teleports and buttons; where a finish cell
+is also the next route's start, the next start sign sits on the cell beside
+it, or on a single post one block above it (the start snaps down onto it). Most of these routes do not plan yet — that is the
+point of them.
 
 ## Watching
 

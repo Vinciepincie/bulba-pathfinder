@@ -187,7 +187,7 @@
     {
       "id": "paradise3-l49",
       "name": "paradise3-l49",
-      "scenario": "parkour-advanced",
+      "scenario": "parkour-simple",
       "start": [
         -672,
         198,
@@ -203,7 +203,7 @@
     {
       "id": "paradise3-l8",
       "name": "paradise3-l8",
-      "scenario": "parkour-advanced",
+      "scenario": "parkour-simple",
       "start": [
         -720,
         198,
@@ -219,7 +219,7 @@
     {
       "id": "pyramid-l85",
       "name": "pyramid-l85",
-      "scenario": "parkour-advanced",
+      "scenario": "parkour-simple",
       "start": [
         -621,
         205,
@@ -235,7 +235,7 @@
     {
       "id": "spiral3-a",
       "name": "spiral3-a",
-      "scenario": "parkour-advanced",
+      "scenario": "parkour-simple",
       "start": [
         -675,
         198,
@@ -251,7 +251,7 @@
     {
       "id": "spiral3-b",
       "name": "spiral3-b",
-      "scenario": "parkour-advanced",
+      "scenario": "parkour-simple",
       "start": [
         -701,
         204,
@@ -267,7 +267,7 @@
     {
       "id": "spiral3-c",
       "name": "spiral3-c",
-      "scenario": "parkour-advanced",
+      "scenario": "parkour-simple",
       "start": [
         -622,
         198,
@@ -283,7 +283,7 @@
     {
       "id": "spiral3-d",
       "name": "spiral3-d",
-      "scenario": "parkour-advanced",
+      "scenario": "parkour-simple",
       "start": [
         -580,
         198,
@@ -293,6 +293,486 @@
         -583,
         201,
         208
+      ],
+      "notes": "defined by in-world !PF signs"
+    },
+    {
+      "id": "mcc-1-1",
+      "name": "mcc-1-1",
+      "scenario": "parkour-advanced",
+      "start": [
+        295,
+        277,
+        -574
+      ],
+      "end": [
+        309,
+        277,
+        -548
+      ],
+      "notes": "defined by in-world !PF signs"
+    },
+    {
+      "id": "mcc-1-2",
+      "name": "mcc-1-2",
+      "scenario": "parkour-advanced",
+      "start": [
+        308,
+        277,
+        -548
+      ],
+      "end": [
+        340,
+        276,
+        -542
+      ],
+      "notes": "defined by in-world !PF signs"
+    },
+    {
+      "id": "mcc-1-3",
+      "name": "mcc-1-3",
+      "scenario": "parkour-advanced",
+      "start": [
+        339,
+        276,
+        -542
+      ],
+      "end": [
+        390,
+        271,
+        -536
+      ],
+      "notes": "defined by in-world !PF signs"
+    },
+    {
+      "id": "mcc-2-1",
+      "name": "mcc-2-1",
+      "scenario": "parkour-advanced",
+      "start": [
+        389,
+        271,
+        -536
+      ],
+      "end": [
+        376,
+        273,
+        -489
+      ],
+      "notes": "defined by in-world !PF signs"
+    },
+    {
+      "id": "mcc-2-2",
+      "name": "mcc-2-2",
+      "scenario": "parkour-advanced",
+      "start": [
+        377,
+        273,
+        -489
+      ],
+      "end": [
+        351,
+        274,
+        -489
+      ],
+      "notes": "defined by in-world !PF signs"
+    },
+    {
+      "id": "mcc-2-3",
+      "name": "mcc-2-3",
+      "scenario": "parkour-advanced",
+      "start": [
+        350,
+        274,
+        -489
+      ],
+      "end": [
+        317,
+        280,
+        -450
+      ],
+      "notes": "defined by in-world !PF signs"
+    },
+    {
+      "id": "mcc-3-1",
+      "name": "mcc-3-1",
+      "scenario": "parkour-advanced",
+      "start": [
+        316,
+        280,
+        -450
+      ],
+      "end": [
+        300,
+        277,
+        -427
+      ],
+      "notes": "defined by in-world !PF signs"
+    },
+    {
+      "id": "mcc-3-2",
+      "name": "mcc-3-2",
+      "scenario": "parkour-advanced",
+      "start": [
+        301,
+        277,
+        -427
+      ],
+      "end": [
+        300,
+        282,
+        -389
+      ],
+      "notes": "defined by in-world !PF signs"
+    },
+    {
+      "id": "mcc-3-3",
+      "name": "mcc-3-3",
+      "scenario": "parkour-advanced",
+      "start": [
+        299,
+        282,
+        -389
+      ],
+      "end": [
+        315,
+        282,
+        -345
+      ],
+      "notes": "defined by in-world !PF signs"
+    },
+    {
+      "id": "mcc-4-1",
+      "name": "mcc-4-1",
+      "scenario": "parkour-advanced",
+      "start": [
+        314,
+        282,
+        -345
+      ],
+      "end": [
+        316,
+        285,
+        -312
+      ],
+      "notes": "defined by in-world !PF signs"
+    },
+    {
+      "id": "mcc-4-2",
+      "name": "mcc-4-2",
+      "scenario": "parkour-advanced",
+      "start": [
+        315,
+        285,
+        -312
+      ],
+      "end": [
+        299,
+        282,
+        -269
+      ],
+      "notes": "defined by in-world !PF signs"
+    },
+    {
+      "id": "mcc-4-3",
+      "name": "mcc-4-3",
+      "scenario": "parkour-advanced",
+      "start": [
+        300,
+        282,
+        -269
+      ],
+      "end": [
+        255,
+        284,
+        -261
+      ],
+      "notes": "defined by in-world !PF signs"
+    },
+    {
+      "id": "mcc-5-1",
+      "name": "mcc-5-1",
+      "scenario": "parkour-advanced",
+      "start": [
+        256,
+        284,
+        -261
+      ],
+      "end": [
+        228,
+        288,
+        -273
+      ],
+      "notes": "defined by in-world !PF signs"
+    },
+    {
+      "id": "mcc-5-2",
+      "name": "mcc-5-2",
+      "scenario": "parkour-advanced",
+      "start": [
+        227,
+        288,
+        -273
+      ],
+      "end": [
+        230,
+        289,
+        -314
+      ],
+      "notes": "defined by in-world !PF signs"
+    },
+    {
+      "id": "mcc-5-3",
+      "name": "mcc-5-3",
+      "scenario": "parkour-advanced",
+      "start": [
+        231,
+        289,
+        -314
+      ],
+      "end": [
+        194,
+        283,
+        -343
+      ],
+      "notes": "defined by in-world !PF signs"
+    },
+    {
+      "id": "mcc-6-1",
+      "name": "mcc-6-1",
+      "scenario": "parkour-advanced",
+      "start": [
+        195,
+        283,
+        -343
+      ],
+      "end": [
+        159,
+        283,
+        -347
+      ],
+      "notes": "defined by in-world !PF signs"
+    },
+    {
+      "id": "mcc-6-2",
+      "name": "mcc-6-2",
+      "scenario": "parkour-advanced",
+      "start": [
+        158,
+        283,
+        -347
+      ],
+      "end": [
+        161,
+        283,
+        -387
+      ],
+      "notes": "defined by in-world !PF signs"
+    },
+    {
+      "id": "mcc-6-3",
+      "name": "mcc-6-3",
+      "scenario": "parkour-advanced",
+      "start": [
+        160,
+        283,
+        -387
+      ],
+      "end": [
+        217,
+        280,
+        -388
+      ],
+      "notes": "defined by in-world !PF signs"
+    },
+    {
+      "id": "mcc-7-1",
+      "name": "mcc-7-1",
+      "scenario": "parkour-advanced",
+      "start": [
+        216,
+        280,
+        -388
+      ],
+      "end": [
+        250,
+        280,
+        -393
+      ],
+      "notes": "defined by in-world !PF signs"
+    },
+    {
+      "id": "mcc-7-2",
+      "name": "mcc-7-2",
+      "scenario": "parkour-advanced",
+      "start": [
+        249,
+        280,
+        -393
+      ],
+      "end": [
+        251,
+        277,
+        -437
+      ],
+      "notes": "defined by in-world !PF signs"
+    },
+    {
+      "id": "mcc-7-3",
+      "name": "mcc-7-3",
+      "scenario": "parkour-advanced",
+      "start": [
+        250,
+        277,
+        -437
+      ],
+      "end": [
+        251,
+        278,
+        -480
+      ],
+      "notes": "defined by in-world !PF signs"
+    },
+    {
+      "id": "mcc-8-1",
+      "name": "mcc-8-1",
+      "scenario": "parkour-advanced",
+      "start": [
+        250,
+        278,
+        -480
+      ],
+      "end": [
+        251,
+        279,
+        -513
+      ],
+      "notes": "defined by in-world !PF signs"
+    },
+    {
+      "id": "mcc-8-2",
+      "name": "mcc-8-2",
+      "scenario": "parkour-advanced",
+      "start": [
+        252,
+        279,
+        -513
+      ],
+      "end": [
+        248,
+        278,
+        -550
+      ],
+      "notes": "defined by in-world !PF signs"
+    },
+    {
+      "id": "mcc-8-3",
+      "name": "mcc-8-3",
+      "scenario": "parkour-advanced",
+      "start": [
+        247,
+        278,
+        -550
+      ],
+      "end": [
+        241,
+        301,
+        -596
+      ],
+      "notes": "defined by in-world !PF signs"
+    },
+    {
+      "id": "tenways-headhitters",
+      "name": "tenways-headhitters",
+      "scenario": "parkour-advanced",
+      "start": [
+        544,
+        267,
+        -597
+      ],
+      "end": [
+        544,
+        272,
+        -597
+      ],
+      "notes": "defined by in-world !PF signs"
+    },
+    {
+      "id": "tenways-ladder",
+      "name": "tenways-ladder",
+      "scenario": "parkour-advanced",
+      "start": [
+        515,
+        267,
+        -597
+      ],
+      "end": [
+        518,
+        278,
+        -597
+      ],
+      "notes": "defined by in-world !PF signs"
+    },
+    {
+      "id": "tenways-slime",
+      "name": "tenways-slime",
+      "scenario": "parkour-advanced",
+      "start": [
+        579,
+        267,
+        -597
+      ],
+      "end": [
+        575,
+        277,
+        -596
+      ],
+      "notes": "defined by in-world !PF signs"
+    },
+    {
+      "id": "whpm-1",
+      "name": "whpm-1",
+      "scenario": "parkour-advanced",
+      "start": [
+        475,
+        270,
+        -592
+      ],
+      "end": [
+        470,
+        282,
+        -553
+      ],
+      "notes": "defined by in-world !PF signs"
+    },
+    {
+      "id": "whpm-2",
+      "name": "whpm-2",
+      "scenario": "parkour-advanced",
+      "start": [
+        470,
+        283,
+        -553
+      ],
+      "end": [
+        481,
+        298,
+        -583
+      ],
+      "notes": "defined by in-world !PF signs"
+    },
+    {
+      "id": "whpm-3",
+      "name": "whpm-3",
+      "scenario": "parkour-advanced",
+      "start": [
+        481,
+        299,
+        -583
+      ],
+      "end": [
+        424,
+        303,
+        -523
       ],
       "notes": "defined by in-world !PF signs"
     }
