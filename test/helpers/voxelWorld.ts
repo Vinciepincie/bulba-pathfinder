@@ -247,6 +247,7 @@ export function snapshotFromWorld (world: VoxelWorld, lut: BlockLut, needStates 
   const snap = new Snapshot(meta, lut.fingerprint)
   const states = needStates ? snap.allocStates() : null
   const special = lut.special ? snap.allocSpecial() : null
+  const thin = lut.thin ? snap.allocThin() : null
   for (let y = b.y0; y <= b.y1; y++) {
     for (let z = b.z0; z <= b.z1; z++) {
       for (let x = b.x0; x <= b.x1; x++) {
@@ -256,6 +257,7 @@ export function snapshotFromWorld (world: VoxelWorld, lut: BlockLut, needStates 
         snap.heights[idx] = lut.heights[state]
         if (states) states[idx] = state
         if (special) special[idx] = lut.special![state]
+        if (thin) thin[idx] = lut.thin![state]
       }
     }
   }

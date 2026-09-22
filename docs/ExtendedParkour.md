@@ -37,11 +37,20 @@ carries a running jump ~5.7 blocks). The executor's jump simulation budget is
 Offsets are enumerated, not listed: every integer landing (a, b) with
 2 ≤ distance ≤ 5.66 (matching the deepest default-profile drop). The cost is
 `max(dist + 0.5, octile(a, b))`: euclidean plus a tie-breaking pad, floored at
-the solver's own heuristic. The pad alone is not quite enough at the
-enumeration limit — the octile-minus-euclidean deficit peaks at ~0.082 × major,
-so (2,6), (3,6), (6,2) and (6,3) came out **below** the heuristic by up to
-0.035 and made A* inadmissible. Flooring those four is preferable to lowering
-`MAX_OFFSET_MAJOR`, which would delete real reach. For each offset the
+the solver's own heuristic. The pad alone is not quite enough at the enumeration limit — the
+octile-minus-euclidean deficit peaks at ~0.082 × major, so (2,6), (3,6), (6,2)
+and (6,3) came out **below** the heuristic by up to 0.035 and made A*
+inadmissible. Flooring those four is preferable to lowering
+`MAX_OFFSET_MAJOR`, which would delete real reach.
+
+**Measured and rejected** (2026-09-18): a second floor at the ~11-tick arc a
+jump takes (3.1 walking blocks), on the theory that a short hop is slower than
+walking round it. The route book said the opposite — basic1 +2.49 s, basic3
++3.68 s, tunnel1 +1.47 s — because the bot then walked 5-8 blocks round gaps it
+had been crossing in stride. A hop only costs 11 dead ticks when the body has
+to STOP and line up for it; a sprint-hop never stops, and covers more ground
+per tick than sprinting does. Pricing that case means pricing the LINE-UP, not
+the jump. For each offset the
 **swept corridor** is computed by clipping the flight segment against each
 cell rect Minkowski-inflated by the hitbox half-width **minus a 0.15
 corner-nick tolerance**: cells the center line crosses are *line* cells
@@ -175,12 +184,21 @@ usual pair). A post sunk one below the floor (top 0.5 above it) is simply
 walked onto.
 
 What a narrow top costs is **catch credit**. The height byte carries a
-2-bit `topCatchClass` (shapes.ts): the largest centered square inside any
-single top face within step height of the collision top — 0 full/wide
-(slabs, stairs, chests), 1 the 0.25-half class (heads, wall posts), 2 the
-0.125-half class (fence posts, flower pots), 3 nothing (a ladder's 3/16
-edge). One face at a time, not the union: a fence with arms projects to a
-cross whose bounding box fills the cell. The envelope credits generalise
+2-bit `topCatchClass` (shapes.ts): the largest centered square inside the
+**union** of the top faces within step height of the collision top — 0
+full/wide (slabs, stairs, chests), 1 the 0.25-half class (heads, wall posts),
+2 the 0.125-half class (fence posts, flower pots), 3 nothing (a ladder's 3/16
+edge).
+
+The union, not each face alone: an upside-down (`half=top`) stair is two boxes
+that TILE its cell, and its top is as flat and as full as a slab's, but
+measured one box at a time neither box holds a centred square and the stair
+came out class 3 — a fence post. That cost it every landing credit the top can
+actually catch, and it barred aimed lines (which need a full top at the end
+they move), which is why courses built out of upside-down stairs — the arena's
+Six Rings — could not be entered at all. A fence keeps its class either way:
+its arms sit half a block under the post, so the union is a cross, and the
+largest centred square inside a cross is still the post. The envelope credits generalise
 from the full-block constants: takeoff = min(0.6, half + 0.28) — on a post
 the creep goes to two centimetres inside the overhang limit half + 0.3 (there
 is no other takeoff on a 1x1 top; "jump exactly from the corner"), a full
@@ -202,6 +220,68 @@ legal between full blocks, on posts only as a momentum chain — and a
 (2,2)+1 from a post onto a head needs 1.60. `hopMath.ts` in the arena
 scratch folder prints the numbers.
 
+## Off-centre narrow supports (`carryCode`)
+
+The class model puts a narrow support's carrying width symmetrically round
+the CELL centre, which a post, a head or a pot is. An open trapdoor's panel
+is a 3/16 strip at the cell's EDGE, a ladder's top its wall-side strip, a
+connected pane a 2/16 LINE through the middle: credited as centred posts they
+offered a creep the panel cannot give on one side and refused a whole cell of
+run on the other. `shapes.ts carryCode` classifies those shapes once per
+state (special byte, bits 5-7: edge panel W/E/N/S, line along x/z; 0 = the
+class model, so every centred support is unchanged), and `parkourExtTarget`
+credits take-off front/back and the landing per SIDE on the major axis
+(`carrySide`: full, none, or the class). The executor measures its creep and
+its lip from the real top faces (`geometry.supportFaces`), aims an off-centre
+support at the middle of its carrying face, and never sprint-hops onto a
+narrow support.
+
+Two more rules keep wall-mounted trapdoor LEDGES honest (arena `mcc-2-2`,
+walked the way a player does it: along each ledge to its end, a small hop
+across the corner to the next). A diagonal step between two carry-coded
+supports is a walk only where their faces carry a common body position
+(`carryTouch`: round the outer corner of one wall they meet, across the inner
+corner between two walls they are 0.8 apart) — otherwise it is emitted as a
+HOP (`META_PARKOUR`, +0.5) and the executor jumps it. And a diagonal jump
+whose minor axis (or, for a pure diagonal, either axis) leaves the panel's
+empty side crosses the strip's 3/16 width: no creep, no run-up cell, no lip
+take-off, no chain, and `OFF_PANEL_MARGIN` of flight in hand. A jump whose
+MAJOR axis leaves the empty side is the ordinary one off a ledge and keeps
+its credits.
+
+## Which end an aimed line may move
+
+An aimed line (below) stands the body off its cell's centre at the take-off,
+at the landing, or both. An end it moves needs a **full top** under it — a
+post, a pane or an edge panel has nothing beside its centre to stand on or
+land on. The test is per END, not per line: `pOff ≠ 0` demands a class-0,
+carry-0 take-off and `qOff ≠ 0` a class-0 landing, so a line that only moves
+the take-off may still land on a pane post, and one that only moves the
+landing may leave from one. `AIM_P0_MASK` (the variants with `pOff === 0`) is
+what a narrow take-off narrows the candidate set to before any of them is
+evaluated, so a course of posts and heads pays almost nothing for lines it
+cannot use.
+
+## Shifted flight lines (`META_SHIFT_*`, `Move.takeoff`)
+
+A pillar at the corner of the flight line refuses the jump (corridor pass);
+a player takes the same jump from one side of the block. Every table entry
+carries four VARIANTS — the same offset flown parallel to the centre line,
+`LATERAL_SHIFT_SMALL` (0.2: the body flush with its own cell at both ends)
+and `LATERAL_SHIFT` (0.35) to either side — swept with the full hitbox less
+5 cm, no corner-nick allowance. `extTarget` tries them ONLY where a corridor
+pass refused the centred line (never for reach or floor, so open ground pays
+nothing), only between full-block ends, never as a momentum chain, and
+prices them +0.5 / +1. The side travels in the meta byte in WORLD space
+(the perpendicular (-dz, dx) of the flight direction; the table's side flips
+with one mirrored axis, not two). `postProcessPath` moves the landing aim by
+the offset and records the same offset on the previous node's block as
+`Move.takeoff`; the executor walks the body onto that line first (`shift`
+branch, sneaking once close, to within `SHIFT_LINE_TOL`) and the creep,
+run-up and jump gates then work from there. Not covered: lines that are not
+parallel (take-off and landing shifted differently) and mid-air turns — the
+arena's Tuning Forks and the later Lateral Leaps need those.
+
 ## Ladders: entry, catch, transfer — never the top edge
 
 A ladder cell is entered cardinally from an adjacent stand (`moveForward`
@@ -222,6 +302,16 @@ diagonal): a ladder classifies as physical, so a +1 hop between the top
 edges of two ladders priced like a block hop — and a plan the executor
 cannot fly. Climbing over the lip at the top of a ladder (`moveUp` to the
 cell above, then off it) is unchanged.
+
+A ladder that starts at HEAD height (no rung in the feet cell) is entered by
+a jump straight up into it (`moveUp`, extended repertoire only; the executor's
+`jumpinto` branch faces the ladder's wall and jumps). Along a ladder WALL
+under a ceiling the executor keeps the node inside the ladder's cell instead
+of on its top, and traverses hanging: the step is split into an along-wall
+and an into-wall part (`climbWall` reads the wall side from the ladder's
+shape), the body moves sideways only where it fits and has a rung to hang
+from, presses only while below the node, and lets go to descend. A final
+node on a ladder is held until the body is within `CLIMB_FINISH_DY` of it.
 
 ## Momentum chains (`META_CHAIN`, `via`)
 

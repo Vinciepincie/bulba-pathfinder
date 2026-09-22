@@ -68,6 +68,10 @@ export class Movements {
   allowParkourExtended: boolean
   /** Improvement (opt-in, needs allowParkourExtended): momentum-aware search — see MovementsConfig.allowParkourMomentum. */
   allowParkourMomentum: boolean
+  /** Improvement (needs allowParkourExtended, default true): frame-perfect jumps as a dear fallback — see MovementsConfig.allowParkourTight. */
+  allowParkourTight: boolean
+  /** Improvement (opt-in, needs allowParkourExtended): physics-verified hops where the search fails — see MovementsConfig.allowParkourPhysics. */
+  allowParkourPhysics: boolean
   allowSprinting: boolean
   /**
    * Improvement (opt-in): hold jump while sprinting across open ground.
@@ -138,6 +142,15 @@ export class Movements {
    * the next take-off became 2, 11.3 s → 10.0 s.
    */
   allowLandingRetire: boolean
+  /**
+   * Improvement (opt-in, executor gait only, needs allowSprintHop): keep
+   * sprint-hopping on the approach to a parkour jump when a kernel rollout of
+   * the executor's own policy says hopping now lands that jump sooner than
+   * sprinting to it (PhysicsSim.hopIntoJumpBetter). Without it the gait is
+   * refused whenever a jump is within its look-ahead, and every approach on a
+   * course is sprinted: 4-15 s per parkour route on the arena.
+   */
+  allowHopIntoJump: boolean
   allowEntityDetection: boolean
 
   entitiesToAvoid: Set<string>
@@ -195,12 +208,15 @@ export class Movements {
     this.allowParkour = true
     this.allowParkourExtended = false // improvement, opt-in (upstream only jumps straight and flat)
     this.allowParkourMomentum = false // improvement, opt-in (landing momentum as search state)
+    this.allowParkourTight = true // improvement: zero-margin jumps where the comfortable envelope has no way
+    this.allowParkourPhysics = false // improvement, opt-in (physics-verified hops where the search fails)
     this.allowSprinting = true
     this.allowSprintHop = false // improvement, opt-in (executor gait only)
     this.allowLowCeilingHop = false // improvement, opt-in (executor gait only)
     this.allowCornerCut = true // improvement, on (executor steering only; plan unchanged)
     this.allowRunUp = false // improvement, opt-in (executor take-off only)
     this.allowLandingRetire = false // improvement, opt-in (executor arrival only)
+    this.allowHopIntoJump = false // improvement, opt-in (executor gait only)
     this.allowEntityDetection = true
 
     this.entitiesToAvoid = new Set()
@@ -474,7 +490,9 @@ export class Movements {
       useBubbleColumns: this.useBubbleColumns,
       bubbleCost: this.bubbleCost,
       parkourSafetyMargin: this.parkourSafetyMargin,
-      allowParkourMomentum: this.allowParkourMomentum
+      allowParkourMomentum: this.allowParkourMomentum,
+      allowParkourTight: this.allowParkourTight,
+      allowParkourPhysics: this.allowParkourPhysics
     }
   }
 

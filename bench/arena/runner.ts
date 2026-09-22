@@ -5,6 +5,7 @@
 // from `src/`, so the benchmark exercises what production runs — worker
 // thread, wasm core and all. Running the TypeScript sources directly would
 // silently fall back to main-thread solving and flatter the result.
+import { appendFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { performance } from 'node:perf_hooks'
 import type { Bot } from 'mineflayer'
@@ -265,6 +266,10 @@ export function applyProfile (
     // race the profile a conservative consumer (the shop bot) runs.
     movements.allowRunUp = process.env.ARENA_NO_RUNUP !== '1'
     movements.allowLandingRetire = process.env.ARENA_NO_LANDRETIRE !== '1'
+    // The gait flown INTO a jump (executor only, opt-in); ARENA_NO_HOPJUMP=1 bisects it.
+    movements.allowHopIntoJump = process.env.ARENA_NO_HOPJUMP !== '1'
+    // Physics-verified hops where the search fails (opt-in); ARENA_NO_PHYSICS=1 bisects it.
+    movements.allowParkourPhysics = profile.extendedParkour && process.env.ARENA_NO_PHYSICS !== '1'
     // Bisect switch for the sprint-hop gait on any engine (bulba-nohop is JS only).
     if (process.env.ARENA_NO_HOP === '1') {
       movements.allowSprintHop = false
@@ -595,6 +600,15 @@ export class Racer {
     const t0 = performance.now()
     launchAt = t0
     launchPos = bot.entity.position.clone()
+    // Route marker in the executor trace (PF_EXEC_TRACE), so one batch's
+    // per-tick rows split by route. The plugin flushes on idle ticks, so
+    // nothing of the previous route is still buffered at launch.
+    if (process.env.PF_EXEC_TRACE) {
+      try {
+        appendFileSync(`${process.env.PF_EXEC_TRACE}-${bot.username}.jsonl`,
+          JSON.stringify(['route', routeId, result.startedAt]) + '\n')
+      } catch { /* tracing is best effort */ }
+    }
     try {
       const goto = (pf.goto as (g: unknown) => Promise<void>)(goal)
       let timer: NodeJS.Timeout | undefined

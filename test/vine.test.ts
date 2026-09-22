@@ -87,7 +87,7 @@ describe('vine climbing (auto on 1.16+)', function () {
     const snap = out.snapKeyed
     const descriptor = serializeGoal(goal)!
     const w = wasm.solve(
-      { meta: snap.meta, flags: snap.flags, heights: snap.heights, states: null, special: snap.special, entityIdx: snap.entityIdx, entityWeight: snap.entityWeight },
+      { meta: snap.meta, flags: snap.flags, heights: snap.heights, states: null, special: snap.special, thin: snap.thin, entityIdx: snap.entityIdx, entityWeight: snap.entityWeight },
       out.movements.toConfig(), descriptor, start, null,
       { timeout: 30000, searchRadius: -1, sliceMs: 1e9, cancelFlag: null, onPartial: () => {} }
     )

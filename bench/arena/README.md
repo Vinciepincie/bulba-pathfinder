@@ -388,7 +388,7 @@ Thirty routes above y 266 over the arena's south-east quadrant (nothing of
 | routes | source | what it tests |
 | --- | --- | --- |
 | `mcc-1-1` … `mcc-8-3` | Minecraft Championship practice parkour remake (Hybrid Posts, original by Noxcrew), all 24 stages | neos around pane walls, ladder hops and climbs, trapdoor hoops, the slime Triple Bounce, iron bars, ice |
-| `whpm-1` … `whpm-3` | World's Hardest Parkour Map (CrazyMonkeyChip) | 5-block post jumps, ladder hops round a fence tower, beds and panes, a +1 staircase of single posts |
+| `mcc-6-2a` | the first three hops of `mcc-6-2` (Lateral Leaps) | jumps past a wall corner on a shifted flight line; a stage that does not plan end to end is not walked at all, so a technique gets its own sub-route |
 | `tenways-ladder` | 10 Ways to Parkour (McDeathStar), level 2 | jumps between single ladder blocks up a room |
 | `tenways-headhitters` | same map, level 4 | a zig-zag climb where every landing has a block three above |
 | `tenways-slime` | same map, level 6 | slime blocks and ladders |

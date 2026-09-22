@@ -2,6 +2,8 @@
 // receive these in path_update results and rely on the Vec3 inheritance.
 import { Vec3 } from 'vec3'
 import type { RawPathNode } from './types.js'
+import type { HopProgram } from './hopOracle.js'
+import { AIM_VARIANTS } from './parkourTable.js'
 
 export interface ToPlaceEntry {
   x: number
@@ -37,6 +39,21 @@ export class Move extends Vec3 {
    * support instead of creeping to the lip and jumping from rest.
    */
   run = false
+  /** Is the landing support narrower than a full top (a post, a pane, a panel)? Set by the executor when the node comes up; null = not looked at yet. */
+  narrowLanding: boolean | null = null
+  /**
+   * Aimed flight line (planner META_AIM): signed offsets (blocks) of the
+   * TAKE-OFF point and the LANDING point from their cell centres, along the
+   * world perpendicular (-dz, dx) of the flight direction; 0 = centred.
+   * postProcessPath moves the aim point by `qOff` and sets `takeoff`, `pOff`
+   * beside the previous node's aim, where the executor lines the body up
+   * before the jump.
+   */
+  pOff = 0
+  qOff = 0
+  /** A NEO (AIM_VARIANTS wOff ≠ 0): the planned line goes out beside a pillar in the way and back in behind it. The executor flies it with a searched jump script (PhysicsSim.solveJump). */
+  wOff = 0
+  takeoff: { x: number, z: number } | null = null
   /**
    * Aim offset (XZ, blocks) applied after the aim point is set on the
    * support's top: a momentum-chain stepping stone is landed on its FAR side
@@ -44,6 +61,10 @@ export class Move extends Vec3 {
    */
   aimDx = 0
   aimDz = 0
+  /** Physics-verified hop (allowParkourPhysics): the control program that lands this node; null otherwise. */
+  program: HopProgram | null = null
+  /** The planner's cell of this node — x/y/z become its aim point in postProcessPath, which may sit on the cell's edge. */
+  readonly cell: readonly [number, number, number]
 
   constructor (
     x: number,
@@ -58,6 +79,7 @@ export class Move extends Vec3 {
     chain = false
   ) {
     super(Math.floor(x), Math.floor(y), Math.floor(z))
+    this.cell = [this.x, this.y, this.z]
     this.remainingBlocks = remainingBlocks
     this.cost = cost
     this.toBreak = toBreak
@@ -76,6 +98,16 @@ export class Move extends Vec3 {
     const via = raw.via ? new Vec3(raw.via.x, raw.via.y, raw.via.z) : null
     const move = new Move(raw.x, raw.y, raw.z, 0, raw.cost, toBreak, toPlace, raw.parkour, via, raw.chain === true)
     move.run = raw.run === true
+    if (raw.program !== undefined) move.program = raw.program
+    if (raw.aim !== undefined && raw.aim !== 0) {
+      const v = AIM_VARIANTS[(raw.aim & 0x7f) - 1]
+      if (v !== undefined) {
+        const side = (raw.aim & 0x80) !== 0 ? -1 : 1
+        move.pOff = v[0] * side
+        move.qOff = v[1] * side
+        move.wOff = v[2] * side
+      }
+    }
     return move
   }
 

@@ -14,7 +14,7 @@
 // arena by the momentum count.
 import { performance } from 'node:perf_hooks'
 import { MinHeap } from './heap.js'
-import { MoveGen, META_PARKOUR, META_USEONE, META_BOUNCE, META_CHAIN, META_RUN, MOM_NONE } from './moveGen.js'
+import { MoveGen, META_PARKOUR, META_USEONE, META_BOUNCE, META_CHAIN, META_RUN, META_AIM, MOM_NONE } from './moveGen.js'
 import type { SnapshotView, StepExclusionFn, DigContext } from './moveGen.js'
 import type { MovementsConfig, RawPathNode, SolveStatus } from './types.js'
 
@@ -44,6 +44,8 @@ export interface RawSolveResult {
   boundaryLimited: boolean
   /** Which engine produced this result ('js' when absent). */
   engine?: 'js' | 'wasm'
+  /** Physics-verified hops stitched into the path (hopPipeline.ts, allowParkourPhysics). */
+  hops?: number
 }
 
 /** Secondary (momentum) slots reserved beyond the cell region per solve. */
@@ -178,6 +180,8 @@ export class Solver {
   private breaks: Map<number, number[]> | null = null
   /** Per-node slime stand cell for META_BOUNCE moves; lazily created. */
   private vias: Map<number, number> | null = null
+  /** Per-node AIM byte for META_AIM moves; lazily created. */
+  private aims: Map<number, number> | null = null
 
   constructor (
     snap: SnapshotView,
@@ -250,6 +254,34 @@ export class Solver {
     const out = new Set<string>()
     for (const [cx, cz] of this.chunkList) out.add(`${cx},${cz}`)
     return out
+  }
+
+  /**
+   * Was cell (x, y, z) reached (opened) by this search, at any momentum?
+   * Read-only, and only while the arena is still this solve's (a later solve
+   * that re-acquired it has moved the epoch on; the answer is then false).
+   * What a failed search did not reach is where a physics hop can open the
+   * way (hopOracle.ts).
+   */
+  reached (x: number, y: number, z: number): boolean {
+    const lx = x - this.x0
+    const ly = y - this.y0
+    const lz = z - this.z0
+    const m = this.snap.meta
+    if (lx < 0 || lx >= m.w || ly < 0 || ly >= m.h || lz < 0 || lz >= m.l) return false
+    const arena = this.arena
+    if (arena.epoch !== this.myEpoch) return false
+    const cell = (ly * this.l + lz) * this.w + lx
+    if (arena.stamp[cell] === this.myEpoch) return true
+    if (!this.momentum) return false
+    let k = arena.momHead[cell]
+    if (k < 0 || k >= this.secCount || arena.secCell[k] !== cell) return false
+    for (;;) {
+      if (arena.stamp[this.n + k] === this.myEpoch) return true
+      const nx = arena.secNext[k]
+      if (nx < 0) return false
+      k = nx
+    }
   }
 
   /** Cell index of a slot (momentum slots map back through the secondary). */
@@ -325,6 +357,10 @@ export class Solver {
           useOne: (meta & META_USEONE) !== 0 ? { x, y, z } : null
         }
         if ((meta & META_RUN) !== 0) node.run = true
+        if ((meta & META_AIM) !== 0) {
+          const aim = this.aims?.get(cur)
+          if (aim !== undefined) node.aim = aim
+        }
         const breakCells = this.breaks?.get(cur)
         if (breakCells !== undefined) {
           node.toBreak = breakCells.map(idx => ({
@@ -484,6 +520,12 @@ export class Solver {
           (this.vias ??= new Map()).set(nIdx, via)
         } else if (this.vias !== null) {
           this.vias.delete(nIdx)
+        }
+        const aim = moveGen.outAim[i]
+        if (aim !== 0) {
+          (this.aims ??= new Map()).set(nIdx, aim)
+        } else if (this.aims !== null) {
+          this.aims.delete(nIdx)
         }
         if (h < this.bestH) {
           this.bestH = h

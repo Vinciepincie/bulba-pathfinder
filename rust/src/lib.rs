@@ -25,6 +25,7 @@
 
 use core::f64::consts::SQRT_2;
 use std::collections::BTreeMap;
+use std::rc::Rc;
 
 // ── LutFlags (must match src/types.ts) ─────────────────────────────────────
 const SAFE: u8 = 1;
@@ -45,6 +46,67 @@ const SPECIAL_SLIME: u8 = 8;
 const SPECIAL_STAIR: u8 = 16;
 // Bubble-only semantics must not fire on VINE/SLIME-marked cells.
 const BUBBLE_MASK: u8 = BUBBLE_UP | BUBBLE_DOWN;
+/// Where a narrow support sits in its cell, bits 5-7 of the special byte
+/// (mirror of shapes.ts carryCode / CARRY_*).
+const CARRY_SHIFT: u8 = 5;
+const CARRY_W_NONE: u8 = 1;
+const CARRY_E_NONE: u8 = 2;
+const CARRY_N_NONE: u8 = 3;
+const CARRY_LINE_X: u8 = 5;
+const CARRY_LINE_Z: u8 = 6;
+
+/// Mirror of moveGen.ts OFF_PANEL_MARGIN.
+const OFF_PANEL_MARGIN: f64 = 0.3;
+/// Mirror of moveGen.ts TIGHT_COST.
+const TIGHT_COST: f64 = 6.0;
+
+/// Mirror of shapes.ts CARRY_RECT: nominal top-face rect [x0, x1, z0, z1] per carry code.
+const CARRY_RECT: [[f64; 4]; 8] = [
+    [0.0, 1.0, 0.0, 1.0],
+    [0.8125, 1.0, 0.0, 1.0],
+    [0.0, 0.1875, 0.0, 1.0],
+    [0.0, 1.0, 0.8125, 1.0],
+    [0.0, 1.0, 0.0, 0.1875],
+    [0.0, 1.0, 0.4375, 0.5625],
+    [0.4375, 0.5625, 0.0, 1.0],
+    [0.0, 1.0, 0.0, 1.0],
+];
+const CARRY_REACH: f64 = 0.275;
+
+/// Mirror of shapes.ts carryTouch: do the two faces carry a common body position?
+#[inline]
+fn carry_touch(a: u8, b: u8, dx: i32, dz: i32) -> bool {
+    let ra = CARRY_RECT[a as usize];
+    let rb = CARRY_RECT[b as usize];
+    let r = 2.0 * CARRY_REACH;
+    let fx = dx as f64;
+    let fz = dz as f64;
+    ra[0] - r < rb[1] + fx && rb[0] + fx - r < ra[1] && ra[2] - r < rb[3] + fz && rb[2] + fz - r < ra[3]
+}
+
+/// Mirror of shapes.ts carrySide: 2 full, 1 none, 0 the class model.
+#[inline]
+fn carry_side(code: u8, dx: i32, dz: i32) -> u8 {
+    if code == 0 || code == CARRY_WIDE {
+        return 0;
+    }
+    if code == CARRY_LINE_X {
+        return if dx != 0 { 2 } else { 0 };
+    }
+    if code == CARRY_LINE_Z {
+        return if dz != 0 { 2 } else { 0 };
+    }
+    let none = if code == CARRY_W_NONE {
+        dx < 0
+    } else if code == CARRY_E_NONE {
+        dx > 0
+    } else if code == CARRY_N_NONE {
+        dz < 0
+    } else {
+        dz > 0
+    };
+    if none { 1 } else { 2 }
+}
 
 // DigFlags (must match src/types.ts)
 const CAN_FALL: u8 = 1;
@@ -57,6 +119,62 @@ const META_CHAIN: u8 = 8;
 /// The jump needs a run-up (mirror of moveGen.ts META_RUN): executor
 /// information only, never a search input.
 const META_RUN: u8 = 16;
+/// Aimed flight line (mirror of moveGen.ts META_AIM): the AIM byte follows
+/// the meta byte in the serialized result.
+const META_AIM: u8 = 32;
+/// Mirror of shapes.ts CARRY_WIDE.
+const CARRY_WIDE: u8 = 7;
+/// Thin footprint interval classes in sixteenths (mirror of shapes.ts THIN_INTERVALS).
+const THIN_LO: [f64; 16] = [0.0, 0.0, 13.0, 7.0, 6.0, 5.0, 4.0, 0.0, 0.0, 0.0, 0.0, 7.0, 6.0, 5.0, 4.0, 0.0];
+const THIN_HI: [f64; 16] = [16.0, 3.0, 16.0, 9.0, 10.0, 11.0, 12.0, 9.0, 10.0, 11.0, 12.0, 16.0, 16.0, 16.0, 16.0, 16.0];
+/// Mirror of moveGen.ts THIN_BODY_HALF.
+const THIN_BODY_HALF: f64 = 0.29;
+
+/// Does the segment P -> P+D enter the open rect? (mirror of moveGen.ts segHits, same operation order)
+#[inline]
+fn seg_hits(px: f64, pz: f64, dx: f64, dz: f64, x0: f64, x1: f64, z0: f64, z1: f64) -> bool {
+    let mut t0 = 0.0f64;
+    let mut t1 = 1.0f64;
+    if dx == 0.0 {
+        if px <= x0 || px >= x1 {
+            return false;
+        }
+    } else {
+        let mut e = (x0 - px) / dx;
+        let mut x = (x1 - px) / dx;
+        if e > x {
+            let sw = e;
+            e = x;
+            x = sw;
+        }
+        if e > t0 {
+            t0 = e;
+        }
+        if x < t1 {
+            t1 = x;
+        }
+    }
+    if dz == 0.0 {
+        if pz <= z0 || pz >= z1 {
+            return false;
+        }
+    } else {
+        let mut e = (z0 - pz) / dz;
+        let mut x = (z1 - pz) / dz;
+        if e > x {
+            let sw = e;
+            e = x;
+            x = sw;
+        }
+        if e > t0 {
+            t0 = e;
+        }
+        if x < t1 {
+            t1 = x;
+        }
+    }
+    t1 - t0 > 1e-9
+}
 
 const CARDINAL: [(i32, i32); 4] = [(-1, 0), (1, 0), (0, -1), (0, 1)];
 const DIAGONAL: [(i32, i32); 4] = [(-1, -1), (-1, 1), (1, -1), (1, 1)];
@@ -158,13 +276,14 @@ fn chain_aligned(abx: i32, abz: i32, ab2: i32, bcx: i32, bcz: i32) -> bool {
     (dot * dot) as f64 >= CHAIN_MIN_COS2 * ab2 as f64 * (bcx * bcx + bcz * bcz) as f64
 }
 
-/// Mirror of moveGen.ts flightFrom: per-axis credited flight for offset
-/// (a, b) from takeoff point `s` along the line — sqrt of a sum, never
-/// hypot, so both engines round identically.
+/// Mirror of moveGen.ts flightFrom2: per-axis credited flight for offset
+/// (a, b) from takeoff point `s` along the line, the landing credit given
+/// per axis (an edge panel or a line carries differently along and across)
+/// — sqrt of a sum, never hypot, so both engines round identically.
 #[inline]
-fn flight_from(a: f64, b: f64, dist: f64, s: f64, l_cred: f64) -> f64 {
-    let dx = a - a / dist * s - l_cred;
-    let dz = b - b / dist * s - l_cred;
+fn flight_from2(a: f64, b: f64, dist: f64, s: f64, l_cred_x: f64, l_cred_z: f64) -> f64 {
+    let dx = a - a / dist * s - l_cred_x;
+    let dz = b - b / dist * s - l_cred_z;
     let px = if dx > 0.0 { dx } else { 0.0 };
     let pz = if dz > 0.0 { dz } else { 0.0 };
     (px * px + pz * pz).sqrt()
@@ -190,6 +309,19 @@ struct ExtEntry {
     /// uploaded J_STANDING / J_RUNNING rows per landing bucket.
     fn_stand: f64,
     fn_run: f64,
+    /// Signed offsets of the take-off and landing points from their cell
+    /// centres (0 on a centred entry): an end a line moves needs a full top.
+    p_off: f64,
+    q_off: f64,
+    /// Aimed line (parkourTable.ts AIM_VARIANTS): 1-based variant index, 0 on
+    /// a centred entry. The variants of main entry i are entries
+    /// ext_main_n + i·ext_var_per + j (serializeParkourTable).
+    aim_index: u8,
+    /// How much longer than the centre line the aimed line is.
+    extra: f64,
+    /// The flown path in table space (ParkourExtEntry.pts): n_seg segments over up to three points.
+    n_seg: usize,
+    pts: [f64; 6],
 }
 
 // ── goal ───────────────────────────────────────────────────────────────────
@@ -315,6 +447,8 @@ struct Config {
     bubble_cost: f64,
     /// ENVELOPE_SAFETY_MARGIN − parkourSafetyMargin (moveGen.ts marginCredit).
     margin_credit: f64,
+    /// Margin credit of the tight pass (moveGen.ts tightCredit).
+    tight_credit: f64,
 }
 
 // ── heap (mirror of src/heap.ts) ──────────────────────────────────────────
@@ -411,6 +545,7 @@ struct NeighborOut {
     breaks: [Option<Vec<i32>>; OUT_CAP],
     /// Slime stand cell of a META_BOUNCE neighbour, -1 otherwise.
     via: [i32; OUT_CAP],
+    aim: [u8; OUT_CAP],
     /// Momentum the neighbour arrives with (mirror of MoveGen.outMom).
     mom: [u8; OUT_CAP],
     count: usize,
@@ -423,6 +558,8 @@ struct SolverState {
     heights: Vec<u8>,
     states: Vec<u16>,
     special: Vec<u8>,
+    /// Thin footprint byte per cell (shapes.ts thinFootprint); empty without the extended repertoire.
+    thin: Vec<u8>,
     x0: i32,
     y0: i32,
     z0: i32,
@@ -443,8 +580,20 @@ struct SolverState {
     max_cost: f64,
 
     // extended-parkour table (per-solve upload; see ExtEntry)
-    ext_entries: Vec<ExtEntry>,
+    /// Extended-parkour entries (parse_ext); Rc so an expansion borrows them while mutating the rest.
+    ext_entries: Rc<Vec<ExtEntry>>,
+    /// Serialized table kept resident (ext_begin / ext_commit).
+    ext_blob: Vec<u8>,
     ext_cells: Vec<i32>,
+    /// Aimed variants that do not sweep the cell at all (ParkourExtEntry.avoid), indexed by cells_off + k.
+    ext_avoid: Vec<i32>,
+    /// Per cell: the siblings whose flight line misses it (ParkourExtEntry.lineAvoid).
+    ext_line_avoid: Vec<i32>,
+    /// Variants whose take-off is centred (moveGen.ts AIM_P0_MASK).
+    ext_p0_mask: i32,
+    /// The centre line's landing (node y, support y), reused by its aimed variants.
+    ext_land_y: i32,
+    ext_land_sup_y: i32,
     /// Per-corridor-cell min feet height: six blocks (standing, running,
     /// low-standing, low-running, lip, low-lip), each ext_mf_block long,
     /// indexed by block·ext_mf_block + cells_off + k.
@@ -456,6 +605,12 @@ struct SolverState {
     ext_diag_n: usize,
     ext_card_x_n: usize,
     ext_card_z_n: usize,
+    /// Centred entries (diag + cardX + cardZ); their shifted variants follow.
+    ext_main_n: usize,
+    ext_var_per: usize,
+    /// Set by parkour_ext_target when a corridor pass refused the line: the
+    /// aimed variants worth trying (mirror of moveGen.ts extTryMask).
+    ext_try_mask: i32,
 
     // persistent epoch-stamped arena (grow-only, never zeroed per solve).
     // Slots [0, n_cells) are cells at momentum NONE; momentum states live in
@@ -476,6 +631,8 @@ struct SolverState {
     breaks: BTreeMap<i32, Vec<i32>>,
     /// Slime stand cell per META_BOUNCE node (-1 otherwise); stamped like g.
     vias: Vec<i32>,
+    /// AIM byte per META_AIM node (0 otherwise); stamped like g.
+    aims: Vec<u8>,
     heap: MinHeap,
     n_cells: usize,
     momentum: bool,
@@ -490,6 +647,7 @@ struct SolverState {
     move_breaks: Vec<i32>,
     /// Set by slime_bounce for the push it is about to make.
     pending_via: i32,
+    pending_aim: u8,
     /// Set by parkour_ext_target for the landing it is about to push.
     pending_mom: u8,
     /// Momentum of the node being expanded (mirror of MoveGen.momIn).
@@ -518,6 +676,7 @@ impl SolverState {
             heights: Vec::new(),
             states: Vec::new(),
             special: Vec::new(),
+            thin: Vec::new(),
             x0: 0,
             y0: 0,
             z0: 0,
@@ -532,14 +691,23 @@ impl SolverState {
             cfg: Config::default(),
             goal: MultiGoal { specs: Vec::new() },
             max_cost: -1.0,
-            ext_entries: Vec::new(),
+            ext_entries: Rc::new(Vec::new()),
+            ext_blob: Vec::new(),
             ext_cells: Vec::new(),
+            ext_avoid: Vec::new(),
+            ext_line_avoid: Vec::new(),
+            ext_p0_mask: 0,
+            ext_land_y: 0,
+            ext_land_sup_y: i32::MIN,
             ext_mf: Vec::new(),
             ext_mf_block: 0,
             ext_reach: [0.0; 150],
             ext_diag_n: 0,
             ext_card_x_n: 0,
             ext_card_z_n: 0,
+            ext_main_n: 0,
+            ext_var_per: 0,
+            ext_try_mask: 0,
             epoch: 0,
             g: Vec::new(),
             parent: Vec::new(),
@@ -548,6 +716,7 @@ impl SolverState {
             closed: Vec::new(),
             breaks: BTreeMap::new(),
             vias: Vec::new(),
+            aims: Vec::new(),
             heap: MinHeap::new(4096),
             n_cells: 0,
             momentum: false,
@@ -565,11 +734,13 @@ impl SolverState {
                 meta: [0; OUT_CAP],
                 breaks: [const { None }; OUT_CAP],
                 via: [-1; OUT_CAP],
+                aim: [0; OUT_CAP],
                 mom: [0; OUT_CAP],
                 count: 0,
             },
             move_breaks: Vec::new(),
             pending_via: -1,
+            pending_aim: 0,
             pending_mom: MOM_NONE,
             mom_in: MOM_NONE,
             mom_dx: 0,
@@ -616,6 +787,7 @@ impl SolverState {
         self.stamp.resize(need, 0);
         self.closed.resize(need, 0);
         self.vias.resize(need, -1);
+        self.aims.resize(need, 0);
     }
 
     #[inline]
@@ -695,6 +867,116 @@ pub unsafe extern "C" fn wasm_free(ptr: *mut u8, size: usize) {
     drop(Vec::from_raw_parts(ptr, 0, size.max(1)));
 }
 
+
+/// Parse a serialized extended-parkour table (parkourTable.ts serializeParkourTable)
+/// into the core's tables. 0 = ok, 5 = layout mismatch.
+unsafe fn parse_ext(st: &mut SolverState, ext_ptr: *const u8, ext_len: usize) -> i32 {
+    let mut entries: Vec<ExtEntry> = Vec::new();
+    st.ext_entries = Rc::new(Vec::new());
+    st.ext_cells.clear();
+    st.ext_avoid.clear();
+    st.ext_line_avoid.clear();
+    st.ext_p0_mask = 0;
+    st.ext_mf.clear();
+    st.ext_mf_block = 0;
+    st.ext_diag_n = 0;
+    st.ext_card_x_n = 0;
+    st.ext_card_z_n = 0;
+    st.ext_main_n = 0;
+        let mut eo = 0usize;
+        st.ext_diag_n = read_i32(ext_ptr, &mut eo) as usize;
+        st.ext_card_x_n = read_i32(ext_ptr, &mut eo) as usize;
+        st.ext_card_z_n = read_i32(ext_ptr, &mut eo) as usize;
+        let cells_len = read_i32(ext_ptr, &mut eo) as usize;
+        st.ext_var_per = read_i32(ext_ptr, &mut eo) as usize;
+        st.ext_main_n = st.ext_diag_n + st.ext_card_x_n + st.ext_card_z_n;
+        // Centred entries, then every entry's shifted variants (ext_var_per each).
+        let n_total = st.ext_main_n * (1 + st.ext_var_per);
+        if st.ext_main_n == 0 || n_total > 4096 || st.ext_var_per > 64 || cells_len > 262144 {
+            return 5;
+        }
+        for _ in 0..n_total {
+            let tx = read_i32(ext_ptr, &mut eo);
+            let tz = read_i32(ext_ptr, &mut eo);
+            let n_line = read_i32(ext_ptr, &mut eo) as usize;
+            let n_cells = read_i32(ext_ptr, &mut eo) as usize;
+            let cells_off = read_i32(ext_ptr, &mut eo) as usize;
+            let run_x = read_i32(ext_ptr, &mut eo);
+            let run_z = read_i32(ext_ptr, &mut eo);
+            let n_seg = read_i32(ext_ptr, &mut eo) as usize;
+            entries.push(ExtEntry {
+                tx, tz, n_line, n_cells, cells_off, run_x, run_z,
+                dist: 0.0, cost: 0.0, fn_stand: 0.0, fn_run: 0.0, p_off: 0.0, q_off: 0.0, aim_index: 0, extra: 0.0,
+                n_seg, pts: [0.0; 6],
+            });
+        }
+        for _ in 0..cells_len {
+            st.ext_cells.push(read_i32(ext_ptr, &mut eo));
+        }
+        for _ in 0..cells_len / 2 {
+            st.ext_avoid.push(read_i32(ext_ptr, &mut eo));
+        }
+        for _ in 0..cells_len / 2 {
+            st.ext_line_avoid.push(read_i32(ext_ptr, &mut eo));
+        }
+        eo = (eo + 7) & !7; // f64 section is 8-aligned in the blob
+        for i in 0..150 {
+            st.ext_reach[i] = read_f64(ext_ptr, &mut eo);
+        }
+        for i in 0..n_total {
+            entries[i].dist = read_f64(ext_ptr, &mut eo);
+            entries[i].cost = read_f64(ext_ptr, &mut eo);
+            entries[i].fn_stand = read_f64(ext_ptr, &mut eo);
+            entries[i].fn_run = read_f64(ext_ptr, &mut eo);
+            entries[i].p_off = read_f64(ext_ptr, &mut eo);
+            entries[i].q_off = read_f64(ext_ptr, &mut eo);
+            entries[i].extra = read_f64(ext_ptr, &mut eo);
+            for k in 0..6 {
+                entries[i].pts[k] = read_f64(ext_ptr, &mut eo);
+            }
+            if i >= st.ext_main_n && st.ext_var_per > 0 {
+                entries[i].aim_index = ((i - st.ext_main_n) % st.ext_var_per) as u8 + 1;
+                // The lines a narrow support can still start (moveGen.ts AIM_P0_MASK).
+                if i < st.ext_main_n + st.ext_var_per && entries[i].p_off == 0.0 {
+                    st.ext_p0_mask |= 1 << (i - st.ext_main_n);
+                }
+            }
+        }
+        // Per-cell min-feet arrays: standing, running, low-standing,
+        // low-running, lip, low-lip blocks.
+        st.ext_mf_block = cells_len / 2;
+        for _ in 0..cells_len * 3 {
+            st.ext_mf.push(read_f64(ext_ptr, &mut eo));
+        }
+        if eo != ext_len {
+            st.ext_main_n = 0;
+            return 5; // layout mismatch between serializer and parser
+        }
+    st.ext_entries = Rc::new(entries);
+    0
+}
+
+/// Extended-parkour table residency: `ext_begin(len)` sizes the blob buffer
+/// (write it at ext_ptr), `ext_commit` parses it. The table is a process
+/// constant on the JS side (~0.7 MB serialized), uploaded once.
+#[no_mangle]
+pub unsafe extern "C" fn ext_begin(len: u32) {
+    state().ext_blob.resize(len as usize, 0);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ext_ptr() -> *mut u8 {
+    state().ext_blob.as_mut_ptr()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ext_commit() -> i32 {
+    let st = state();
+    let len = st.ext_blob.len();
+    let ptr = st.ext_blob.as_ptr();
+    parse_ext(st, ptr, len)
+}
+
 // ── snapshot residency exports ────────────────────────────────────────────
 #[no_mangle]
 pub unsafe extern "C" fn snap_begin(n: u32, states_len: u32, special_len: u32) {
@@ -723,6 +1005,16 @@ pub unsafe extern "C" fn snap_states_ptr() -> *mut u8 {
 #[no_mangle]
 pub unsafe extern "C" fn snap_special_ptr() -> *mut u8 {
     state().special.as_mut_ptr()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn snap_thin_begin(len: u32) {
+    state().thin.resize(len as usize, 0);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn snap_thin_ptr() -> *mut u8 {
+    state().thin.as_mut_ptr()
 }
 
 #[no_mangle]
@@ -818,6 +1110,12 @@ impl SolverState {
         } else {
             (self.heights[idx as usize] >> 6) as usize
         }
+    }
+
+    /// carryCode of the cell's block (mirror of moveGen.ts carryAt).
+    #[inline]
+    fn carry_at(&mut self, x: i32, y: i32, z: i32) -> u8 {
+        self.special_at(x, y, z) >> CARRY_SHIFT
     }
 
     #[inline]
@@ -957,6 +1255,8 @@ impl SolverState {
         self.out.meta[i] = meta;
         self.out.via[i] = self.pending_via;
         self.pending_via = -1;
+        self.out.aim[i] = self.pending_aim;
+        self.pending_aim = 0;
         self.out.mom[i] = mom;
         self.out.breaks[i] = if self.move_breaks.is_empty() {
             None
@@ -1225,6 +1525,15 @@ impl SolverState {
         }
 
         if (f1 & CLIMBABLE) == 0 {
+            // A ladder starting at head height: jump into it (mirror of moveGen.ts).
+            if !self.ext_on() {
+                return;
+            }
+            let f_h = self.flags_at(x, y + 1, z);
+            if (f_h & CLIMBABLE) == 0 || !self.is_safe(f_h) || !self.climb_usable(x, y + 1, z) {
+                return;
+            }
+            self.push_out(x, y + 1, z, cost + 1.0, 0);
             return;
         }
 
@@ -1312,7 +1621,14 @@ impl SolverState {
             || self.is_thin_floor(f_c)
             || (self.special_at(x + dx, y, z + dz) & BUBBLE_MASK) != 0
         {
-            self.push_out(x + dx, y, z + dz, cost, 0);
+            // Extended: a diagonal between two edge supports is a hop (mirror of moveGen.ts).
+            let mut hop = false;
+            if self.ext_on() {
+                let c_a = self.carry_at(x, y - 1, z);
+                let c_b = if c_a == 0 { 0 } else { self.carry_at(x + dx, y - 1, z + dz) };
+                hop = c_b != 0 && !carry_touch(c_a, c_b, dx, dz);
+            }
+            self.push_out(x + dx, y, z + dz, if hop { cost + 0.5 } else { cost }, if hop { META_PARKOUR } else { 0 });
         } else if (self.flags_at(x + dx, y - 2, z + dz) & PHYSICAL) != 0 || (f_d & LIQUID) != 0 {
             if !self.is_safe(f_d) {
                 return;
@@ -1399,6 +1715,7 @@ impl SolverState {
     /// Mirror of moveGen.ts momentumChains: re-jump edges through the
     /// parkour landings this expansion just produced (stepping stones only).
     fn momentum_chains(&mut self, x: i32, y: i32, z: i32) {
+        let tab = Rc::clone(&self.ext_entries);
         let n_out = self.out.count;
         for i in 0..n_out {
             if self.out.meta[i] != META_PARKOUR {
@@ -1453,7 +1770,7 @@ impl SolverState {
             for q in 0..4 {
                 let (sx, sz) = DIAGONAL[q];
                 for k in 0..self.ext_diag_n {
-                    let e = self.ext_entries[k];
+                    let e = &tab[k];
                     if !chain_aligned(abx, abz, ab2, e.tx * sx, e.tz * sz) {
                         continue;
                     }
@@ -1464,7 +1781,7 @@ impl SolverState {
                 let (dx, dz) = CARDINAL[d];
                 if dx != 0 {
                     for k in 0..self.ext_card_x_n {
-                        let e = self.ext_entries[self.ext_diag_n + k];
+                        let e = &tab[self.ext_diag_n + k];
                         if !chain_aligned(abx, abz, ab2, e.tx * dx, 0) {
                             continue;
                         }
@@ -1472,7 +1789,7 @@ impl SolverState {
                     }
                 } else {
                     for k in 0..self.ext_card_z_n {
-                        let e = self.ext_entries[self.ext_diag_n + self.ext_card_x_n + k];
+                        let e = &tab[self.ext_diag_n + self.ext_card_x_n + k];
                         if !chain_aligned(abx, abz, ab2, 0, e.tz * dz) {
                             continue;
                         }
@@ -1489,19 +1806,119 @@ impl SolverState {
     /// Improvement (allowParkourExtended), mirror of moveGen.ts
     /// parkourExtTarget — rules in docs/ExtendedParkour.md. `chain_via ≥ 0`
     /// is the momentum-chain re-jump variant (see momentum_chains).
-    fn parkour_ext_target(&mut self, x: i32, y: i32, z: i32, sx: i32, sz: i32, h_0: f64, low_takeoff: bool, e: ExtEntry, chain_via: i32, chain_base: f64) {
+    /// Thin footprint byte of a cell (0 = solid, or no thin grid).
+    fn thin_at(&mut self, cx: i32, ly: i32, cz: i32) -> u8 {
+        if self.thin.is_empty() {
+            return 0;
+        }
+        let idx = self.cell_index(cx, ly, cz);
+        if idx < 0 { 0 } else { self.thin[idx as usize] }
+    }
+
+    /// Floor that is no way through: a thin shape stands on it at body height
+    /// (mirror of moveGen.ts thinStands).
+    fn thin_stands(&mut self, cx: i32, y: i32, cz: i32) -> bool {
+        if self.thin_at(cx, y, cz) != 0 {
+            let f0 = self.flags_at(cx, y, cz);
+            if !self.is_safe(f0) {
+                return true;
+            }
+        }
+        if self.thin_at(cx, y + 1, cz) != 0 {
+            let f1 = self.flags_at(cx, y + 1, cz);
+            return !self.is_safe(f1);
+        }
+        false
+    }
+
+    /// A corridor cell that is not passable but holds only a thin shape the
+    /// path keeps the hitbox off (mirror of moveGen.ts thinClear).
+    fn thin_clear(&mut self, cx: i32, ly: i32, cz: i32, e: &ExtEntry, k: usize, sx: i32, sz: i32) -> bool {
+        let b = self.thin_at(cx, ly, cz);
+        if b == 0 {
+            return false;
+        }
+        let mut x0 = THIN_LO[(b & 15) as usize] / 16.0;
+        let mut x1 = THIN_HI[(b & 15) as usize] / 16.0;
+        let mut z0 = THIN_LO[(b >> 4) as usize] / 16.0;
+        let mut z1 = THIN_HI[(b >> 4) as usize] / 16.0;
+        if sx < 0 {
+            let lo = 1.0 - x1;
+            x1 = 1.0 - x0;
+            x0 = lo;
+        }
+        if sz < 0 {
+            let lo = 1.0 - z1;
+            z1 = 1.0 - z0;
+            z0 = lo;
+        }
+        let cbase = e.cells_off * 2;
+        let ax = self.ext_cells[cbase + k * 2] as f64;
+        let az = self.ext_cells[cbase + k * 2 + 1] as f64;
+        x0 += ax - THIN_BODY_HALF;
+        x1 += ax + THIN_BODY_HALF;
+        z0 += az - THIN_BODY_HALF;
+        z1 += az + THIN_BODY_HALF;
+        for i in 0..e.n_seg {
+            let p = &e.pts;
+            if seg_hits(p[i * 2], p[i * 2 + 1], p[i * 2 + 2] - p[i * 2], p[i * 2 + 3] - p[i * 2 + 1], x0, x1, z0, z1) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// The centred line of main entry `k`, then — only where a corridor pass
+    /// refused it — its shifted variants (mirror of moveGen.ts extTarget).
+    fn ext_target(&mut self, x: i32, y: i32, z: i32, sx: i32, sz: i32, h_0: f64, low_takeoff: bool, tab: &[ExtEntry], k: usize) {
+        self.ext_try_mask = 0;
+        self.parkour_ext_target(x, y, z, sx, sz, h_0, low_takeoff, &tab[k], -1, 0.0);
+        let mut mask = self.ext_try_mask;
+        if mask == 0 {
+            return;
+        }
+        // Off a narrow support only the centred-take-off lines are worth
+        // evaluating (mirror of moveGen.ts ext_target).
+        if self.catch_at(x, y - 1, z) != 0 || self.carry_at(x, y - 1, z) != 0 {
+            mask &= self.ext_p0_mask;
+            if mask == 0 {
+                return;
+            }
+        }
+        // A solid cell that refuses a variant refuses the siblings sweeping it (its avoid mask).
+        for j in 0..self.ext_var_per {
+            if mask == 0 {
+                break;
+            }
+            if (mask >> j) & 1 == 0 {
+                continue;
+            }
+            let v = &tab[self.ext_main_n + k * self.ext_var_per + j];
+            self.ext_try_mask = -1;
+            self.parkour_ext_target(x, y, z, sx, sz, h_0, low_takeoff, v, -1, 0.0);
+            mask &= self.ext_try_mask;
+        }
+    }
+
+    fn parkour_ext_target(&mut self, x: i32, y: i32, z: i32, sx: i32, sz: i32, h_0: f64, low_takeoff: bool, e: &ExtEntry, chain_via: i32, chain_base: f64) {
         self.begin_move();
         let cbase = e.cells_off * 2;
         // Flat-ground fast-out: walkable floor on the first flight-line cell.
         let flx = x + self.ext_cells[cbase] * sx;
         let flz = z + self.ext_cells[cbase + 1] * sz;
-        if (self.flags_at(flx, y - 1, flz) & PHYSICAL) != 0 && self.height_at(flx, y - 1, flz) >= h_0 {
+        if (self.flags_at(flx, y - 1, flz) & PHYSICAL) != 0 && self.height_at(flx, y - 1, flz) >= h_0
+            && !self.thin_stands(flx, y, flz)
+        {
+            // A walk for every aimed line over this floor too (ext_target).
+            if e.aim_index != 0 {
+                self.ext_try_mask &= self.ext_line_avoid[e.cells_off];
+            }
             return;
         }
 
         let tx = x + e.tx * sx;
         let tz = z + e.tz * sz;
-        let idx_t = self.cell_index(tx, y, tz);
+        let idx_t = if e.aim_index != 0 { -1 } else { self.cell_index(tx, y, tz) };
         let f_t = if idx_t < 0 { 0 } else { self.flags[idx_t as usize] };
 
         let mut node_y: i32;
@@ -1511,7 +1928,16 @@ impl SolverState {
         // Cell whose top the feet land on (support landings): the reach
         // bucket is the real rise to it. i32::MIN = a catch (node delta).
         let mut sup_y: i32 = i32::MIN;
-        if (f_t & CLIMBABLE) != 0 && self.is_safe(f_t) && self.climb_usable(tx, y, tz) {
+        if e.aim_index != 0 {
+            // An aimed line lands where the centre line that selected it lands
+            // (ext_target): a full top, classified once on the centre line.
+            node_y = self.ext_land_y;
+            sup_y = self.ext_land_sup_y;
+            land_catch = 0;
+            if node_y > y {
+                cost += (node_y - y) as f64;
+            }
+        } else if (f_t & CLIMBABLE) != 0 && self.is_safe(f_t) && self.climb_usable(tx, y, tz) {
             // Grab a ladder/vine at flight level — before PHYSICAL, because
             // ladders classify as physical too; the catch is the lowest
             // contiguous ladder cell up to two below (see the JS reference).
@@ -1601,6 +2027,10 @@ impl SolverState {
                 sup_y = node_y - 1;
             }
         }
+        if land_catch == 0 && e.aim_index == 0 {
+            self.ext_land_y = node_y;
+            self.ext_land_sup_y = sup_y;
+        }
 
         // Corridor pass 1 — body cells passable, line-cell walkable rule,
         // and any blocked head+1 (takeoff included) selects the head-hitter
@@ -1611,18 +2041,29 @@ impl SolverState {
             let c_az = self.ext_cells[cbase + k * 2 + 1];
             let cx = x + c_ax * sx;
             let cz = z + c_az * sz;
-            let c0 = self.flags_at(cx, y, cz);
-            let c1 = self.flags_at(cx, y + 1, cz);
-            if !self.is_safe(c0) || !self.is_safe(c1) {
+            for ly in y..=y + 1 {
+                let c = self.flags_at(cx, ly, cz);
+                if self.is_safe(c) || self.thin_clear(cx, ly, cz, e, k, sx, sz) {
+                    continue;
+                }
+                // A blocked corner cell, or a thin shape anywhere, is what an
+                // aimed line can clear; on a variant the mask is its siblings'
+                // (mirror of moveGen.ts).
+                if land_catch == 0 {
+                    self.ext_try_mask = if self.thin_at(cx, ly, cz) != 0 { -1 } else { self.ext_avoid[e.cells_off + k] };
+                }
                 return;
             }
             let c2 = self.flags_at(cx, y + 2, cz);
-            if !self.is_safe(c2) {
+            if !self.is_safe(c2) && !self.thin_clear(cx, y + 2, cz, e, k, sx, sz) {
                 low = true;
             }
             if k < e.n_line {
                 let fd = self.flags_at(cx, y - 1, cz);
-                if (fd & PHYSICAL) != 0 && self.height_at(cx, y - 1, cz) >= h_0 {
+                if (fd & PHYSICAL) != 0 && self.height_at(cx, y - 1, cz) >= h_0 && !self.thin_stands(cx, y, cz) {
+                    if e.aim_index != 0 {
+                        self.ext_try_mask &= self.ext_line_avoid[e.cells_off + k];
+                    }
                     return; // walkable — not a gap
                 }
             }
@@ -1669,13 +2110,55 @@ impl SolverState {
         }
         let l_cred = if land_catch < 0 { LAND_HALF } else { LAND_NARROW_MARGIN + CATCH_HALF[land_catch as usize] };
         let half = CATCH_HALF[takeoff_catch];
-        let front = (TAKEOFF_NARROW_MARGIN + half).min(TAKEOFF_STAND);
-        let mut run = front + half + TAKEOFF_NARROW_MARGIN;
+        // Direction-dependent carry on narrow supports (mirror of moveGen.ts).
+        let maj_f = if e.tx > e.tz { e.tx as f64 } else { e.tz as f64 };
+        let maj_x = e.tx > e.tz;
+        let t_carry = self.carry_at(x, y - 1, z);
+        // An aimed line: full-block ends only (mirror of moveGen.ts).
+        // An end an aimed line moves needs a full top under it; per end, so a
+        // line that only moves the take-off may land on a post and back
+        // (mirror of moveGen.ts).
+        if e.p_off != 0.0 && (takeoff_catch != 0 || t_carry != 0) {
+            return;
+        }
+        if e.q_off != 0.0 && land_catch != 0 {
+            return;
+        }
+        let fwd_x = if maj_x { sx } else { 0 };
+        let fwd_z = if maj_x { 0 } else { sz };
+        let c_front = carry_side(t_carry, fwd_x, fwd_z);
+        let c_back = carry_side(t_carry, -fwd_x, -fwd_z);
+        // A diagonal off an edge panel's empty side: a jump from the spot
+        // (mirror of moveGen.ts offPanel).
+        // Mirror of moveGen.ts offPanel (see the note there: narrowing this to
+        // pure diagonals was measured and rejected).
+        let off_panel = t_carry != 0 && e.tx != 0 && e.tz != 0
+            && (carry_side(t_carry, if maj_x { 0 } else { sx }, if maj_x { sz } else { 0 }) == 1
+                || (e.tx == e.tz && c_front == 1));
+        let front = if off_panel || c_front == 1 { 0.0 } else if c_front == 2 { TAKEOFF_STAND } else { (TAKEOFF_NARROW_MARGIN + half).min(TAKEOFF_STAND) };
+        let back = if off_panel || c_back == 1 { 0.0 } else if c_back == 2 { 0.5 + TAKEOFF_NARROW_MARGIN } else { half + TAKEOFF_NARROW_MARGIN };
+        let lip_half = if off_panel || c_front == 1 { -LAND_NARROW_MARGIN } else if c_front == 2 { 0.5 } else { half };
+        let mut run = front + back;
+        let mut l_cred_x = l_cred;
+        let mut l_cred_z = l_cred;
+        if land_catch > 0 && sup_y != i32::MIN {
+            let l_carry = self.carry_at(tx, sup_y, tz);
+            if l_carry != 0 {
+                if e.tx != 0 {
+                    let c = carry_side(l_carry, -sx, 0);
+                    l_cred_x = if c == 2 { LAND_HALF } else if c == 1 { 0.0 } else { l_cred };
+                }
+                if e.tz != 0 {
+                    let c = carry_side(l_carry, 0, -sz);
+                    l_cred_z = if c == 2 { LAND_HALF } else if c == 1 { 0.0 } else { l_cred };
+                }
+            }
+        }
         let rx = x + e.run_x * sx;
         let rz = z + e.run_z * sz;
         let r0 = self.flags_at(rx, y, rz);
         let r1 = self.flags_at(rx, y + 1, rz);
-        if self.is_safe(r0) && self.is_safe(r1) {
+        if !off_panel && self.is_safe(r0) && self.is_safe(r1) {
             let f_r = self.flags_at(rx, y - 1, rz);
             if (f_r & PHYSICAL) != 0 && self.catch_at(rx, y - 1, rz) == 0 {
                 let h_r = self.height_at(rx, y - 1, rz);
@@ -1698,16 +2181,17 @@ impl SolverState {
         if frac > 0.0 {
             usable = usable + (self.ext_reach[base + bucket - 1] - usable) * frac;
         }
-        usable += self.cfg.margin_credit;
-        let fn_needed = if takeoff_catch == 0 && land_catch <= 0 {
+        let mut fn_needed = if takeoff_catch == 0 && land_catch <= 0 {
             e.fn_stand
         } else {
             let a = e.tx as f64;
             let b = e.tz as f64;
-            flight_from(a, b, e.dist, front * e.dist / (if a > b { a } else { b }), l_cred)
+            flight_from2(a, b, e.dist, front * e.dist / maj_f, l_cred_x, l_cred_z)
         };
-        let mut feasible = fn_needed <= usable;
-        let mut needs_running = row >= 1;
+        if off_panel {
+            fn_needed += OFF_PANEL_MARGIN; // mirror of moveGen.ts
+        }
+        fn_needed += e.extra; // an aimed line is that much longer (mirror of moveGen.ts)
         // Would the standing row fly it? META_RUN for the executor only
         // (mirror of moveGen.ts runNeeded).
         let stand_base = if low { 70 } else { 0 };
@@ -1715,55 +2199,84 @@ impl SolverState {
         if frac > 0.0 {
             usable_stand = usable_stand + (self.ext_reach[stand_base + bucket - 1] - usable_stand) * frac;
         }
-        let run_needed = fn_needed > usable_stand + self.cfg.margin_credit;
-        let mut chained = false;
-        let mut lip_jump = false;
-        if chain_via < 0 {
-            if !feasible && self.momentum {
-                // Lip take-off (mirror of moveGen.ts): half + 0.3 past centre,
-                // tried only where the creep credit falls short.
-                let a = e.tx as f64;
-                let b = e.tz as f64;
-                let s_lip = (half + LAND_NARROW_MARGIN + LIP_PHASE) * e.dist / (if a > b { a } else { b });
-                if flight_from(a, b, e.dist, s_lip, l_cred) <= usable {
-                    feasible = true;
-                    lip_jump = true;
+        // Comfortable pass, then the TIGHT pass that gives the safety margin
+        // back at TIGHT_COST (mirror of moveGen.ts).
+        let mut mc = self.cfg.margin_credit;
+        let mut tight = false;
+        let mut feasible;
+        let mut needs_running;
+        let mut run_needed;
+        let mut chained;
+        let mut lip_jump;
+        loop {
+            let usable_m = usable + mc;
+            let mut ok = true;
+            feasible = fn_needed <= usable_m;
+            needs_running = row >= 1;
+            run_needed = fn_needed > usable_stand + mc;
+            chained = false;
+            lip_jump = false;
+            if chain_via < 0 {
+                if !feasible && self.momentum && !off_panel {
+                    // Lip take-off (mirror of moveGen.ts): half + 0.3 past centre,
+                    // tried only where the creep credit falls short.
+                    let a = e.tx as f64;
+                    let b = e.tz as f64;
+                    let s_lip = (lip_half + LAND_NARROW_MARGIN + LIP_PHASE) * e.dist / maj_f;
+                    if flight_from2(a, b, e.dist, s_lip, l_cred_x, l_cred_z) <= usable_m {
+                        feasible = true;
+                        lip_jump = true;
+                    }
                 }
-            }
-            if !feasible {
-                // Momentum chain from the landing's own state (mirror of
-                // moveGen.ts): continue the incoming flight within the cone,
-                // chain row from the far-side landing point less the turn
-                // loss, never under a lid.
-                if self.mom_in == MOM_NONE || low
-                    || !chain_aligned(self.mom_dx, self.mom_dz, self.mom_d2, e.tx * sx, e.tz * sz)
-                {
+                if !feasible {
+                    // Momentum chain from the landing's own state (mirror of
+                    // moveGen.ts): continue the incoming flight within the cone,
+                    // chain row from the far-side landing point less the turn
+                    // loss, never under a lid.
+                    if self.mom_in == MOM_NONE || low || e.aim_index != 0 || off_panel
+                        || !chain_aligned(self.mom_dx, self.mom_dz, self.mom_d2, e.tx * sx, e.tz * sz)
+                    {
+                        ok = false;
+                    } else {
+                        let a = e.tx as f64;
+                        let b = e.tz as f64;
+                        let s_chain = front * CHAIN_TAKEOFF_FRACTION * e.dist / maj_f;
+                        let cos_turn = (self.mom_dx * (e.tx * sx) + self.mom_dz * (e.tz * sz)) as f64
+                            / ((self.mom_d2 * (e.tx * e.tx + e.tz * e.tz)) as f64).sqrt();
+                        if flight_from2(a, b, e.dist, s_chain, l_cred_x, l_cred_z) > self.ext_reach[CHAIN_ROW + bucket] - CHAIN_TURN_LOSS * (1.0 - cos_turn) + mc {
+                            ok = false;
+                        } else {
+                            needs_running = true;
+                            chained = true;
+                        }
+                    }
+                }
+            } else {
+                // Chain variant (mirror of moveGen.ts): only where the stone's
+                // own jump falls short, from the landing point, never under a lid.
+                if feasible || low {
                     return;
                 }
                 let a = e.tx as f64;
                 let b = e.tz as f64;
-                let s_chain = (TAKEOFF_NARROW_MARGIN + CATCH_HALF[takeoff_catch]).min(TAKEOFF_STAND) * CHAIN_TAKEOFF_FRACTION * e.dist / (if a > b { a } else { b });
-                let cos_turn = (self.mom_dx * (e.tx * sx) + self.mom_dz * (e.tz * sz)) as f64
-                    / ((self.mom_d2 * (e.tx * e.tx + e.tz * e.tz)) as f64).sqrt();
-                if flight_from(a, b, e.dist, s_chain, l_cred) > self.ext_reach[CHAIN_ROW + bucket] - CHAIN_TURN_LOSS * (1.0 - cos_turn) + self.cfg.margin_credit {
-                    return;
+                let s_chain = front * CHAIN_TAKEOFF_FRACTION * e.dist / maj_f;
+                if flight_from2(a, b, e.dist, s_chain, l_cred_x, l_cred_z) > self.ext_reach[CHAIN_ROW + bucket] + mc {
+                    ok = false;
+                } else {
+                    needs_running = true;
                 }
-                needs_running = true;
-                chained = true;
             }
-        } else {
-            // Chain variant (mirror of moveGen.ts): only where the stone's
-            // own jump falls short, from the landing point, never under a lid.
-            if feasible || low {
+            if ok {
+                break;
+            }
+            if tight || mc >= self.cfg.tight_credit {
                 return;
             }
-            let a = e.tx as f64;
-            let b = e.tz as f64;
-            let s_chain = (TAKEOFF_NARROW_MARGIN + CATCH_HALF[takeoff_catch]).min(TAKEOFF_STAND) * CHAIN_TAKEOFF_FRACTION * e.dist / (if a > b { a } else { b });
-            if flight_from(a, b, e.dist, s_chain, l_cred) > self.ext_reach[CHAIN_ROW + bucket] + self.cfg.margin_credit {
-                return;
-            }
-            needs_running = true;
+            tight = true;
+            mc = self.cfg.tight_credit;
+        }
+        if tight {
+            cost += TIGHT_COST;
         }
 
         // Corridor pass 2: per-cell flight-curve bound mf = the lowest the
@@ -1785,10 +2298,16 @@ impl SolverState {
             while ly >= lo_ly {
                 if (ly + 1) as f64 > lim {
                     let fd = self.flags_at(cx, ly, cz);
-                    if !self.is_safe(fd) {
+                    if !self.is_safe(fd) && !self.thin_clear(cx, ly, cz, e, k, sx, sz) {
+                        if land_catch == 0 && e.aim_index == 0 {
+                            self.ext_try_mask = if self.thin_at(cx, ly, cz) != 0 { -1 } else { self.ext_avoid[e.cells_off + k] };
+                        }
                         return; // body cell
                     }
-                } else if self.height_at(cx, ly, cz) > lim {
+                } else if self.height_at(cx, ly, cz) > lim && !self.thin_clear(cx, ly, cz, e, k, sx, sz) {
+                    if land_catch == 0 && e.aim_index == 0 {
+                        self.ext_try_mask = if self.thin_at(cx, ly, cz) != 0 { -1 } else { self.ext_avoid[e.cells_off + k] };
+                    }
                     return; // pokes up into the flight path
                 }
                 ly -= 1;
@@ -1811,7 +2330,7 @@ impl SolverState {
         if self.momentum && land_catch >= 1 && rise >= -MOMENTUM_MAX_DROP {
             self.pending_mom = momentum_of(e.tx * sx, e.tz * sz);
         }
-        let run_bit = if run_needed || lip_jump { META_RUN } else { 0 };
+        let run_bit = if run_needed || lip_jump || tight { META_RUN } else { 0 };
         if chain_via >= 0 {
             self.pending_via = chain_via;
             self.push_out(tx, node_y, tz, chain_base + cost, META_PARKOUR | META_CHAIN | META_RUN);
@@ -1819,7 +2338,12 @@ impl SolverState {
             self.pending_via = self.cell_index(x, y, z);
             self.push_out(tx, node_y, tz, cost, META_PARKOUR | META_CHAIN | META_RUN);
         } else {
-            self.push_out(tx, node_y, tz, cost, META_PARKOUR | run_bit);
+            // Aimed line: the variant and its world-space mirror flag (mirror of moveGen.ts).
+            if e.aim_index != 0 {
+                self.pending_aim = e.aim_index | if sx * sz < 0 { 0x80 } else { 0 };
+            }
+            let shift_bit = if e.aim_index != 0 { META_AIM } else { 0 };
+            self.push_out(tx, node_y, tz, cost, META_PARKOUR | run_bit | shift_bit);
         }
     }
 
@@ -2087,6 +2611,7 @@ impl SolverState {
         let mut jumps = false;
         let mut h_0 = 0.0;
         let mut low_takeoff = false;
+        let tab = Rc::clone(&self.ext_entries);
         if self.ext_on() {
             // No y+2 requirement: a blocked head+1 at the takeoff selects the
             // head-hitter class instead. `ext` supersedes upstream's cardinal
@@ -2115,13 +2640,11 @@ impl SolverState {
             if jumps {
                 if dx != 0 {
                     for k in 0..self.ext_card_x_n {
-                        let e = self.ext_entries[self.ext_diag_n + k];
-                        self.parkour_ext_target(x, y, z, dx, 1, h_0, low_takeoff, e, -1, 0.0);
+                        self.ext_target(x, y, z, dx, 1, h_0, low_takeoff, &tab, self.ext_diag_n + k);
                     }
                 } else {
                     for k in 0..self.ext_card_z_n {
-                        let e = self.ext_entries[self.ext_diag_n + self.ext_card_x_n + k];
-                        self.parkour_ext_target(x, y, z, 1, dz, h_0, low_takeoff, e, -1, 0.0);
+                        self.ext_target(x, y, z, 1, dz, h_0, low_takeoff, &tab, self.ext_diag_n + self.ext_card_x_n + k);
                     }
                 }
             }
@@ -2131,8 +2654,7 @@ impl SolverState {
             self.move_diagonal(x, y, z, dx, dz);
             if jumps {
                 for k in 0..self.ext_diag_n {
-                    let e = self.ext_entries[k];
-                    self.parkour_ext_target(x, y, z, dx, dz, h_0, low_takeoff, e, -1, 0.0);
+                    self.ext_target(x, y, z, dx, dz, h_0, low_takeoff, &tab, k);
                 }
             }
         }
@@ -2269,6 +2791,7 @@ impl SolverState {
                 self.parent[ni] = idx;
                 self.meta[ni] = self.out.meta[i];
                 self.vias[ni] = self.out.via[i];
+                self.aims[ni] = self.out.aim[i];
                 match self.out.breaks[i].take() {
                     Some(b) => {
                         self.breaks.insert(n_idx, b);
@@ -2334,6 +2857,9 @@ impl SolverState {
             let edge = self.g[ni] - if parent >= 0 { self.g[parent as usize] } else { 0.0 };
             out.extend_from_slice(&edge.to_le_bytes());
             out.push(self.meta[ni]);
+            if (self.meta[ni] & META_AIM) != 0 {
+                out.push(self.aims[ni]); // wasmSolver.ts readResult
+            }
             if (self.meta[ni] & (META_BOUNCE | META_CHAIN)) != 0 {
                 // The via cell follows the meta byte (wasmSolver.ts readResult).
                 let via = self.vias[ni];
@@ -2408,6 +2934,7 @@ pub unsafe extern "C" fn solve_init(params: *const u8) -> i32 {
     let dig_cost = read_f64(params, &mut off);
     let bubble_cost = read_f64(params, &mut off);
     let margin_credit = read_f64(params, &mut off);
+    let tight_credit = read_f64(params, &mut off);
     let search_radius = read_f64(params, &mut off);
 
     let entity_ptr = read_u32(params, &mut off) as *const u8;
@@ -2433,6 +2960,7 @@ pub unsafe extern "C" fn solve_init(params: *const u8) -> i32 {
         dig_cost,
         bubble_cost,
         margin_credit,
+        tight_credit,
     };
 
     let n = (st.w * st.h * st.l) as usize;
@@ -2460,61 +2988,17 @@ pub unsafe extern "C" fn solve_init(params: *const u8) -> i32 {
     }
 
     // Extended-parkour table (layout: serializeParkourTable in parkourTable.ts).
-    st.ext_entries.clear();
-    st.ext_cells.clear();
-    st.ext_mf.clear();
-    st.ext_mf_block = 0;
-    st.ext_diag_n = 0;
-    st.ext_card_x_n = 0;
-    st.ext_card_z_n = 0;
+    // Resident once uploaded through ext_begin / ext_commit; a table passed
+    // with the parameters (older hosts) is parsed for this solve.
     let ext_on = st.cfg.allow_parkour && st.cfg.allow_sprinting && st.cfg.allow_parkour_extended;
     if ext_on {
-        if ext_len == 0 {
+        if ext_len > 0 {
+            let rc = parse_ext(st, ext_ptr, ext_len);
+            if rc != 0 {
+                return rc;
+            }
+        } else if st.ext_main_n == 0 {
             return 5; // flag set but no table — would silently diverge from JS
-        }
-        let mut eo = 0usize;
-        st.ext_diag_n = read_i32(ext_ptr, &mut eo) as usize;
-        st.ext_card_x_n = read_i32(ext_ptr, &mut eo) as usize;
-        st.ext_card_z_n = read_i32(ext_ptr, &mut eo) as usize;
-        let cells_len = read_i32(ext_ptr, &mut eo) as usize;
-        let n_total = st.ext_diag_n + st.ext_card_x_n + st.ext_card_z_n;
-        if n_total == 0 || n_total > 256 || cells_len > 8192 {
-            return 5;
-        }
-        for _ in 0..n_total {
-            let tx = read_i32(ext_ptr, &mut eo);
-            let tz = read_i32(ext_ptr, &mut eo);
-            let n_line = read_i32(ext_ptr, &mut eo) as usize;
-            let n_cells = read_i32(ext_ptr, &mut eo) as usize;
-            let cells_off = read_i32(ext_ptr, &mut eo) as usize;
-            let run_x = read_i32(ext_ptr, &mut eo);
-            let run_z = read_i32(ext_ptr, &mut eo);
-            st.ext_entries.push(ExtEntry {
-                tx, tz, n_line, n_cells, cells_off, run_x, run_z,
-                dist: 0.0, cost: 0.0, fn_stand: 0.0, fn_run: 0.0,
-            });
-        }
-        for _ in 0..cells_len {
-            st.ext_cells.push(read_i32(ext_ptr, &mut eo));
-        }
-        eo = (eo + 7) & !7; // f64 section is 8-aligned in the blob
-        for i in 0..150 {
-            st.ext_reach[i] = read_f64(ext_ptr, &mut eo);
-        }
-        for i in 0..n_total {
-            st.ext_entries[i].dist = read_f64(ext_ptr, &mut eo);
-            st.ext_entries[i].cost = read_f64(ext_ptr, &mut eo);
-            st.ext_entries[i].fn_stand = read_f64(ext_ptr, &mut eo);
-            st.ext_entries[i].fn_run = read_f64(ext_ptr, &mut eo);
-        }
-        // Per-cell min-feet arrays: standing, running, low-standing,
-        // low-running, lip, low-lip blocks.
-        st.ext_mf_block = cells_len / 2;
-        for _ in 0..cells_len * 3 {
-            st.ext_mf.push(read_f64(ext_ptr, &mut eo));
-        }
-        if eo != ext_len {
-            return 5; // layout mismatch between serializer and parser
         }
     }
 
@@ -2546,6 +3030,7 @@ pub unsafe extern "C" fn solve_init(params: *const u8) -> i32 {
         st.parent[ui] = -1;
         st.meta[ui] = 0;
         st.vias[ui] = -1;
+        st.aims[ui] = 0;
         st.heap.push(s_idx, h0);
         st.open_count = 1;
     } else {
@@ -2577,4 +3062,39 @@ pub unsafe extern "C" fn finalize(status: u8) -> u32 {
 #[no_mangle]
 pub unsafe extern "C" fn result_ptr() -> *const u8 {
     state().result.as_ptr()
+}
+
+/// Was cell (x, y, z) reached (opened) by the last solve, at any momentum?
+/// 1 / 0. Read-only: the mirror of solver.ts `reached`, for the physics-hop
+/// pipeline (hopOracle.ts), which looks for hops out of a FAILED search's
+/// reach and so must know what that search reached.
+#[no_mangle]
+pub unsafe extern "C" fn node_reached(x: i32, y: i32, z: i32) -> i32 {
+    let st = state();
+    let (lx, ly, lz) = (x - st.x0, y - st.y0, z - st.z0);
+    if lx < 0 || lx >= st.w || ly < 0 || ly >= st.h || lz < 0 || lz >= st.l {
+        return 0;
+    }
+    let cell = ((ly * st.l + lz) * st.w + lx) as usize;
+    if cell < st.stamp.len() && st.stamp[cell] == st.epoch {
+        return 1;
+    }
+    if !st.momentum || cell >= st.mom_head.len() {
+        return 0;
+    }
+    let mut k = st.mom_head[cell];
+    if k < 0 || (k as usize) >= st.sec_count || st.sec_cell[k as usize] != cell as i32 {
+        return 0;
+    }
+    loop {
+        let slot = st.n_cells + k as usize;
+        if slot < st.stamp.len() && st.stamp[slot] == st.epoch {
+            return 1;
+        }
+        let nx = st.sec_next[k as usize];
+        if nx < 0 {
+            return 0;
+        }
+        k = nx;
+    }
 }

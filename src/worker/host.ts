@@ -27,6 +27,10 @@ export interface WorkerSolveRequest {
   sliceMs: number
   /** Per-state dig tables (required when cfg.canDig). */
   dig?: DigData | null
+  /** The bot's body for the physics kernel (cfg.allowParkourPhysics): hitbox and walking speed. */
+  body?: { halfWidth: number, height: number, speed: number }
+  /** Run the hop pipeline on a boundary-limited failure too (the first box of a solve: small enough to search in). */
+  hopsOnBoundary?: boolean
   onPartial: (result: RawSolveResult) => void
 }
 
@@ -197,7 +201,9 @@ export class SolverWorkerHost {
         maxStateId: req.lut.maxStateId,
         shapeStarts: req.lut.shapeStarts,
         shapeCounts: req.lut.shapeCounts,
-        shapeData: req.lut.shapeData
+        shapeData: req.lut.shapeData,
+        simSlip: req.lut.simSlip,
+        simKind: req.lut.simKind
       })
       aw.sentLutFingerprint = req.lut.fingerprint
     }
@@ -239,6 +245,7 @@ export class SolverWorkerHost {
       heightsBuf: snap.heights.buffer,
       statesBuf: snap.states ? snap.states.buffer : null,
       specialBuf: snap.special ? snap.special.buffer : null,
+      thinBuf: snap.thin ? snap.thin.buffer : null,
       entityIdx: snap.entityIdx,
       entityWeight: snap.entityWeight,
       cfg: req.cfg,
@@ -248,7 +255,9 @@ export class SolverWorkerHost {
       searchRadius: req.searchRadius,
       sliceMs: req.sliceMs,
       cancelBuf,
-      digFingerprint: req.dig ? req.dig.fingerprint : null
+      digFingerprint: req.dig ? req.dig.fingerprint : null,
+      body: req.body,
+      hopsOnBoundary: req.hopsOnBoundary
     })
 
     return {

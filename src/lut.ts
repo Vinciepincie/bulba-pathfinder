@@ -9,7 +9,8 @@
 import type { Bot } from 'mineflayer'
 import prismarineBlockLoader from 'prismarine-block'
 import { LutFlags, LutSpecial } from './types.js'
-import { topCatchClass } from './shapes.js'
+import { topCatchClass, carryCode, thinFootprint, CARRY_SHIFT } from './shapes.js'
+import { simSlipOf, simKindOf } from './playerSim.js'
 import type { Movements } from './movements.js'
 
 export interface BlockLut {
@@ -23,11 +24,19 @@ export interface BlockLut {
   /** special[stateId] — LutSpecial byte (bubble columns). Null unless the
    * profile opts into a feature that needs it (useBubbleColumns). */
   special: Uint8Array | null
+  /** thin[stateId] — thin footprint byte (shapes.ts thinFootprint). Null unless
+   * the profile has the extended parkour repertoire. */
+  thin: Uint8Array | null
   /** shapeStarts[stateId] — box offset into shapeData (in boxes, ×6 floats); shapeCounts boxes. */
   shapeStarts: Int32Array
   shapeCounts: Uint8Array
   /** Flattened AABBs: [x0,y0,z0,x1,y1,z1] per box. Deduplicated across states. */
   shapeData: Float32Array
+  /** waterlogged[stateId] — 1 for a waterlogged state (prismarine-physics counts it as water). */
+  waterlogged: Uint8Array
+  /** The exact-physics kernel's per-state tables (playerSim.ts simTablesFromLut): slipperiness (0 = default) and SIM_* kind bits. */
+  simSlip: Float64Array
+  simKind: Uint8Array
 }
 
 interface LutCacheEntry {
@@ -87,8 +96,12 @@ export function buildLut (bot: Bot, movements: Movements): BlockLut {
   const vineClimb = vineBlock !== undefined && movements.climbables.has(vineBlock.id)
   const slimeMark = movements.allowParkourExtended
   const special = movements.useBubbleColumns || vineClimb || slimeMark ? new Uint8Array(maxStateId + 1) : null
+  const thin = slimeMark ? new Uint8Array(maxStateId + 1) : null
   const shapeStarts = new Int32Array(maxStateId + 1).fill(-1)
   const shapeCounts = new Uint8Array(maxStateId + 1)
+  const waterlogged = new Uint8Array(maxStateId + 1)
+  const simSlip = new Float64Array(maxStateId + 1)
+  const simKind = new Uint8Array(maxStateId + 1)
   const shapeChunks: number[] = []
   const shapeDedup = new Map<string, { start: number, count: number }>()
 
@@ -134,6 +147,10 @@ export function buildLut (bot: Bot, movements: Movements): BlockLut {
         stateFlags |= open ? LutFlags.DOOR_OPEN : LutFlags.DOOR_CLOSED
       }
       flags[stateId] = stateFlags
+      const wl = (block as { isWaterlogged?: unknown }).isWaterlogged
+      if (wl === true || wl === 'true') waterlogged[stateId] = 1
+      simSlip[stateId] = simSlipOf(blockType.name)
+      simKind[stateId] = simKindOf(blockType.name, waterlogged[stateId] === 1)
 
       if (special) {
         if (movements.useBubbleColumns && blockType.name === 'bubble_column') {
@@ -157,6 +174,10 @@ export function buildLut (bot: Bot, movements: Movements): BlockLut {
           const hasUpperStep = shapes.some(s => s[4] > 0.5)
           if (lowSlab && hasUpperStep) special[stateId] = LutSpecial.STAIR
         }
+        // Where a narrow support carries the body (shapes.ts carryCode):
+        // bits 5-7, beside whatever the block is. Only class > 0 supports
+        // get one, and those are never bubble columns, vines or slime.
+        if (slimeMark) special[stateId] |= carryCode(shapes) << CARRY_SHIFT
       }
 
       // Collision-top height, quantized to 1/32 blocks (vanilla shape tops
@@ -167,6 +188,7 @@ export function buildLut (bot: Bot, movements: Movements): BlockLut {
         if (s[4] > top) top = s[4]
       }
       heights[stateId] = Math.min(63, Math.round(top * 32)) | (topCatchClass(shapes) << 6)
+      if (thin !== null) thin[stateId] = thinFootprint(shapes)
 
       if (shapes.length > 0) {
         const key = JSON.stringify(shapes)
@@ -188,8 +210,12 @@ export function buildLut (bot: Bot, movements: Movements): BlockLut {
     flags,
     heights,
     special,
+    thin,
     shapeStarts,
     shapeCounts,
-    shapeData: Float32Array.from(shapeChunks)
+    shapeData: Float32Array.from(shapeChunks),
+    waterlogged,
+    simSlip,
+    simKind
   }
 }

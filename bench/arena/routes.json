@@ -569,6 +569,22 @@
       "notes": "defined by in-world !PF signs"
     },
     {
+      "id": "mcc-6-2a",
+      "name": "mcc-6-2a",
+      "scenario": "parkour-advanced",
+      "start": [
+        158,
+        283,
+        -347
+      ],
+      "end": [
+        155,
+        283,
+        -358
+      ],
+      "notes": "first three Lateral Leaps: jumps past a wall corner on a shifted flight line (the rest of the stage needs mid-air turns)"
+    },
+    {
       "id": "mcc-6-3",
       "name": "mcc-6-3",
       "scenario": "parkour-advanced",
@@ -729,52 +745,36 @@
       "notes": "defined by in-world !PF signs"
     },
     {
-      "id": "whpm-1",
-      "name": "whpm-1",
+      "id": "tenways-slime-first",
+      "name": "tenways-slime-first",
       "scenario": "parkour-advanced",
       "start": [
-        475,
-        270,
-        -592
+        579,
+        267,
+        -597
       ],
       "end": [
-        470,
-        282,
-        -553
+        575,
+        272,
+        -587
       ],
-      "notes": "defined by in-world !PF signs"
+      "notes": "Ten Ways slime room, first bounce: west ladder to the platform at y 277, drop onto the slime at 575,270,-592, rebound onto the slime top at 575,271,-587 (5 above the floor: no walking route)"
     },
     {
-      "id": "whpm-2",
-      "name": "whpm-2",
+      "id": "tenways-slime-way",
+      "name": "tenways-slime-way",
       "scenario": "parkour-advanced",
       "start": [
-        470,
-        283,
-        -553
+        579,
+        267,
+        -597
       ],
       "end": [
-        481,
-        298,
-        -583
+        575,
+        280,
+        -581
       ],
-      "notes": "defined by in-world !PF signs"
-    },
-    {
-      "id": "whpm-3",
-      "name": "whpm-3",
-      "scenario": "parkour-advanced",
-      "start": [
-        481,
-        299,
-        -583
-      ],
-      "end": [
-        424,
-        303,
-        -523
-      ],
-      "notes": "defined by in-world !PF signs"
+      "notes": "Ten Ways slime room, along the west wall: up the west ladder, off its top onto the slime at 575,270,-592, rebound onto 575,271,-587, across to 575,271,-584, into the south-west ladder (bottom rung 5 above the floor) and up to its top"
     }
   ]
 }

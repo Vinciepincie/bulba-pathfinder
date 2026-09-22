@@ -22,6 +22,11 @@ interface WasmExports {
   snap_heights_ptr (): number
   snap_states_ptr (): number
   snap_special_ptr (): number
+  snap_thin_begin (len: number): void
+  snap_thin_ptr (): number
+  ext_begin? (len: number): void
+  ext_ptr? (): number
+  ext_commit? (): number
   snap_set_meta (x0: number, y0: number, z0: number, w: number, h: number, l: number, worldMinY: number): void
   dig_begin (len: number): void
   dig_labor_ptr (): number
@@ -31,6 +36,7 @@ interface WasmExports {
   finalize (status: number): number
   result_ptr (): number
   arena_reserve (n: number, momentum: number): void
+  node_reached? (x: number, y: number, z: number): number
 }
 
 const GOAL_KINDS: Record<string, number> = {
@@ -98,6 +104,7 @@ export interface WasmSnapshotInput {
   heights: Uint8Array
   states: Uint16Array | null
   special?: Uint8Array | null
+  thin?: Uint8Array | null
   entityIdx: Int32Array
   entityWeight: Int32Array
 }
@@ -116,6 +123,8 @@ export class WasmSolver {
   private lastSnapKey: string | null = null
   /** Fingerprint of the dig tables currently resident in wasm memory. */
   private lastDigKey: string | null = null
+  /** Whether the extended-parkour table is resident in the core (ext_begin / ext_commit). */
+  private extResident = false
 
   private constructor (exports: WasmExports) {
     this.exports = exports
@@ -146,6 +155,15 @@ export class WasmSolver {
   }
 
   /**
+   * Did the last solve reach cell (x, y, z)? (lib.rs node_reached; false on a
+   * core built without it.) The physics-hop pipeline (hopPipeline.ts) looks
+   * for hops out of a failed search's reach.
+   */
+  reached (x: number, y: number, z: number): boolean {
+    return this.exports.node_reached !== undefined && this.exports.node_reached(x, y, z) === 1
+  }
+
+  /**
    * Full solve loop with host-side slicing: between expansion batches the
    * host checks its cancel flag + think budget and emits interim partials
    * (same cadence contract as the JS solver path).
@@ -165,6 +183,7 @@ export class WasmSolver {
       // — force full re-upload on the next attempt.
       this.lastSnapKey = null
       this.lastDigKey = null
+      this.extResident = false
       throw error
     }
   }
@@ -192,14 +211,17 @@ export class WasmSolver {
     const statesLen = cfg.canDig && snap.states ? snap.states.length : 0
     // Uploaded whenever present (bubble columns and/or climbable vines mark it).
     const specialLen = snap.special ? snap.special.length : 0
-    const snapKey = `${m.generation}:${m.patchCount}:${m.x0},${m.y0},${m.z0}:${m.w}x${m.h}x${m.l}:${statesLen}:${specialLen}`
+    const thinLen = snap.thin ? snap.thin.length : 0
+    const snapKey = `${m.generation}:${m.patchCount}:${m.x0},${m.y0},${m.z0}:${m.w}x${m.h}x${m.l}:${statesLen}:${specialLen}:${thinLen}`
     if (this.lastSnapKey !== snapKey) {
       this.lastSnapKey = null // a failure below must not leave a stale claim
       ex.snap_begin(n, statesLen, specialLen)
+      ex.snap_thin_begin(thinLen)
       const flagsPtr = ex.snap_flags_ptr()
       const heightsPtr = ex.snap_heights_ptr()
       const statesPtr = statesLen > 0 ? ex.snap_states_ptr() : 0
       const specialPtr = specialLen > 0 ? ex.snap_special_ptr() : 0
+      const thinPtr = thinLen > 0 ? ex.snap_thin_ptr() : 0
       // snap_begin may have grown wasm memory — build the view after it.
       const mem = new Uint8Array(ex.memory.buffer)
       mem.set(snap.flags, flagsPtr)
@@ -207,6 +229,7 @@ export class WasmSolver {
       if (statesLen > 0) {
         mem.set(new Uint8Array(snap.states!.buffer, snap.states!.byteOffset, statesLen * 2), statesPtr)
       }
+      if (thinLen > 0) mem.set(snap.thin!, thinPtr)
       if (specialLen > 0) {
         mem.set(snap.special!, specialPtr)
       }
@@ -233,13 +256,27 @@ export class WasmSolver {
     // ── per-solve blobs: params + entity weights + parkour table ─────────
     const entityCount = snap.entityIdx.length
     const entitySize = entityCount * 8
-    const paramsSize = 4 * 4 + specs.length * 36 + 4 * 2 + 8 * 6 + 4 * 2 + 4 * 2
-    // The extended-parkour table travels with the solve so the core consumes
-    // the exact table the JS reference builds — one geometry source. It is a
-    // process constant (~25 KB), serialised once and re-uploaded per solve.
-    const extBlob = cfg.allowParkourExtended && cfg.allowParkour && cfg.allowSprinting
-      ? (cachedExtBlob ??= serializeParkourTable(getParkourExtTable(), J_RUN, J_LOW_RUN, J_CHAIN))
-      : null
+    const paramsSize = 4 * 4 + specs.length * 36 + 4 * 2 + 8 * 7 + 4 * 2 + 4 * 2
+    // The extended-parkour table is the one the JS reference builds — one
+    // geometry source. It is a process constant (~0.7 MB serialized with its
+    // aimed variants), so it is uploaded and parsed ONCE and stays resident in
+    // the core; a core without the residency exports gets it with every solve.
+    const extWanted = cfg.allowParkourExtended && cfg.allowParkour && cfg.allowSprinting
+    let extBlob: ArrayBuffer | null = null
+    if (extWanted) {
+      cachedExtBlob ??= serializeParkourTable(getParkourExtTable(), J_RUN, J_LOW_RUN, J_CHAIN)
+      if (ex.ext_begin !== undefined && ex.ext_ptr !== undefined && ex.ext_commit !== undefined) {
+        if (!this.extResident) {
+          ex.ext_begin(cachedExtBlob.byteLength)
+          new Uint8Array(ex.memory.buffer).set(new Uint8Array(cachedExtBlob), ex.ext_ptr())
+          const rc = ex.ext_commit()
+          if (rc !== 0) throw new Error(`wasm ext_commit rejected the parkour table (code ${rc})`)
+          this.extResident = true
+        }
+      } else {
+        extBlob = cachedExtBlob
+      }
+    }
     // Allocs before any view — each may grow (and detach views of) wasm
     // memory; resident snapshot/dig data stays valid (growth extends).
     const entityPtr = entityCount > 0 ? ex.wasm_alloc(entitySize) : 0
@@ -285,7 +322,9 @@ export class WasmSolver {
     i32(cfg.maxDropDown)
     f64(cfg.liquidCost); f64(cfg.entityCost); f64(cfg.digCost)
     f64(cfg.bubbleCost)
-    f64(ENVELOPE_SAFETY_MARGIN - (cfg.parkourSafetyMargin ?? ENVELOPE_SAFETY_MARGIN)) // margin credit
+    const marginCredit = ENVELOPE_SAFETY_MARGIN - (cfg.parkourSafetyMargin ?? ENVELOPE_SAFETY_MARGIN)
+    f64(marginCredit)
+    f64(cfg.allowParkourTight === false ? marginCredit : ENVELOPE_SAFETY_MARGIN) // tight-pass credit
     f64(opts.searchRadius)
     u32(entityPtr); u32(entityCount)
     u32(extPtr); u32(extBlob !== null ? extBlob.byteLength : 0)
@@ -377,6 +416,10 @@ export class WasmSolver {
         useOne: (meta & 2) !== 0 ? { x, y, z } : null
       }
       if ((meta & 16) !== 0) node.run = true // META_RUN
+      if ((meta & 32) !== 0) {
+        // META_AIM: the AIM byte follows the meta byte (lib.rs serialize_result)
+        node.aim = view.getUint8(off); off += 1
+      }
       if ((meta & (4 | 8)) !== 0) {
         // META_BOUNCE / META_CHAIN: the via cell follows the meta byte
         // (lib.rs serialize_result), before the toBreak list.

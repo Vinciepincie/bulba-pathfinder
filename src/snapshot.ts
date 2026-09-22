@@ -27,6 +27,11 @@ export class Snapshot {
   /** LutSpecial byte per cell (bubble columns). Present only when the
    * profile's LUT carries a special table (useBubbleColumns). */
   special: Uint8Array | null = null
+  /** Thin footprint byte per cell (shapes.ts thinFootprint). Present only when
+   * the profile's LUT carries a thin table (allowParkourExtended). */
+  thin: Uint8Array | null = null
+  /** Chunk columns inside the box that were not loaded when it was built (their cells read as unsafe), as cx,cz keys. */
+  missingColumns: Set<string> = new Set()
   entityIdx: Int32Array = EMPTY_I32
   entityWeight: Int32Array = EMPTY_I32
   /** LUT this snapshot was resolved through (for in-place cell patches). */
@@ -67,6 +72,13 @@ export class Snapshot {
       this.special = new Uint8Array(new SharedArrayBuffer(this.cellCount))
     }
     return this.special
+  }
+
+  allocThin (): Uint8Array {
+    if (!this.thin) {
+      this.thin = new Uint8Array(new SharedArrayBuffer(this.cellCount))
+    }
+    return this.thin
   }
 }
 
@@ -209,6 +221,7 @@ interface NoSpanBits {
   flags: Uint8Array
   heights: Uint8Array
   special: Uint8Array
+  thin: Uint8Array
   states: Uint16Array
 }
 
@@ -238,6 +251,7 @@ function noSpanBits (container: unknown, lut: BlockLut, cache: Map<unknown, NoSp
       const flags = new Uint8Array(n)
       const heights = new Uint8Array(n)
       const special = new Uint8Array(n)
+      const thin = new Uint8Array(n)
       const states = new Uint16Array(n)
       let ok = true
       for (let i = 0; i < n; i++) {
@@ -246,12 +260,13 @@ function noSpanBits (container: unknown, lut: BlockLut, cache: Map<unknown, NoSp
         flags[i] = lut.flags[s]
         heights[i] = lut.heights[s]
         special[i] = lut.special ? lut.special[s] : 0
+        thin[i] = lut.thin ? lut.thin[s] : 0
         states[i] = s
       }
       if (ok) {
         out = {
           words: ba.data, bitsPerValue: ba.bitsPerValue, valuesPerLong: ba.valuesPerLong, valueMask: ba.valueMask,
-          flags, heights, special, states
+          flags, heights, special, thin, states
         }
       }
     } else if (palette === undefined) {
@@ -265,7 +280,7 @@ function noSpanBits (container: unknown, lut: BlockLut, cache: Map<unknown, NoSp
       // empty array is never indexed.
       out = {
         words: ba.data, bitsPerValue: ba.bitsPerValue, valuesPerLong: ba.valuesPerLong, valueMask: ba.valueMask,
-        flags: lut.flags, heights: lut.heights, special: lut.special ?? NO_SPECIAL, states: directStates
+        flags: lut.flags, heights: lut.heights, special: lut.special ?? NO_SPECIAL, thin: lut.thin ?? NO_SPECIAL, states: directStates
       }
     }
   }
@@ -291,6 +306,7 @@ export function buildSnapshot (bot: Bot, lut: BlockLut, box: Box, needStates: bo
   const snap = new Snapshot(meta, lut.fingerprint)
   const states = needStates ? snap.allocStates() : null
   const special = lut.special ? snap.allocSpecial() : null
+  const thin = lut.thin ? snap.allocThin() : null
 
   const world = bot.world as unknown as WorldLike
   const flags = snap.flags
@@ -298,6 +314,7 @@ export function buildSnapshot (bot: Bot, lut: BlockLut, box: Box, needStates: bo
   const lutFlags = lut.flags
   const lutHeights = lut.heights
   const lutSpecial = lut.special
+  const lutThin = lut.thin
   const maxStateId = lut.maxStateId
 
   const cx0 = box.x0 >> 4
@@ -326,7 +343,7 @@ export function buildSnapshot (bot: Bot, lut: BlockLut, box: Box, needStates: bo
       } catch {
         column = null
       }
-      if (!column) { colsMissing++; continue } // unloaded → cells stay 0 (upstream null-block: unsafe, not physical)
+      if (!column) { colsMissing++; snap.missingColumns.add(`${cx},${cz}`); continue } // unloaded → cells stay 0 (upstream null-block: unsafe, not physical)
 
       // Fast path: read section containers directly (prismarine-chunk 1.18+).
       // A SingleValueContainer section (all air, all stone) resolves without
@@ -379,12 +396,14 @@ export function buildSnapshot (bot: Bot, lut: BlockLut, box: Box, needStates: bo
               const f = lutFlags[uniformState]
               const h = lutHeights[uniformState]
               const sp = lutSpecial ? lutSpecial[uniformState] : 0
+              const th = lutThin ? lutThin[uniformState] : 0
               for (let x = bx0; x <= bx1; x++) {
                 const idx = base + x
                 flags[idx] = f
                 heights[idx] = h
                 if (states) states[idx] = uniformState
                 if (special) special[idx] = sp
+                if (thin) thin[idx] = th
               }
             }
             continue
@@ -399,6 +418,7 @@ export function buildSnapshot (bot: Bot, lut: BlockLut, box: Box, needStates: bo
             const pf = bits.flags
             const ph = bits.heights
             const ps = bits.special
+            const pt = bits.thin
             const pst = bits.states
             for (let x = bx0; x <= bx1; x++) {
               const ci = zPart | (x & 15)
@@ -419,6 +439,7 @@ export function buildSnapshot (bot: Bot, lut: BlockLut, box: Box, needStates: bo
                 heights[idx] = ph[v]
                 if (states) states[idx] = pst[v]
                 if (special) special[idx] = ps[v]
+                if (thin) thin[idx] = pt[v]
               }
             }
             continue
@@ -435,6 +456,7 @@ export function buildSnapshot (bot: Bot, lut: BlockLut, box: Box, needStates: bo
                   heights[idx] = lutHeights[stateId]
                   if (states) states[idx] = stateId
                   if (special) special[idx] = lutSpecial![stateId]
+                  if (thin) thin[idx] = lutThin![stateId]
                 }
               }
               continue
@@ -457,6 +479,7 @@ export function buildSnapshot (bot: Bot, lut: BlockLut, box: Box, needStates: bo
               heights[idx] = lutHeights[stateId]
               if (states) states[idx] = stateId
               if (special) special[idx] = lutSpecial![stateId]
+              if (thin) thin[idx] = lutThin![stateId]
             }
           }
         }
@@ -487,11 +510,13 @@ export function applySnapshotBlockUpdate (
     snap.heights[idx] = lut.heights[stateId]
     if (snap.states) snap.states[idx] = stateId
     if (snap.special) snap.special[idx] = lut.special ? lut.special[stateId] : 0
+    if (snap.thin) snap.thin[idx] = lut.thin ? lut.thin[stateId] : 0
   } else {
     snap.flags[idx] = 0
     snap.heights[idx] = 0
     if (snap.states) snap.states[idx] = 0
     if (snap.special) snap.special[idx] = 0
+    if (snap.thin) snap.thin[idx] = 0
   }
   return true
 }

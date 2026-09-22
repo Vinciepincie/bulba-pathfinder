@@ -116,6 +116,7 @@ describe('wasm ↔ JS solver differential', function () {
         heights: snap.heights,
         states: snap.states,
         special: snap.special,
+        thin: snap.thin,
         entityIdx: snap.entityIdx,
         entityWeight: snap.entityWeight
       },

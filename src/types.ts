@@ -77,6 +77,14 @@ export const LutSpecial = {
    * only on straight/corner bottom stairs (top-half stairs stay full-top).
    */
   STAIR: 16
+  /**
+   * Bits 5–7 (shapes.ts CARRY_SHIFT / carryCode): where a NARROW support
+   * (catch class > 0) carries the body relative to its cell — an edge panel
+   * in one of four orientations, or a line along x or z. 0 = centred, the
+   * class model. Set with the extended parkour repertoire; the bits are
+   * never set on the blocks the other values mark, so equality tests on
+   * those values keep working.
+   */
 } as const
 
 /**
@@ -171,6 +179,22 @@ export interface MovementsConfig {
    * configs.
    */
   allowParkourMomentum?: boolean
+  /**
+   * Improvement (needs allowParkourExtended; default on): where the reach
+   * envelope with the profile's parkourSafetyMargin offers no jump, offer
+   * the ZERO-margin one — the frame-perfect jump a practised player makes —
+   * at a cost premium (moveGen.ts TIGHT_COST), so the search buys it only
+   * where nothing comfortable gets through. Optional for older configs.
+   */
+  allowParkourTight?: boolean
+  /**
+   * Improvement (opt-in, needs allowParkourExtended): where the search FAILS,
+   * look for physics-verified hops out of its reach (hopOracle.ts) — jumps the
+   * table cannot express, flown in the exact kernel against the exact
+   * collision boxes — and stitch them into the path. Routes the table plans
+   * are untouched. Optional for older serialized configs.
+   */
+  allowParkourPhysics?: boolean
 }
 
 /** Per-state dig auxiliaries (only consulted when a block is unsafe). */
@@ -219,6 +243,17 @@ export interface RawPathNode {
   chain?: boolean
   /** Parkour jump the standing (creep-to-the-lip) reach cannot fly: the executor lines up a run. */
   run?: boolean
+  /** Parkour jump flown on an AIMED line (moveGen.ts META_AIM): bits 0-6 the
+   * 1-based parkourTable.ts AIM_VARIANTS index, bit 7 set when the table's
+   * side is mirrored in world space. Take-off and landing points sit beside
+   * their cell centres by the variant's offsets. */
+  aim?: number
+  /**
+   * Physics-verified hop (allowParkourPhysics, hopOracle.ts): the control
+   * program that lands this node, flown by the executor tick for tick from
+   * rest at its start point on the previous node's support.
+   */
+  program?: import('./hopOracle.js').HopProgram
 }
 
 export interface SolveResult {
@@ -345,6 +380,39 @@ export interface PhysicsLike {
   bestWalkHeading (path: XYZ[], sprint: boolean): number | null
   /** Does hopping while sprinting get further down this path, safely? */
   sprintHopBetter (path: XYZ[], lowCeilingHop?: boolean, horizon?: number): boolean
+  /**
+   * Optional: what to hold this tick of a flight so it comes down on the
+   * node (null = the default forward + sprint). A physics without it flies
+   * every jump with forward held, as upstream does.
+   */
+  airControl? (node: XYZ, engaged: boolean): { control: { forward: boolean, back: boolean, sprint: boolean } | null, engaged: boolean }
+  /**
+   * Optional: search for a scripted jump from the body's state now to the
+   * node (physics.ts JumpScript) — up to `budget` candidates per call;
+   * undefined while searching, null when nothing lands.
+   */
+  solveJump? (node: XYZ, budget: number): {
+    yawA: number, yawB: number, turnTick: number, sprint: boolean, jumpAfter: number, ticks: number
+    track: Array<{ x: number, y: number, z: number }>, miss: number
+  } | null | undefined
+  /** Why the last sprintHopBetter said no ('' = yes). Trace diagnostics. */
+  hopRefusal?: string
+  /** Optional: the kernel's shape tables (physics.ts setShapeTables). */
+  setShapeTables? (lut: import('./lut.js').BlockLut): void
+  /** Optional: hop now into the parkour jump ahead, or keep sprinting? (allowHopIntoJump) */
+  hopIntoJumpBetter? (path: Array<XYZ & { parkour?: boolean }>): boolean
+  /** Optional: the movement-speed attribute without sprinting (the worker kernel's speed). */
+  walkSpeed? (): number
+  /** Optional: a live control program to this planner node from the body as it is (physics.ts hopFrom). */
+  hopFrom? (cell: readonly [number, number, number], budgetMs: number): import('./hopOracle.js').HopProgram | null
+  /** Optional: a control program to this planner node from rest at a stand point of the body's node (physics.ts hopLinedUp). */
+  hopLinedUp? (cell: readonly [number, number, number], budgetMs: number): import('./hopOracle.js').HopProgram | null
+  /** Optional: a planned program re-anchored at the body as it is, if it still lands (physics.ts hopAnchored). */
+  hopAnchored? (cell: readonly [number, number, number], prog: import('./hopOracle.js').HopProgram): import('./hopOracle.js').HopProgram | null
+  /** Why the last hopFrom / hopLinedUp came out as it did. Trace diagnostics. */
+  hopNote?: string
+  /** Did the last hopLinedUp fly every family's programs and land none (a verdict, not a timeout)? */
+  hopExhausted?: boolean
 }
 
 export type { Vec3 }

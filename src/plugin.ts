@@ -37,6 +37,8 @@ import type { Box } from './snapshot.js'
 import { serializeGoal, goalNeedsRaycast, descriptorTargets } from './goalSerde.js'
 import { TAKEOFF_STAND, TAKEOFF_NARROW_MARGIN, CHAIN_TAKEOFF_FRACTION } from './parkourEnvelope.js'
 import { CATCH_HALF, topCatchClass } from './shapes.js'
+import { headingDir, programHeading, sneakLanding, F_FWD, F_SPRINT, F_JUMP, LAND_OVERLAP } from './hopOracle.js'
+import type { HopProgram } from './hopOracle.js'
 import { getSharedWorkerHost } from './worker/host.js'
 import * as geometry from './geometry.js'
 import { InterruptController } from './interrupt.js'
@@ -190,6 +192,96 @@ const CREEP_SNEAK_ZONE = 0.35
  * edge-guard (a server position packet clears onGround) cannot leave it.
  */
 const NARROW_LIP_SAFETY = 0.08
+
+/**
+ * Into-the-wall component of the heading while moving along a ladder wall,
+ * per unit of sideways component. Any inward component at all makes the
+ * physics register the horizontal collision that climbs (0.2 a tick); the
+ * sideways share is what moves the body along, so it is kept the larger.
+ */
+/**
+ * Physics-verified hop line-up (Move.program): how close to the program's
+ * start the resting body must be — inside hopOracle.ts ROBUST_NUDGE, which
+ * every accepted program survives — where the line-up starts sneaking, and
+ * the ground coast of a released body in ticks of its carried velocity
+ * (1 / (1 - 0.6 · 0.91)).
+ */
+const PROG_LINEUP_TOL = 0.02
+const PROG_SNEAK_ZONE = 0.6
+const PROG_COAST = 1 / (1 - 0.6 * 0.91)
+/** Ticks of held jump without taking off before a replay is given up (hopOracle.ts JUMP_GRACE). */
+const PROG_JUMP_GRACE = 6
+/**
+ * The line-up's live searches (PhysicsSim.hopFrom): at most this many per
+ * node, at rests within this of the program's start. And how far one sneaking
+ * press moves the rest point (walk speed · ground acceleration · 0.3 sneak ·
+ * 0.98 input, coasted): the line-up can place a body no finer than this.
+ */
+const PROG_LIVE_TRIES = 3
+const PROG_LIVE_NEAR = 0.15
+/** A take-off up a climbable is climbed to until the feet are within this of its height (the program branch). */
+const PROG_CLIMB_TOL = 0.05
+const PROG_PRESS_SHIFT = 0.1 * 0.98 * 0.3 * PROG_COAST
+/**
+ * The take-off search in the exact kernel (PhysicsSim.hopFrom / hopLinedUp):
+ * its wall-clock budget; PF_TAKEOFF_KERNEL=0 turns it off for A/B runs.
+ */
+const TAKEOFF_KERNEL = process.env.PF_TAKEOFF_KERNEL !== '0'
+const TAKEOFF_SEARCH_MS = 40
+/** ...and for the search from a stand point, the fallback at a take-off the body is stuck at. */
+const TAKEOFF_LINED_MS = 80
+/**
+ * ...and for re-deriving a planned beam program live at the lined-up rest:
+ * it was proven within LIVE_NUDGE of its start, the line-up lands within
+ * PROG_LINEUP_TOL, and the beam from the actual rest (hopOracle.ts
+ * beamSearch) takes a few hundred ms — spent standing still, once.
+ */
+const TAKEOFF_REST_BEAM_MS = 400
+/**
+ * How long a fresh goal waits on chunks still arriving before a noPath is
+ * final (handleDriveResult). OFF (0): measured on the arena's full book it
+ * held climb1's first search 1.3 s in every sweep (a boundary-limited
+ * failure that box growth solves in 200 ms) and never rescued the route it
+ * was written for (mcc-6-3 fails fresh off a teleport because its columns
+ * arrive PRESENT but empty, which "missing columns" cannot see). The
+ * mechanism stays for a detection that reads the columns themselves.
+ */
+const CHUNK_WAIT_MS = 0
+
+/** Scripted jumps (PhysicsSim.solveJump); PF_JUMP_SOLVER=0 turns them off for A/B runs. */
+const JUMP_SOLVER = process.env.PF_JUMP_SOLVER !== '0'
+/** Ticks at rest in front of an unauthorised parkour node before the search starts. */
+const SCRIPT_STILL_TICKS = 6
+/** Candidate scripts flown per executor tick while searching. */
+const SCRIPT_BUDGET = 400
+/** How far the body may be from a script's predicted track before the script is dropped. */
+const SCRIPT_TRACK_TOL = 0.06
+/** In-flight landing control on narrow supports (PhysicsSim.airControl); PF_AIR_CONTROL=0 turns it off for A/B runs. */
+const AIR_CONTROL = process.env.PF_AIR_CONTROL !== '0'
+const CLIMB_PRESS = 0.6
+/**
+ * A climb's along-wall drift: the distance a speed coasts under air drag
+ * (0.91 a tick: 0.91 / 0.09 times itself), and how far from the node's
+ * along-wall aim the coast may end before the climb steers against it.
+ */
+const CLIMB_DRIFT = 0.91 / 0.09
+const CLIMB_HOLD = 0.15
+/** A final node on a climbable is held until the body is within this of its height. */
+const CLIMB_FINISH_DY = 0.2
+/**
+ * Lateral error from a SHIFTED flight line (Move.takeoff) the line-up walk
+ * accepts before the creep takes over. The planner swept the shifted line
+ * with the full hitbox less 5 cm (parkourTable.ts SHIFT_SWEPT_HALF); the
+ * rest of an error this size is a corner nick vanilla slides past.
+ */
+const SHIFT_LINE_TOL = 0.1
+
+/**
+ * Least creep worth taking on a narrow support, along the flight line. Under
+ * this the support is a panel or a pane crossing the line, and the coast
+ * after a sneaking creep ends (~0.08) is most of the gain.
+ */
+const THIN_CREEP_MIN = 0.2
 
 /** Ground distance one sprinting tick covers, the sprint gate's look-ahead. */
 const SPRINT_TICK = 0.3
@@ -400,6 +492,31 @@ export function createPathfinder (options: PathfinderOptions = {}) {
     let digging = false
     /** Sprint-hop latched at take-off, re-pressed on each landing (allowSprintHop). */
     let hopHold = false
+    /** The hop in the air was chosen by the kernel (allowHopIntoJump): flown as it was flown there. */
+    let kernelHop = false
+    /**
+     * Physics-verified hop being flown (Move.program, allowParkourPhysics):
+     * the node, the phase (0 lining up at the program's start, 1 replaying),
+     * and the replay's own counters — the same ones HopOracle.fly keeps, so
+     * the aim schedule is the one the program was verified with.
+     */
+    let progNode: Move | null = null
+    let progPhase = 0
+    let progTick = 0
+    let progFired = false
+    let progAir = 0
+    let progRebounds = 0
+    /** Live searches the line-up has run for the program node, and where the last at-rest one ran. */
+    let progLiveTries = 0
+    let progRestX = Infinity
+    let progRestZ = Infinity
+    /** The node the kernel take-off search last ran for, and whether that search was from rest. */
+    let takeoffSearched: unknown = null
+    let takeoffSearchedAtRest = false
+    /** The node the lined-up search (hopLinedUp) last ran for: once per node. */
+    let linedSearched: unknown = null
+    /** What a take-off search found this tick (PhysicsSim.hopNote), for the exec trace. */
+    let takeoffNote = ''
     /** The node the corner cut is steering at, held until reached or invalid. */
     let cutTarget: Move | null = null
     /** Anchor of the cut line (slides along it each grounded tick); the line is cutFrom → cutTarget. */
@@ -458,6 +575,24 @@ export function createPathfinder (options: PathfinderOptions = {}) {
      * early return is covered; off by default, costs nothing when unset.
      */
     let execBranch = 'idle'
+    /** In-flight landing control: the node it was last sized up for, and whether its support is narrow. */
+    let airNode: unknown = null
+    let airNarrow = false
+    /**
+     * Scripted jump (PhysicsSim.solveJump): the script being replayed, the node
+     * it is for, the tick it is at, whether it has left the ground — and the
+     * ticks the body has stood still in front of a parkour node no gate
+     * authorises, which is what starts the search.
+     */
+    let jumpScript: { yawA: number, yawB: number, turnTick: number, sprint: boolean, jumpAfter: number, ticks: number, track: Array<{ x: number, y: number, z: number }>, miss: number } | null = null
+    let jumpScriptNode: unknown = null
+    let jumpScriptTick = 0
+    let jumpScriptAir = 0
+    let jumpStillTicks = 0
+    let jumpSolveFailedNode: unknown = null
+    let jumpSolveStartNode: unknown = null
+    /** Latched for the flight once the default was predicted to miss its node. */
+    let airEngaged = false
     let execTick = 0
     const execTraceFile = process.env.PF_EXEC_TRACE ? `${process.env.PF_EXEC_TRACE}-${bot.username}.jsonl` : null
     const execTraceBuf: string[] = []
@@ -553,6 +688,8 @@ export function createPathfinder (options: PathfinderOptions = {}) {
     let mainSolver: Solver | null = null
     let growFactor = 1
     let growAttempts = 0
+    /** The last solve failed on a box with unloaded columns: the next waits for one to arrive (CHUNK_WAIT_MS). */
+    let awaitingChunks = false
     /** When the current growth sequence's first solve was dispatched. */
     let growStartedAt = 0
     let lastTouchedChunks: Set<string> | null = null
@@ -930,6 +1067,16 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       }
     }
 
+    /** Did this search reach a chunk next to (or in) one that was not loaded? */
+    function touchedMissing (raw: RawSolveResult, missing: Set<string>): boolean {
+      for (const [cx, cz] of raw.touchedChunks) {
+        for (let dx = -1; dx <= 1; dx++) {
+          for (let dz = -1; dz <= 1; dz++) if (missing.has(`${cx + dx},${cz + dz}`)) return true
+        }
+      }
+      return false
+    }
+
     function contextFromRaw (raw: RawSolveResult): ComputedPathResult['context'] {
       const visitedChunks = new Set<string>()
       for (const [cx, cz] of raw.touchedChunks) visitedChunks.add(`${cx},${cz}`)
@@ -938,6 +1085,31 @@ export function createPathfinder (options: PathfinderOptions = {}) {
 
     function handleDriveResult (raw: RawSolveResult, generation: number, final: boolean): void {
       if (generation !== solveGeneration) return // stale (goal changed etc.)
+
+      // Chunks still arriving (improvement): a search that ran into unloaded
+      // columns failed for want of blocks the server has not sent yet —
+      // fresh off a teleport, a respawn. A noPath then fails the goal (goto
+      // rejects) though the way exists; instead, for a goal no older than
+      // CHUNK_WAIT_MS, nothing is emitted and the solve runs again as soon as
+      // a column in the box arrives (chunkColumnLoad marks the snapshot
+      // stale; the tick loop holds the re-solve until then). Only a search
+      // that reached them: a far goal's box always has unloaded columns in
+      // it, and a search that failed short of them grows its box as before.
+      // (a boundary-limited failure grows its box first, below: climb1's
+      // first search touched an unloaded column AND the box's edge, and the
+      // wait held for 1.6 s what one growth found in 200 ms)
+      if (final && raw.status === 'noPath' && !(raw.boundaryLimited && growAttempts < 5) &&
+          cachedSnapshot !== null && cachedSnapshot.missingColumns.size > 0 &&
+          performance.now() - goalSetAt < CHUNK_WAIT_MS && touchedMissing(raw, cachedSnapshot.missingColumns)) {
+        awaitingChunks = true
+        activeSolveCancel = null
+        activeSolveGeneration = -1
+        mainSolver = null
+        pathUpdated = false
+        lastSolveFrom = null
+        flushPatches()
+        return
+      }
 
       // Transparent snapshot growth: a boundary-limited noPath is retried
       // with a larger box before anything is emitted — within ONE think
@@ -1021,6 +1193,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         if (raw.status === 'success') {
           growFactor = 1
           growAttempts = 0
+          awaitingChunks = false
         }
       }
       // lastNodeArrival is deliberately NOT touched here. It means "when a
@@ -1080,7 +1253,10 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         (!stateMovements.canDig || stateMovements.exclusionAreasBreak.length === 0) &&
         !workerHost.unavailable
 
-      const needStates = (descriptor !== null && goalNeedsRaycast(descriptor)) || stateMovements.canDig
+      // The physics-hop pipeline flies the snapshot's exact collision boxes,
+      // which it reads through the per-cell state ids (allowParkourPhysics).
+      const needStates = (descriptor !== null && goalNeedsRaycast(descriptor)) || stateMovements.canDig ||
+        (stateMovements.allowParkourPhysics && stateMovements.allowParkourExtended)
       const snapT0 = solveTimingOn ? performance.now() : 0
       const hadSnapshot = cachedSnapshot !== null && !snapshotStale
       const snapshot = ensureSnapshot(startPos, descriptor, needStates)
@@ -1104,6 +1280,14 @@ export function createPathfinder (options: PathfinderOptions = {}) {
           searchRadius: pf.searchRadius as number,
           sliceMs: Math.max(10, pf.tickTimeout as number),
           dig: digData,
+          body: stateMovements.allowParkourPhysics
+            ? {
+                halfWidth: (bot.physics as unknown as { playerHalfWidth?: number }).playerHalfWidth ?? 0.3,
+                height: (bot.physics as unknown as { playerHeight?: number }).playerHeight ?? 1.8,
+                speed: physics.walkSpeed?.() ?? 0.1
+              }
+            : undefined,
+          hopsOnBoundary: growAttempts === 0,
           onPartial: (raw: RawSolveResult) => handleDriveResult(raw, generation, false)
         }
         // Mark in-flight synchronously so the next tick doesn't double-start.
@@ -1228,6 +1412,8 @@ export function createPathfinder (options: PathfinderOptions = {}) {
     }
 
     function postProcessPath (thePath: Move[]): Move[] {
+      // The nodes' cells, before the aim points below move off the centres.
+      const cellXZ = thePath.map(m => [Math.floor(m.x), Math.floor(m.z)] as [number, number])
       for (let i = 0; i < thePath.length; i++) {
         const curPoint = thePath[i]
         if (curPoint.toBreak.length > 0 || curPoint.toPlace.length > 0) break
@@ -1249,6 +1435,51 @@ export function createPathfinder (options: PathfinderOptions = {}) {
           curPoint.x = np.x
           curPoint.y = np.y
           curPoint.z = np.z
+          if (support === b && b !== null && (b.type === ladderId || b.type === vineId)) {
+            // Improvement: a climbable node is aimed at the ladder's TOP
+            // (upstream: the body climbs to it and steps off), which is a
+            // place a body can be only when the two cells above the ladder
+            // are open. Under a ceiling — a ladder wall run along beneath a
+            // beam, the arena's mcc-4-3 — the top is inside the beam, and a
+            // bot aimed there presses up into it for as long as the futility
+            // timer allows. Aim inside the ladder's own cell instead; the
+            // arrival box is a block tall, so hanging anywhere in it counts.
+            const fx = Math.floor(curPoint.x)
+            const fz = Math.floor(curPoint.z)
+            const fy = Math.floor(np.y)
+            const blocked = [fy, fy + 1].some(yy => {
+              const bb = bot.blockAt(new Vec3(fx, yy, fz)) as BlockLike | null
+              return bb !== null && bb.type !== ladderId && bb.type !== vineId && bb.shapes.length > 0
+            })
+            if (blocked) curPoint.y = fy - 1
+          } else if (support !== null) {
+            // Improvement: aim where the body is CARRIED. Upstream averages
+            // the cell centre with the face centre, which is the face centre
+            // for every centred support (post, head, pot, slab, full block —
+            // unchanged here). On an open trapdoor's panel at the cell edge
+            // it is 0.7, resting on the panel by 0.19 of the hitbox: a landing
+            // there has 0.19 to spare on one side and 0.6 on the other. Aim
+            // at the middle of the carrying face instead — unless the body
+            // cannot be there (the panel sits against a wall, and upstream's
+            // point IS the wall-pressed position).
+            const faces = geometry.supportFaces(bot, support.position.x, support.position.y, support.position.z)
+            if (faces.length > 0 && geometry.supportDepth(bot, faces, np.x, np.z) < 0.25) {
+              let top = -Infinity
+              for (const f of faces) if (f.top > top) top = f.top
+              let sx = 0
+              let sz = 0
+              let n = 0
+              for (const f of faces) {
+                if (f.top === top) { sx += (f.x0 + f.x1) / 2; sz += (f.z0 + f.z1) / 2; n++ }
+              }
+              const cx = sx / n
+              const cz = sz / n
+              if (!geometry.playerCollides(bot, cx, np.y, cz)) {
+                curPoint.x = cx
+                curPoint.z = cz
+              }
+            }
+          }
         } else {
           curPoint.x = Math.floor(curPoint.x) + 0.5
           curPoint.y = curPoint.y - 1
@@ -1264,6 +1495,30 @@ export function createPathfinder (options: PathfinderOptions = {}) {
           curPoint.x += curPoint.aimDx * scale
           curPoint.z += curPoint.aimDz * scale
         }
+      }
+      // Aimed flight lines (planner META_AIM, Move.pOff / qOff): the jump is
+      // flown from a point pOff beside the previous node's aim to a point
+      // qOff beside this one's, past what the centre line clips. The landing
+      // aim moves there, and the executor lines the body up on the take-off
+      // point (Move.takeoff) first.
+      for (let i = 0; i < thePath.length; i++) {
+        const m = thePath[i]
+        if ((m.pOff === 0 && m.qOff === 0) || m.toBreak.length > 0 || m.toPlace.length > 0) continue
+        const [cx, cz] = cellXZ[i]
+        const [px, pz] = i > 0 ? cellXZ[i - 1] : [Math.floor(bot.entity.position.x), Math.floor(bot.entity.position.z)]
+        const ddx = cx - px
+        const ddz = cz - pz
+        const dl = Math.hypot(ddx, ddz)
+        if (dl < 1e-6) continue
+        const ux = -ddz / dl
+        const uz = ddx / dl
+        const prev = i > 0 ? thePath[i - 1] : { x: px + 0.5, z: pz + 0.5 }
+        // A neo (wOff) is not lined up on a take-off point: what flies it is a
+        // run along the pillar's face from wherever the body arrived on the
+        // block, found by PhysicsSim.solveJump.
+        m.takeoff = m.wOff !== 0 ? null : { x: prev.x + ux * m.pOff, z: prev.z + uz * m.pOff }
+        m.x += ux * m.qOff
+        m.z += uz * m.qOff
       }
 
       if (!(pf.enablePathShortcut as boolean) || stateMovements.exclusionAreasStep.length !== 0 || thePath.length === 0) return thePath
@@ -1356,6 +1611,28 @@ export function createPathfinder (options: PathfinderOptions = {}) {
      * it. Sampled a block and two blocks out, which is as far as the rest of
      * a descent carries.
      */
+    /**
+     * The wall a climbable is hung on, as the unit step from the body's cell
+     * into it. A ladder's collision box is a 3/16 strip against that wall,
+     * so the strip's thin axis and side give it directly; a vine has no
+     * collision, so the first solid non-climbable neighbour stands in. Null
+     * when nothing solid is adjacent (a free-hanging vine curtain).
+     */
+    function climbWall (feet: BlockLike, p: Vec3): [number, number] | null {
+      const fx = Math.floor(p.x)
+      const fy = Math.floor(p.y + 0.001)
+      const fz = Math.floor(p.z)
+      for (const s of feet.shapes) {
+        if (s[3] - s[0] < 0.5) return [s[0] > 0.5 ? 1 : -1, 0]
+        if (s[5] - s[2] < 0.5) return [0, s[2] > 0.5 ? 1 : -1]
+      }
+      for (const [ox, oz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+        const nb = bot.blockAt(new Vec3(fx + ox, fy, fz + oz)) as BlockLike | null
+        if (nb && nb.type !== ladderId && nb.type !== vineId && nb.boundingBox === 'block') return [ox, oz]
+      }
+      return null
+    }
+
     function holeBeyond (node: Move, from: Vec3): boolean {
       const v = bot.entity.velocity
       let ux = v.x
@@ -1390,6 +1667,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
 
     function fullStop (): void {
       hopHold = false
+      kernelHop = false
       cutTarget = null
       clearWedge()
       bot.clearControlStates()
@@ -1398,11 +1676,24 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       bot.entity.velocity.x = 0
       bot.entity.velocity.z = 0
 
-      const blockX = Math.floor(bot.entity.position.x) + 0.5
-      const blockZ = Math.floor(bot.entity.position.z) + 0.5
+      const pos = bot.entity.position
+      const blockX = Math.floor(pos.x) + 0.5
+      const blockZ = Math.floor(pos.z) + 0.5
+      // Never onto nothing (improvement): a body standing over the EDGE of
+      // a block — its box on it, the centre past it, a landing the planner
+      // and the oracle both count — is snapped to the centre of the cell its
+      // centre is in, which on a pillar or a slime top is air (the arena's
+      // tenways-slime-first: onto the goal's slime, snapped off it, a fall).
+      const grounded = (bot.entity as { onGround?: boolean }).onGround === true
+      if (grounded) {
+        const under = bot.blockAt(new Vec3(blockX, pos.y - 0.01, blockZ)) as { shapes?: number[][], position?: Vec3 } | null
+        const by = Math.floor(pos.y - 0.01)
+        const carried = under !== null && (under.shapes ?? []).some(s => Math.abs(by + s[4] - pos.y) < 0.01)
+        if (!carried) return
+      }
 
-      if (Math.abs(bot.entity.position.x - blockX) > 0.2) { bot.entity.position.x = blockX }
-      if (Math.abs(bot.entity.position.z - blockZ) > 0.2) { bot.entity.position.z = blockZ }
+      if (Math.abs(pos.x - blockX) > 0.2) { pos.x = blockX }
+      if (Math.abs(pos.z - blockZ) > 0.2) { pos.z = blockZ }
     }
 
     // ── wedge recovery (improvement) ─────────────────────────────────────
@@ -1542,6 +1833,39 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       biasTicks = 0
     }
 
+    /** One replayed tick of control program `prog`: HopOracle.advance's controls, by the replay's counters. */
+    function replayProgramTick (prog: HopProgram, p: Vec3): void {
+      // onto a slime top: sneak on the touchdown tick, the oracle's own rule
+      const ent = bot.entity as { onGround?: boolean }
+      const hw = (bot.physics as unknown as { playerHalfWidth?: number }).playerHalfWidth ?? 0.3
+      const sneak = sneakLanding(prog, ent.onGround === true, p.x, p.y, p.z, bot.entity.velocity.y, hw)
+      if (prog.seq !== undefined) {
+        // a beam program: its controls tick for tick, the last one held past the end
+        const k = Math.min(progTick, (prog.seq.length >> 1) - 1) << 1
+        if (!Number.isNaN(prog.seq[k])) bot.look(prog.seq[k], 0, true)
+        const flags = prog.seq[k + 1]
+        bot.setControlState('forward', (flags & F_FWD) !== 0)
+        bot.setControlState('back', false)
+        bot.setControlState('left', false)
+        bot.setControlState('right', false)
+        bot.setControlState('sneak', sneak)
+        bot.setControlState('sprint', (flags & F_SPRINT) !== 0)
+        bot.setControlState('jump', (flags & F_JUMP) !== 0)
+        progTick++
+        return
+      }
+      const hd = headingDir(programHeading(prog, progFired, progAir, progRebounds), p.x, p.z)
+      if (hd !== null) bot.look(Math.atan2(-hd[0], -hd[1]), 0, true)
+      bot.setControlState('forward', true)
+      bot.setControlState('back', false)
+      bot.setControlState('left', false)
+      bot.setControlState('right', false)
+      bot.setControlState('sneak', sneak)
+      bot.setControlState('sprint', prog.sprint !== false)
+      bot.setControlState('jump', !progFired && progTick >= prog.jumpAt)
+      progTick++
+    }
+
     /**
      * Turn to make the jump, before shuffling to make room for it.
      *
@@ -1631,6 +1955,9 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       if (!stopPathing && path.length > 0) bot.emit('path_reset' as never, reason as never)
       path = []
       cutTarget = null
+      kernelHop = false
+      progNode = null
+      progPhase = 0
       bounceNode = null
       bounceRisen = false
       chainNode = null
@@ -1689,6 +2016,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       firstDriveLogged = false
       growFactor = 1
       growAttempts = 0
+      awaitingChunks = false
       bot.emit('goal_updated' as never, goal as never, dynamic as never)
       resetPath('goal_updated')
       // Dispatch the solve now rather than on the next tick (eagerStart). The
@@ -2090,7 +2418,9 @@ export function createPathfinder (options: PathfinderOptions = {}) {
             }
             // Dynamic goal standing at its end: idle until hasChanged fires
             // (upstream else-if structure — no recompute here).
-          } else if (!solveInFlight() && (!pathUpdated || movedSinceLastSolve())) {
+          } else if (!solveInFlight() && (!pathUpdated || movedSinceLastSolve()) &&
+              // (waiting on chunks: re-solve once one lands in the box, or the wait is up)
+              !(awaitingChunks && !snapshotStale && performance.now() - goalSetAt < CHUNK_WAIT_MS)) {
             // Divergence from upstream, and the reason for it: upstream gates
             // this purely on `!pathUpdated`, which latches true as soon as any
             // final path is delivered. A path that is then walked to
@@ -2273,6 +2603,23 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       // below measures skipped nodes against it.
       if (cutTarget !== null && path.indexOf(cutTarget) < 1) cutTarget = null
       for (;;) {
+        // A physics-verified hop's node is reached by the program landing it
+        // — touched down (or caught) in its column after the replay's jump —
+        // and by nothing else: the program was verified to land there, and
+        // no box around the node's aim point says more than that.
+        const progHere = (nextPoint as Move).program
+        let progLanded = false
+        if (progHere !== null && progHere !== undefined) {
+          progLanded = progNode === nextPoint && progPhase === 1 && progFired && caughtNow &&
+            // (the box over the node's block by LAND_OVERLAP: HopOracle.overCol)
+            Math.abs(p.x - progHere.tx - 0.5) < 0.8 - LAND_OVERLAP && Math.abs(p.z - progHere.tz - 0.5) < 0.8 - LAND_OVERLAP &&
+            p.y >= progHere.ty - 1.001 && p.y < progHere.ty + 1 &&
+            // the goal is its cell: an edge landing on the last node settles
+            // into it first (the program branch), the landing's own speed
+            // usually carrying it there
+            (path.length > 1 || (Math.floor(p.x) === progHere.tx && Math.floor(p.z) === progHere.tz))
+          if (!progLanded) break
+        }
         // Improvement: never finish a path mid-air. The arrival box has no
         // ground requirement, so a goal satisfied at jump apex would cut
         // sprint+forward and drop the bot short of its landing — keep flying
@@ -2283,6 +2630,11 @@ export function createPathfinder (options: PathfinderOptions = {}) {
           if (ent.onGround !== true && ent.isInWater !== true) {
             const feet = bot.blockAt(p) as { type: number } | null
             airborneHold = feet === null || (feet.type !== ladderId && feet.type !== vineId)
+            // Nor part-way up a ladder (improvement): the box is a block
+            // tall, so a last node at a ladder's top is "reached" from 0.9
+            // below it and the path ends with the body hanging short of
+            // the goal (arena tenways-slime: finished 0.88 under the top).
+            if (!airborneHold && dy > CLIMB_FINISH_DY) airborneHold = true
           }
         }
         // A PARKOUR node is landed on, never flown over (improvement).
@@ -2333,6 +2685,10 @@ export function createPathfinder (options: PathfinderOptions = {}) {
           if (!caught && (stoneOfChain || holeBeyond(nextPoint, p))) break
         }
         if (airborneHold) break
+        // A scripted jump's node is landed on: retired in the air, the script
+        // is dropped and the rest of the flight steers at the node after it.
+        if (jumpScript !== null && jumpScriptNode === nextPoint &&
+            (bot.entity as { onGround?: boolean }).onGround !== true) break
         // Inside the box, or simply GONE BY. The corner cut does not steer
         // through every node centre by design, so a node the body has passed
         // is done even though it was never inside its 0.7-wide box; left in
@@ -2410,7 +2766,15 @@ export function createPathfinder (options: PathfinderOptions = {}) {
           const fz = nextPoint.z - prevRetired.z
           passed = fx * fx + fz * fz > 1 && (p.x - nextPoint.x) * fx + (p.z - nextPoint.z) * fz > 0
         }
-        if (!passed && !(Math.abs(dx) <= 0.35 && Math.abs(dz) <= 0.35 && Math.abs(dy) < arriveDy)) break
+        // Flown over a dip (improvement): a walk node the path dips into and
+        // climbs straight out of, passed in the air by a body already at the
+        // exit's level, is done — whichever branch pressed the jump. Held to
+        // the box, the bot came down on the lips of tunnel1's one-wide ditch
+        // and spent 17 ticks steering at its floor.
+        const overDip = !caughtNow && dy < 0 && -dy <= HOP_ARRIVE_DY && path.length > 1 &&
+          (nextPoint as { parkour?: boolean }).parkour !== true &&
+          path[1].y >= nextPoint.y + 1 && p.y >= path[1].y - 0.5
+        if (!passed && !progLanded && !(Math.abs(dx) <= 0.35 && Math.abs(dz) <= 0.35 && (Math.abs(dy) < arriveDy || overDip))) break
 
         // arrived at next point
         lastNodeTime = performance.now()
@@ -2472,7 +2836,11 @@ export function createPathfinder (options: PathfinderOptions = {}) {
           if (p.y > airPeakY) airPeakY = p.y
         } else if (wasAirborne) {
           wasAirborne = false
-          if (grounded && airPeakY - p.y > FALL_DAMAGE_DISTANCE) {
+          // (a rebound off slime is no landing: vanilla takes no fall damage
+          // there unless sneaking, which is what cancels the rebound)
+          const under = grounded && bot.entity.velocity.y > 0.05 ? bot.blockAt(p.offset(0, -0.2, 0)) as { name?: string } | null : null
+          const rebound = under !== null && under.name === 'slime_block'
+          if (grounded && !rebound && airPeakY - p.y > FALL_DAMAGE_DISTANCE) {
             // Two ticks at zero ping, not one: the server processes the
             // landing position on ITS next tick and the damage velocity
             // packet comes back a tick after that. Traced on parkouradv1's
@@ -2484,6 +2852,14 @@ export function createPathfinder (options: PathfinderOptions = {}) {
             landSettle = 2 + Math.min(4, Math.ceil(ping / 50))
           }
           airPeakY = -Infinity
+        }
+        // (not in the middle of a control program's replay: its flight was
+        // verified as flown, touch-downs and all, and a tick taken from it
+        // desyncs every phase counter after — the landing that ends it
+        // retires its node first)
+        if (landSettle > 0 && grounded && progNode === nextPoint && progPhase === 1 &&
+            (nextPoint as Move).program !== null && (nextPoint as Move).program !== undefined) {
+          landSettle = 0
         }
         if (landSettle > 0 && grounded) {
           landSettle--
@@ -2497,6 +2873,245 @@ export function createPathfinder (options: PathfinderOptions = {}) {
           bot.setControlState('back', false)
           bot.setControlState('left', false)
           bot.setControlState('right', false)
+          futile(swimming)
+          return
+        }
+      }
+
+      // The take-off search in the exact kernel (PhysicsSim.hopFrom): a LIVE
+      // control program from the body exactly as it is, installed on the
+      // node and replayed from this very tick — it holds only from this
+      // state. Used where a planned program would need a line-up (the
+      // program branch) and where no gate flies the node (the scripted-jump
+      // block below: a neo, a wedged take-off).
+      const kernelTakeoff = TAKEOFF_KERNEL && physics.hopFrom !== undefined && cachedLut !== null
+      const takeoffLive = (prog: HopProgram | null): boolean => {
+        if (prog === null) return false
+        ;(nextPoint as Move).program = prog
+        progNode = nextPoint as Move
+        progPhase = 1
+        progTick = 0
+        progFired = false
+        progAir = 0
+        progRebounds = 0
+        jumpStillTicks = 0
+        lastNodeTime = performance.now()
+        cutTarget = null
+        hopHold = false
+        kernelHop = false
+        replayProgramTick(prog, p)
+        execBranch = 'prog'
+        futile(swimming)
+        return true
+      }
+      // Physics-verified hop (allowParkourPhysics, hopOracle.ts): the node
+      // carries a CONTROL PROGRAM — planned (the hop pipeline: verified in the
+      // exact kernel from rest at a stand point; a beam program, to the live
+      // tolerance) or live (found from the body as it stood). A live one is
+      // replayed from the tick it was found on. A planned one is tried live
+      // first: as the node comes up (a take-off with no stop at all), and at
+      // each rest near its start — re-anchored at the exact state
+      // (HopOracle.anchored), else searched from there — so the line-up
+      // (walking, sneaking the last stretch) is only the fallback, replayed
+      // from within PROG_LINEUP_TOL, and a beam program never. The replay keeps
+      // the oracle's own counters: the ground-run aim until the jump has fired,
+      // the first air aim for `turnAir` air ticks (or until a slime rebound),
+      // the second after — or a beam program's controls, tick for tick. None
+      // of the gates below apply: they fly the jumps the table knows, and this
+      // is one it does not.
+      let prog = (nextPoint as Move).program
+      // A LIVE program (found from the body as it stood, PhysicsSim.hopFrom)
+      // holds only from that state: once its replay is lost, it is spent.
+      if (prog !== null && prog !== undefined && prog.start !== undefined && progNode !== nextPoint) {
+        (nextPoint as Move).program = null
+        prog = null
+      }
+      if (prog !== null && prog !== undefined && !swimming) {
+        if (progNode !== nextPoint) {
+          progNode = nextPoint
+          progPhase = 0
+          progTick = 0
+          progFired = false
+          progAir = 0
+          progRebounds = 0
+          progLiveTries = 0
+          progRestX = Infinity
+          progRestZ = Infinity
+        }
+        cutTarget = null
+        hopHold = false
+        kernelHop = false
+        const grounded = (bot.entity as { onGround?: boolean }).onGround === true
+        let spent = false
+        // Up a climbable (improvement): the node comes up while the body is
+        // still on the ladder below the take-off — on the ladder's top edge,
+        // or (HopProgram.climb) hanging on it higher up. Climb to it, pressing
+        // into the ladder's wall. A hanging take-off is then HELD there (sneak
+        // and no keys: prismarine keeps a body on a ladder from sliding) and
+        // searched from the held body, as the rest near a ground start is.
+        if (progPhase === 0 && !grounded && !swimming) {
+          const feetB = bot.blockAt(p) as BlockLike | null
+          if (feetB !== null && (feetB.type === ladderId || feetB.type === vineId)) {
+            const wall = climbWall(feetB, p)
+            if (p.y < prog.sy - PROG_CLIMB_TOL && wall !== null) {
+              bot.look(Math.atan2(-wall[0], -wall[1]), 0, true)
+              bot.setControlState('forward', true)
+              bot.setControlState('back', false)
+              bot.setControlState('left', false)
+              bot.setControlState('right', false)
+              bot.setControlState('jump', false)
+              bot.setControlState('sprint', false)
+              bot.setControlState('sneak', false)
+              execBranch = 'prog-climb'
+              futile(swimming)
+              return
+            }
+            if (prog.climb === true) {
+              const v = bot.entity.velocity
+              const held = Math.hypot(v.x, v.z) < 0.003 && v.y <= 0
+              if (kernelTakeoff && progLiveTries < PROG_LIVE_TRIES && (progLiveTries === 0 || held)) {
+                progLiveTries++
+                if (cachedLut !== null) physics.setShapeTables?.(cachedLut)
+                let live = held ? (physics.hopAnchored?.((nextPoint as Move).cell, prog) ?? null) : null
+                takeoffNote = held ? (physics.hopNote ?? '') : ''
+                if (live === null) {
+                  live = physics.hopFrom?.((nextPoint as Move).cell, TAKEOFF_SEARCH_MS) ?? null
+                  takeoffNote += (takeoffNote !== '' ? ' | ' : '') + (physics.hopNote ?? '')
+                }
+                if (takeoffLive(live)) return
+              }
+              if (progLiveTries >= PROG_LIVE_TRIES && held) {
+                spent = true // held at the take-off, and nothing flies from here
+              } else {
+                bot.setControlState('forward', false)
+                bot.setControlState('back', false)
+                bot.setControlState('left', false)
+                bot.setControlState('right', false)
+                bot.setControlState('jump', false)
+                bot.setControlState('sprint', false)
+                bot.setControlState('sneak', true)
+                execBranch = 'prog-hold'
+                futile(swimming)
+                return
+              }
+            }
+          }
+        }
+        if (spent) {
+          // (the hold's verdict: the node goes back to the ordinary logic below)
+        } else if (progPhase === 0) {
+          const ex = prog.sx - p.x
+          const ez = prog.sz - p.z
+          const d = Math.hypot(ex, ez)
+          const v = bot.entity.velocity
+          const atRest = grounded && Math.hypot(v.x, v.z) < 0.003
+          // A live program from the body as it is needs no line-up at all:
+          // tried as the node comes up, and at each new rest near the start
+          // (a press moves the rest point PROG_PRESS_SHIFT, three times the
+          // tolerance, so a line-up can end just outside it for good).
+          // (a beam program — HopProgram.seq, precision work — is only ever
+          // re-derived live: from the lined-up rest too, never replayed)
+          const beamPlan = prog.seq !== undefined
+          const newRest = atRest && d <= PROG_LIVE_NEAR && Math.hypot(p.x - progRestX, p.z - progRestZ) > 0.005
+          if (kernelTakeoff && grounded && progLiveTries < PROG_LIVE_TRIES && (progLiveTries === 0 || newRest)) {
+            progLiveTries++
+            if (atRest) { progRestX = p.x; progRestZ = p.z }
+            if (cachedLut !== null) physics.setShapeTables?.(cachedLut)
+            // at a rest near the start: the plan itself, re-anchored at the
+            // exact state (no search at all); then a search from here
+            let live = newRest ? (physics.hopAnchored?.((nextPoint as Move).cell, prog) ?? null) : null
+            takeoffNote = newRest ? (physics.hopNote ?? '') : ''
+            if (live === null) {
+              live = physics.hopFrom?.((nextPoint as Move).cell, beamPlan && newRest ? TAKEOFF_REST_BEAM_MS : TAKEOFF_SEARCH_MS) ?? null
+              takeoffNote += (takeoffNote !== '' ? ' | ' : '') + (physics.hopNote ?? '')
+            }
+            if (takeoffLive(live)) return
+          }
+          if (beamPlan && d <= PROG_LINEUP_TOL && atRest) {
+            spent = true // lined up, and no live program from here: the plan does not hold
+          } else if (d <= PROG_LINEUP_TOL && atRest) {
+            progPhase = 1
+            progTick = 0
+            lastNodeTime = performance.now()
+          } else {
+            // lining up: at a walk from afar, sneaking (the edge guard on)
+            // within PROG_SNEAK_ZONE. A body let go coasts PROG_COAST ticks of
+            // its velocity to rest; sneaking, press only while that rest point
+            // misses the tolerance AND one press (PROG_PRESS_SHIFT toward the
+            // start) brings it closer — pressing on a nearer miss overshoots,
+            // and the body hunts round the point without ever coming to rest
+            if (d > 1e-3) bot.look(Math.atan2(-ex, -ez), 0, true)
+            const sneakZone = d < PROG_SNEAK_ZONE
+            let press = !sneakZone
+            if (sneakZone && d > 1e-3) {
+              const rx = p.x + v.x * PROG_COAST - prog.sx
+              const rz = p.z + v.z * PROG_COAST - prog.sz
+              const miss = Math.hypot(rx, rz)
+              press = miss > PROG_LINEUP_TOL &&
+                Math.hypot(rx + (ex / d) * PROG_PRESS_SHIFT, rz + (ez / d) * PROG_PRESS_SHIFT) < miss
+            }
+            bot.setControlState('forward', press)
+            bot.setControlState('back', false)
+            bot.setControlState('left', false)
+            bot.setControlState('right', false)
+            bot.setControlState('jump', false)
+            bot.setControlState('sprint', false)
+            bot.setControlState('sneak', sneakZone)
+            execBranch = 'prog-lineup'
+            futile(swimming)
+            return
+          }
+        } else {
+          // Down on the LAST node over its edge (progLanded: the goal is its
+          // cell): settle into the cell — toward the column's centre, sneaking,
+          // the edge guard holding the body on the block — and the arrival
+          // retires it. (Not a rebound: that tick is the flight's own.)
+          if (progFired && grounded && path.length === 1 && bot.entity.velocity.y <= 0.05 &&
+              Math.abs(p.x - prog.tx - 0.5) < 0.8 - LAND_OVERLAP && Math.abs(p.z - prog.tz - 0.5) < 0.8 - LAND_OVERLAP &&
+              p.y >= prog.ty - 1.001 && p.y < prog.ty + 1) {
+            bot.look(Math.atan2(-(prog.tx + 0.5 - p.x), -(prog.tz + 0.5 - p.z)), 0, true)
+            bot.setControlState('forward', true)
+            bot.setControlState('back', false)
+            bot.setControlState('left', false)
+            bot.setControlState('right', false)
+            bot.setControlState('jump', false)
+            bot.setControlState('sprint', false)
+            bot.setControlState('sneak', true)
+            execBranch = 'prog-settle'
+            futile(swimming)
+            return
+          }
+          // the state after the last replayed tick (HopOracle.advance's
+          // order: the jump registers on the tick it fires, air ticks after
+          // it). A touchdown the arrival check did not retire came down off
+          // the node, and a jump held this long without firing is blocked:
+          // either way this is no longer the verified flight, and the node
+          // goes back to the ordinary logic.
+          if (!progFired) {
+            const vy = bot.entity.velocity.y
+            // (HopOracle.tickFlight: off a climbable, the body leaving it is the take-off)
+            const feetB = prog.climb === true && !grounded ? bot.blockAt(p) as BlockLike | null : null
+            const onClimb = feetB !== null && (feetB.type === ladderId || feetB.type === vineId)
+            if (vy > 0.3 || (!grounded && vy < -0.3) || (prog.climb === true && !grounded && !onClimb)) progFired = true
+            else if (prog.seq === undefined && progTick > prog.jumpAt + PROG_JUMP_GRACE && !onClimb) spent = true
+          } else if (prog.seq === undefined) {
+            progAir++
+            if (grounded) {
+              const under = bot.blockAt(p.offset(0, -0.2, 0)) as { name?: string } | null
+              if (bot.entity.velocity.y > 0.05 && under !== null && under.name === 'slime_block') progRebounds++
+              else spent = true
+            }
+          }
+          // a beam program touches down and goes on (its legs): spent only
+          // once its controls have run out short of the landing
+          if (prog.seq !== undefined && progTick > (prog.seq.length >> 1) + PROG_JUMP_GRACE) spent = true
+        }
+        if (spent) {
+          (nextPoint as Move).program = null
+          progNode = null
+        } else {
+          replayProgramTick(prog, p)
+          execBranch = 'prog'
           futile(swimming)
           return
         }
@@ -2633,6 +3248,12 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       // solver's offset is measured from the heading to path[0], so adding it
       // to a heading aimed several nodes further on would fly the jump at
       // something nobody solved for.
+      // Narrow landing? Looked up once per parkour node: the air-controlled
+      // take-off gate and the in-flight landing control both key on it.
+      if ((nextPoint as Move).parkour && (nextPoint as Move).narrowLanding === null) {
+        const sup = bot.blockAt(new Vec3(Math.floor(nextPoint.x), Math.floor(nextPoint.y - 0.01), Math.floor(nextPoint.z))) as BlockLike | null
+        ;(nextPoint as Move).narrowLanding = sup !== null && sup.shapes.length > 0 && topCatchClass(sup.shapes) !== 0
+      }
       const nodeDx = dx
       const nodeDz = dz
       // Only where a swept hitbox is the WHOLE story. Exclusion areas and
@@ -2933,23 +3554,161 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       // edge, worked; the west→south one, steered diagonally from a low
       // catch, left the cell at 261.6 and fell.
       let climbing = false
-      if (nextPoint.y > p.y + 0.1) {
+      /** Moving along a ladder wall this tick: the heading below is driven directly, not through the gates. */
+      let traverse = false
+      /** Letting go to slide down the ladder to a node below (no forward, no sneak). */
+      let descend = false
+      /** Jumping up into a ladder that starts at head height (moveGen.moveUp's head-height entry). */
+      let jumpInto = false
+      {
         const feet = bot.blockAt(p) as BlockLike | null
-        const hanging = (bot.entity as { onGround?: boolean }).onGround !== true
-        const straightUp = Math.abs(nodeDx) < 0.2 && Math.abs(nodeDz) < 0.2
-        if (feet && (feet.type === ladderId || feet.type === vineId) &&
-            (straightUp || (hanging && nextPoint.y > p.y + 0.3))) {
-          const fx = Math.floor(p.x)
-          const fy = Math.floor(p.y + 0.001)
-          const fz = Math.floor(p.z)
-          for (const [ox, oz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
-            const nb = bot.blockAt(new Vec3(fx + ox, fy, fz + oz)) as BlockLike | null
-            if (nb && nb.boundingBox === 'block') {
-              dx = ox
-              dz = oz
-              climbing = true
-              break
+        const head = bot.blockAt(p.offset(0, 1, 0)) as BlockLike | null
+        if (feet && feet.type !== ladderId && feet.type !== vineId &&
+            head && (head.type === ladderId || head.type === vineId) &&
+            (bot.entity as { onGround?: boolean }).onGround === true &&
+            Math.abs(nodeDx) < 0.35 && Math.abs(nodeDz) < 0.35 && nextPoint.y > p.y + 0.5 && nextPoint.y < p.y + 1.6) {
+          // The ladder is one up: jump into it pressing at its wall, so the
+          // first airborne tick already has the horizontal collision that
+          // climbs. Driven directly — the jump gates steer at a node with no
+          // horizontal offset and drift off the column.
+          const wall = climbWall(head, p.offset(0, 1, 0))
+          if (wall !== null) {
+            dx = wall[0]
+            dz = wall[1]
+            climbing = true
+            traverse = true
+            jumpInto = true
+          }
+        } else if (feet && (feet.type === ladderId || feet.type === vineId)) {
+          const hanging = (bot.entity as { onGround?: boolean }).onGround !== true
+          const straightUp = Math.abs(nodeDx) < 0.2 && Math.abs(nodeDz) < 0.2
+          const wall = climbWall(feet, p)
+          // Along a ladder WALL (improvement): the next node is another cell
+          // of the same wall, level or higher, off to the side. A body that
+          // only presses into the wall climbs on the spot (and under a beam,
+          // presses into the beam); one that only walks sideways leaves the
+          // wall and slides down 0.15 a tick. Both at once is what a player
+          // does: forward into the wall keeps the climb (or the hold, under
+          // a ceiling), the sideways component moves along the ladders at
+          // the ladder's 0.15-a-tick clamp. Only the SAME wall: a transfer
+          // round a pillar corner (parkouradv1's spiral) has its next ladder
+          // on a perpendicular face, and that one is climbed to the top edge
+          // and stepped round, as before.
+          // The node's aim sits inside the ladder's own panel (upstream's
+          // averaged point), half a body short of where the body can be, so
+          // the into-wall part of the step is never closed and must not be
+          // steered on: split the step into its along-wall and into-wall
+          // parts and use the first. A large into-wall part is a node on
+          // another face (round a corner), not this wall.
+          const perp = nodeDx * (wall?.[0] ?? 0) + nodeDz * (wall?.[1] ?? 0)
+          const latX = nodeDx - perp * (wall?.[0] ?? 0)
+          const latZ = nodeDz - perp * (wall?.[1] ?? 0)
+          const lat = Math.hypot(latX, latZ)
+          // Not while the body can still CLIMB toward a node above it: that
+          // is the ordinary climb-and-drift transfer (press in, jump held),
+          // which the gates fly faster than a hanging traverse — measured on
+          // parkouradv1, two traverse ticks there cost 0.15 of height and
+          // two ticks of the run. The traverse is for a body that cannot
+          // rise: level with its node, or pinned under a ceiling.
+          let canRise = nextPoint.y > p.y + 0.3
+          if (canRise) {
+            const hb = bot.blockAt(new Vec3(Math.floor(p.x), Math.floor(p.y + 2.0), Math.floor(p.z))) as BlockLike | null
+            canRise = !(hb !== null && hb.type !== ladderId && hb.type !== vineId && hb.shapes.length > 0)
+          }
+          if (wall !== null && hanging && !canRise && lat >= 0.35 && Math.abs(perp) <= 0.55) {
+            const nx = Math.floor(nextPoint.x)
+            const nz = Math.floor(nextPoint.z)
+            const ny = Math.floor(nextPoint.y + 0.001)
+            const isClimb = (xx: number, yy: number, zz: number): boolean => {
+              const nb = bot.blockAt(new Vec3(xx, yy, zz)) as BlockLike | null
+              return nb !== null && (nb.type === ladderId || nb.type === vineId)
             }
+            if (isClimb(nx, ny, nz) || isClimb(nx, ny - 1, nz)) {
+              // The column the body would move INTO has to hold a ladder it
+              // can hang from: at its current height for a level or rising
+              // transfer — where the next column's ladders start higher up
+              // (mcc-4-3: 285 beside a column that runs 279..286), a body
+              // sliding across at 284.9 leaves the wall into air, so it
+              // climbs straight first — or anywhere between its height and
+              // the node's for a descending one, which drops into it.
+              const fy = Math.floor(p.y + 0.001)
+              const sx = Math.floor(p.x + latX / lat * 0.6)
+              const sz = Math.floor(p.z + latZ / lat * 0.6)
+              // The body has to FIT beside: nothing solid in the side column
+              // over its whole height (under a step in the wall the head
+              // cell beside is stone until the feet are a block lower), and
+              // a ladder to hang from — at the feet, or for a descending
+              // transfer anywhere down to the node, which it drops into.
+              let fits = true
+              for (let yy = fy; fits && yy <= Math.floor(p.y + 1.8); yy++) {
+                const nb = bot.blockAt(new Vec3(sx, yy, sz)) as BlockLike | null
+                if (nb !== null && nb.type !== ladderId && nb.type !== vineId && nb.shapes.length > 0) fits = false
+              }
+              let hang = isClimb(sx, fy, sz)
+              for (let yy = fy - 1; !hang && nextPoint.y < p.y - 0.3 && yy >= ny; yy--) hang = isClimb(sx, yy, sz)
+              // Height is held by the wall press: pressing climbs 0.2 a tick
+              // (or holds, under a ceiling), not pressing slides 0.15 a tick
+              // down the ladder. Press below the node's height, let go above
+              // it: the body hovers within a fifth of a block of the node
+              // while it moves along — under a ceiling pinned to it, under a
+              // step held low enough to pass.
+              const press = p.y < nextPoint.y - 0.05
+              if (fits && hang) {
+                dx = latX / lat + (press ? wall[0] * CLIMB_PRESS : 0)
+                dz = latZ / lat + (press ? wall[1] * CLIMB_PRESS : 0)
+                climbing = true
+                traverse = true
+              } else if (nextPoint.y < p.y - 0.3) {
+                // The wall steps DOWN here: the next column is solid at this
+                // height and ladders lower (mcc-4-3: stone at 285 beside a
+                // ladder at 284). Moving across now presses into the stone,
+                // which climbs; let go and slide until the body fits beside.
+                dx = -wall[0]
+                dz = -wall[1]
+                climbing = true
+                traverse = true
+                descend = true
+              } else if (nextPoint.y > p.y - 0.1) {
+                dx = wall[0]
+                dz = wall[1]
+                climbing = true
+                traverse = true
+              }
+            }
+          }
+          if (!traverse && wall !== null && nextPoint.y > p.y + 0.1 &&
+              (straightUp || (hanging && nextPoint.y > p.y + 0.3))) {
+            dx = wall[0]
+            dz = wall[1]
+            climbing = true
+            // Kept in the column (improvement): a catch comes in with speed
+            // along the wall, and a press into it alone lets that speed carry
+            // the body out of the ladder's cell — it slides off, falls a
+            // block and catches again (tenways-slime-way's south-west ladder:
+            // 15 ticks). Steer against where the drift is taking it: the
+            // along-wall speed coasts CLIMB_DRIFT times itself, measured
+            // against the node's along-wall offset.
+            if (hanging) {
+              const v = bot.entity.velocity
+              const ax = wall[1] !== 0 ? 1 : 0
+              const az = wall[0] !== 0 ? 1 : 0
+              const along = nodeDx * ax + nodeDz * az - (v.x * ax + v.z * az) * CLIMB_DRIFT
+              if (Math.abs(along) > CLIMB_HOLD) {
+                dx += ax * Math.sign(along)
+                dz += az * Math.sign(along)
+              }
+            }
+          }
+          // Down a ladder (improvement): the node is below in this column.
+          // Nothing pressed, a hanging body slides down at 0.15 a tick; the
+          // sneak the catch branch would otherwise hold it with is what kept
+          // the arena's mcc-4-3 bot pinned under the beam above the step-down.
+          if (!traverse && !climbing && hanging && wall !== null && lat < 0.35 && nextPoint.y < p.y - 0.3) {
+            dx = -wall[0]
+            dz = -wall[1]
+            climbing = true
+            traverse = true
+            descend = true
           }
         }
       }
@@ -3039,9 +3798,12 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       const slideDz = slideLive ? dz : nodeDz
       if (!climbing && (nextPoint as { parkour?: boolean }).parkour !== true &&
           dy <= STEP_UP_MIN && (slideLive || Math.hypot(nodeDx, nodeDz) <= WALK_STEP_REACH)) {
+        // (plain steps too: down a one-wide tunnel a lateral part of 0.01
+        // picked a wall to probe, and the standoff steered 14° into the
+        // other one — arena tunnel1, a hop pressed against it, +2.3 s)
         const slideLen = Math.hypot(slideDx, slideDz) || 1
-        const sx = slideLive && Math.abs(slideDx) / slideLen < SLIDE_AXIS_MIN ? 0 : Math.sign(slideDx)
-        const sz = slideLive && Math.abs(slideDz) / slideLen < SLIDE_AXIS_MIN ? 0 : Math.sign(slideDz)
+        const sx = Math.abs(slideDx) / slideLen < SLIDE_AXIS_MIN ? 0 : Math.sign(slideDx)
+        const sz = Math.abs(slideDz) / slideLen < SLIDE_AXIS_MIN ? 0 : Math.sign(slideDz)
         const xBlocked = sx !== 0 && geometry.playerCollides(bot, p.x + sx * SLIDE_PROBE, p.y, p.z)
         const zBlocked = sz !== 0 && geometry.playerCollides(bot, p.x, p.y, p.z + sz * SLIDE_PROBE)
         // The standoff is a fraction of the ALONG-wall component, and it
@@ -3113,6 +3875,268 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         return
       }
       if (biasFlight && (bot.entity as { onGround?: boolean }).onGround === true) biasFlight = false
+
+      // Scripted jump (improvement, PhysicsSim.solveJump). A parkour node no
+      // gate will authorise — a neo that has to wrap round its pillar, a
+      // landing that only a mid-air turn reaches — leaves the body standing
+      // at its take-off. After a few ticks of that, search the physics sim
+      // for a control script that lands it, from exactly where the body
+      // stands; replay it tick for tick, holding the body to the predicted
+      // track, and hand back to the ordinary logic the moment it strays.
+      if (jumpScript !== null && jumpScriptNode !== nextPoint) jumpScript = null
+      // (the exact kernel first: takeoffLive above; the scripted search last)
+      if (jumpScript === null && JUMP_SOLVER && physics.solveJump !== undefined && !climbing && !swimming &&
+          (nextPoint as { parkour?: boolean }).parkour === true &&
+          (bot.entity as { onGround?: boolean }).onGround === true && jumpSolveFailedNode !== nextPoint) {
+        const v = bot.entity.velocity
+        const speed = Math.hypot(v.x, v.z)
+        // A NEO (Move.wOff) is never flown by the gates — what lands it is a
+        // run along its pillar's face (PhysicsSim.solveJump) — so the body is
+        // stopped where it arrived and the search starts at once.
+        const neo = (nextPoint as Move).wOff !== 0
+        if (neo && kernelTakeoff && takeoffSearched !== nextPoint) {
+          // on arrival: a program from the moving body takes off without a stop
+          takeoffSearched = nextPoint
+          takeoffSearchedAtRest = speed < 0.01
+          if (cachedLut !== null) physics.setShapeTables?.(cachedLut)
+          const live = physics.hopFrom?.((nextPoint as Move).cell, TAKEOFF_SEARCH_MS) ?? null
+          takeoffNote = physics.hopNote ?? ''
+          if (takeoffLive(live)) return
+        }
+        if (neo && speed >= 0.01) {
+          bot.setControlState('forward', false)
+          bot.setControlState('back', false)
+          bot.setControlState('jump', false)
+          bot.setControlState('sprint', false)
+          bot.setControlState('sneak', true)
+          jumpStillTicks = 0
+          execBranch = 'solve-brake'
+          futile(swimming)
+          return
+        }
+        jumpStillTicks = speed < 0.035 ? jumpStillTicks + 1 : 0
+        // The search is the LAST resort: a body merely standing still is not
+        // stuck, it is lining up, and every ordinary take-off — the creep, the
+        // run-up, the angled escape — is cheaper than searching for a script
+        // that reproduces it. So a non-neo node waits for the body to count as
+        // WEDGED, not merely still: starting at SCRIPT_STILL_TICKS (6)
+        // preempted mechanisms that unlock at WEDGE_TICKS (12) and then spent
+        // ~37 ticks re-deriving a jump the executor already knew how to fly —
+        // 1.9 s on paradise3-l49's node 4, and 2.2 s on parkouradv1, whose
+        // runs that never reached the search matched the old build tick for
+        // tick. A neo is never flown by the gates, so it still brakes straight
+        // into the search.
+        if (neo || (wedged && jumpStillTicks >= SCRIPT_STILL_TICKS)) {
+          // Once wedged, the angled take-off still gets the tick before the
+          // search does.
+          if (!neo && !squeezed && wedged && driveAngledJump(nextPoint, nodeDx, nodeDz)) {
+            execBranch = 'angled'
+            futile(swimming)
+            return
+          }
+          // the search and the script it finds get a fresh futility clock
+          if (jumpStillTicks === SCRIPT_STILL_TICKS || (neo && jumpSolveStartNode !== nextPoint)) {
+            jumpSolveStartNode = nextPoint
+            lastNodeTime = performance.now()
+          }
+          if (kernelTakeoff && !(takeoffSearched === nextPoint && takeoffSearchedAtRest)) {
+            takeoffSearched = nextPoint
+            takeoffSearchedAtRest = true
+            if (cachedLut !== null) physics.setShapeTables?.(cachedLut)
+            const live = physics.hopFrom?.((nextPoint as Move).cell, TAKEOFF_SEARCH_MS) ?? null
+            takeoffNote = physics.hopNote ?? ''
+            if (takeoffLive(live)) return
+          }
+          // (once per node, whether or not the live search ran this tick)
+          if (kernelTakeoff && linedSearched !== nextPoint) {
+            linedSearched = nextPoint
+            const lined = physics.hopLinedUp?.((nextPoint as Move).cell, TAKEOFF_LINED_MS) ?? null
+            takeoffNote += ' | ' + (physics.hopNote ?? '')
+            if (lined !== null) {
+              // the program branch lines the body up on its start from the next tick
+              ;(nextPoint as Move).program = lined
+              progNode = null
+              jumpStillTicks = 0
+              lastNodeTime = performance.now()
+              bot.setControlState('forward', false)
+              bot.setControlState('back', false)
+              bot.setControlState('jump', false)
+              bot.setControlState('sprint', false)
+              bot.setControlState('sneak', true)
+              execBranch = 'takeoff-lined'
+              futile(swimming)
+              return
+            }
+            // Every family flown to the end from the take-off cell and none
+            // lands (improvement): a table jump the physics refuses. Given up
+            // now — the landing banned, a re-solve — rather than after the
+            // old search and the run-ups reach the same verdict (8-1's strip
+            // past a post: 78 ticks of them before the lip wait gave it up).
+            if (physics.hopExhausted === true && prevRetired !== null &&
+                Math.floor(prevRetired.x) === Math.floor(p.x) && Math.floor(prevRetired.z) === Math.floor(p.z)) {
+              banTakeoff(nextPoint)
+              execBranch = 'giveup'
+              resetPath('stuck', true)
+              return
+            }
+          }
+          const found = physics.solveJump(nextPoint, SCRIPT_BUDGET)
+          if (found === undefined) {
+            // searching: hold still (the search is from exactly here)
+            bot.setControlState('forward', false)
+            bot.setControlState('back', false)
+            bot.setControlState('jump', false)
+            bot.setControlState('sprint', false)
+            bot.setControlState('sneak', true)
+            execBranch = 'solving'
+            futile(swimming)
+            return
+          }
+          jumpStillTicks = 0
+          if (found === null) {
+            jumpSolveFailedNode = nextPoint
+          } else {
+            jumpScript = found
+            jumpScriptNode = nextPoint
+            jumpScriptTick = 0
+            jumpScriptAir = 0
+            lastNodeTime = performance.now()
+          }
+        }
+      } else {
+        jumpStillTicks = 0
+      }
+
+      if (jumpScript !== null) {
+        const want = jumpScriptTick > 0 ? jumpScript.track[jumpScriptTick - 1] : null
+        const strayed = want !== null && want !== undefined &&
+          Math.hypot(want.x - p.x, want.y - p.y, want.z - p.z) > SCRIPT_TRACK_TOL
+        if (strayed || jumpScriptTick >= jumpScript.ticks) {
+          if (process.env.PF_SCRIPT_DEBUG === '1') console.warn(`[script] ${strayed ? 'STRAYED' : 'done'} at tick ${jumpScriptTick}/${jumpScript.ticks}: want ${want !== null && want !== undefined ? `${want.x.toFixed(3)},${want.y.toFixed(3)},${want.z.toFixed(3)}` : '-'} is ${p.x.toFixed(3)},${p.y.toFixed(3)},${p.z.toFixed(3)} (yawA ${jumpScript.yawA.toFixed(2)} yawB ${jumpScript.yawB.toFixed(2)} turn ${jumpScript.turnTick} ja ${jumpScript.jumpAfter} sprint ${String(jumpScript.sprint)})`)
+          jumpScript = null
+        } else {
+          const onGroundNow = (bot.entity as { onGround?: boolean }).onGround === true
+          if (jumpScriptAir > 0 || (!onGroundNow && bot.entity.velocity.y > 0)) jumpScriptAir++
+          const turned = jumpScriptAir > jumpScript.turnTick
+          bot.look(turned ? jumpScript.yawB : jumpScript.yawA, 0, true)
+          bot.setControlState('forward', true)
+          bot.setControlState('back', false)
+          bot.setControlState('left', false)
+          bot.setControlState('right', false)
+          bot.setControlState('sneak', false)
+          bot.setControlState('sprint', jumpScript.sprint)
+          bot.setControlState('jump', jumpScriptAir === 0 && jumpScriptTick >= jumpScript.jumpAfter)
+          jumpScriptTick++
+          execBranch = 'script'
+          futile(swimming)
+          return
+        }
+      }
+      // In-flight landing control (improvement, PhysicsSim.airControl): a
+      // body in the air toward a parkour node holds forward + sprint, as it
+      // always has, for as long as that comes down on the node. Where it
+      // would not — a pane post four blocks out, a bar across the flight —
+      // it holds what does: forward without sprint, nothing, or back.
+      if (airborne && !climbing && !swimming && (nextPoint as { parkour?: boolean }).parkour === true &&
+          physics.airControl !== undefined && AIR_CONTROL) {
+        // Narrow landing supports only: a full block has ground to overrun,
+        // and braking onto its middle would only slow the run.
+        if (airNode !== nextPoint) {
+          airNode = nextPoint
+          airEngaged = false
+          airNarrow = (nextPoint as Move).narrowLanding === true
+        }
+        let air: { forward: boolean, back: boolean, sprint: boolean } | null = null
+        if (airNarrow) {
+          const r = physics.airControl(nextPoint, airEngaged)
+          airEngaged = r.engaged
+          air = r.control
+        }
+        if (air !== null) {
+          bot.look(Math.atan2(-dx, -dz), 0)
+          bot.setControlState('forward', air.forward)
+          bot.setControlState('back', air.back)
+          bot.setControlState('sprint', air.sprint)
+          bot.setControlState('jump', false)
+          bot.setControlState('sneak', false)
+          bot.setControlState('left', false)
+          bot.setControlState('right', false)
+          execBranch = 'aircontrol'
+          futile(swimming)
+          return
+        }
+      }
+
+      // A hop the kernel chose (hopIntoJumpBetter) is flown the way the
+      // kernel flew it — at the next node, forward and sprint held, nothing
+      // else — until it touches down. The cascade below re-decides a body in
+      // the air with rollouts of its own (a walk-angled heading, a straight
+      // line refused mid-arc) and flies a different arc from the one that was
+      // judged: traced on the arena's basic3, the hop came down past its walk
+      // node, turned back for it and lost the take-off to a line-up.
+      if (kernelHop) {
+        if ((bot.entity as { onGround?: boolean }).onGround === true || climbing || swimming) {
+          kernelHop = false
+        } else {
+          bot.look(Math.atan2(-nodeDx, -nodeDz), 0)
+          bot.setControlState('forward', true)
+          bot.setControlState('back', false)
+          bot.setControlState('left', false)
+          bot.setControlState('right', false)
+          bot.setControlState('sneak', false)
+          bot.setControlState('jump', false)
+          bot.setControlState('sprint', true)
+          execBranch = 'khop'
+          futile(swimming)
+          return
+        }
+      }
+
+      // Along a ladder wall the heading was decided above; the gates below
+      // reason about walking and jumping from the ground and would only
+      // refuse it (and fall through to a sneak that holds the body still).
+      if (traverse) {
+        bot.look(Math.atan2(-dx, -dz), 0)
+        bot.setControlState('forward', !descend)
+        bot.setControlState('back', false)
+        bot.setControlState('sneak', false)
+        bot.setControlState('sprint', false)
+        bot.setControlState('jump', jumpInto)
+        execBranch = jumpInto ? 'jumpinto' : descend ? 'descend' : 'traverse'
+        futile(swimming)
+        return
+      }
+
+      // Shifted flight line (Move.takeoff, planner META_SHIFT): the jump was
+      // planned a hitbox-width beside the centre line, so the body walks to
+      // the shifted take-off point first — at a sneak once close, the point
+      // is 0.15 from the lip of its block — and only then does the creep /
+      // run-up / gate machinery below see a body on the line that was
+      // checked. Not re-entered once the body is well along the line.
+      {
+        const shiftTo = (nextPoint as Move).takeoff
+        if (shiftTo !== null && shiftTo !== undefined && !climbing && !swimming &&
+            (bot.entity as { onGround?: boolean }).onGround === true) {
+          const ex = p.x - shiftTo.x
+          const ez = p.z - shiftTo.z
+          const lx = nextPoint.x - shiftTo.x
+          const lz = nextPoint.z - shiftTo.z
+          const ll = Math.hypot(lx, lz)
+          const lat = ll > 1e-6 ? Math.abs(ex * lz - ez * lx) / ll : Math.hypot(ex, ez)
+          const along = ll > 1e-6 ? (ex * lx + ez * lz) / ll : 0
+          if (lat > SHIFT_LINE_TOL && along < 0.3) {
+            bot.look(Math.atan2(ex, ez), 0)
+            bot.setControlState('forward', true)
+            bot.setControlState('back', false)
+            bot.setControlState('jump', false)
+            bot.setControlState('sprint', false)
+            bot.setControlState('sneak', Math.hypot(ex, ez) < 0.7)
+            execBranch = 'shift'
+            futile(swimming)
+            return
+          }
+        }
+      }
 
       if (!squeezed && wedged) {
         if (driveAngledJump(nextPoint, nodeDx, nodeDz)) { execBranch = 'angled'; futile(swimming); return }
@@ -3190,6 +4214,15 @@ export function createPathfinder (options: PathfinderOptions = {}) {
             (v.x * dx + v.z * dz) / (speed * head) < HOP_TURN_COS
           hopHold = stateMovements.allowSprintHop && !turning &&
             physics.sprintHopBetter(gatePath, stateMovements.allowLowCeilingHop)
+          // A jump ahead is where the gait above gives up (its rollout cannot
+          // fly the jump); the kernel flies both policies through it and the
+          // hop is taken only where it lands the jump sooner (allowHopIntoJump).
+          if (!hopHold && stateMovements.allowSprintHop && stateMovements.allowHopIntoJump && !turning &&
+              physics.hopRefusal === 'jump-ahead' && physics.hopIntoJumpBetter !== undefined) {
+            if (cachedLut !== null) physics.setShapeTables?.(cachedLut)
+            hopHold = physics.hopIntoJumpBetter(gatePath)
+            kernelHop = hopHold
+          }
         }
         // PRESS on the landing tick, never hold. prismarine-physics charges a
         // held jump key a 10-tick re-jump cooldown (`autojumpCooldown`) and
@@ -3233,6 +4266,20 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         execBranch = 'walkjump'
       } else {
         hopHold = false
+        // No gate flies this take-off: the exact kernel first (improvement),
+        // once per node, from the body as it is — on arrival, moving, a
+        // take-off with no stop at all; the line-up below is the fallback
+        // (8-1's diagonal off a strip: 33 ticks of creep and lip wait before
+        // the angled escape found a jump).
+        if (kernelTakeoff && (nextPoint as { parkour?: boolean }).parkour === true && !climbing && !swimming &&
+            (bot.entity as { onGround?: boolean }).onGround === true && takeoffSearched !== nextPoint) {
+          takeoffSearched = nextPoint
+          takeoffSearchedAtRest = Math.hypot(bot.entity.velocity.x, bot.entity.velocity.z) < 0.01
+          if (cachedLut !== null) physics.setShapeTables?.(cachedLut)
+          const live = physics.hopFrom?.((nextPoint as Move).cell, TAKEOFF_SEARCH_MS) ?? null
+          takeoffNote = physics.hopNote ?? ''
+          if (takeoffLive(live)) return
+        }
         // Improvement: creep to the takeoff CORNER before a standing parkour
         // jump. The sims above test jump-now from the CURRENT position; a
         // player walks to the lip first — for diagonal pillar hops all the
@@ -3253,6 +4300,11 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         let takeoffPx = 0
         let takeoffPz = 0
         let takeoffLip = Infinity
+        /** The take-off support's carrying faces (empty when unknown) and how far back along the flight line it carries the body. */
+        let takeoffFaces: geometry.FaceRect[] = []
+        let takeoffRear = 0
+        /** A support too thin along the flight line to be worth creeping on: the jump goes from where the body stands. */
+        let thinTakeoff = false
         const parkourNode = (nextPoint as { parkour?: boolean }).parkour === true
         const grounded = (bot.entity as { onGround?: boolean }).onGround === true
         if (creepNode !== nextPoint) {
@@ -3283,8 +4335,6 @@ export function createPathfinder (options: PathfinderOptions = {}) {
                 : p
               creepCell = { x: Math.floor(anchor.x), z: Math.floor(anchor.z) }
             }
-            const px = p.x - (creepCell.x + 0.5)
-            const pz = p.z - (creepCell.z + 0.5)
             // On a narrow support (fence post, head, pot) the lip is closer:
             // the same reduced credit the planner used (parkourEnvelope.ts).
             // Without the cap the sneak guard stops the body at the post's
@@ -3293,14 +4343,50 @@ export function createPathfinder (options: PathfinderOptions = {}) {
             // feet − 0.2 like the physics does, then one lower, because a
             // fence's 1.5 top pokes into the cell above its own.
             let half = 0.5
+            let faces: geometry.FaceRect[] = []
             for (const oy of [-0.2, -1.2]) {
-              const sup = bot.blockAt(new Vec3(creepCell.x, Math.floor(p.y + oy), creepCell.z)) as BlockLike | null
+              const sy = Math.floor(p.y + oy)
+              const sup = bot.blockAt(new Vec3(creepCell.x, sy, creepCell.z)) as BlockLike | null
               if (sup !== null && sup.shapes.length > 0) {
                 half = CATCH_HALF[topCatchClass(sup.shapes)]
+                faces = geometry.supportFaces(bot, creepCell.x, sy, creepCell.z)
                 break
               }
             }
             takeoffHalf = half
+            // Where the creep is measured from (improvement, off-centre
+            // supports). The class model puts a support's carrying width
+            // symmetrically round the CELL centre, which a post, a head, a
+            // pot or a slab is. An open trapdoor's panel is a 3/16 strip at
+            // the cell's edge, a ladder's top its wall-side strip, a pane
+            // line 2/16 through the middle: measured from the centre those
+            // are wrong by up to 0.4, and the lip the class model computes
+            // is in the air (arena mcc-2-2: crept to x .30 for a panel at
+            // .81..1 and fell). Where the cell centre is not carried at all,
+            // measure from the point the body IS carried at — the retired
+            // node's aim, which postProcessPath put on the face — and let
+            // the real faces say where the hitbox leaves them. A centred
+            // support gets the class model's numbers exactly.
+            let ox = creepCell.x + 0.5
+            let oz = creepCell.z + 0.5
+            if (faces.length > 0 && !geometry.supportedAt(bot, faces, ox, oz) &&
+                prevRetired !== null && Math.floor(prevRetired.x) === creepCell.x && Math.floor(prevRetired.z) === creepCell.z &&
+                geometry.supportedAt(bot, faces, prevRetired.x, prevRetired.z)) {
+              ox = prevRetired.x
+              oz = prevRetired.z
+            }
+            // A shifted line (Move.takeoff) is measured from its own take-off point.
+            const shiftTo = (nextPoint as Move).takeoff
+            if (shiftTo !== null && shiftTo !== undefined) {
+              ox = shiftTo.x
+              oz = shiftTo.z
+            }
+            const px = p.x - ox
+            const pz = p.z - oz
+            const ux = dx / len
+            const uz = dz / len
+            /** Along-line distance per block of the widest axis: the planner's credits are per axis. */
+            const axisScale = len / Math.max(Math.abs(dx), Math.abs(dz))
             // Never past the support's PHYSICAL limit less a margin. The
             // planner's lip credit (TAKEOFF_NARROW_MARGIN, 0.28) is two
             // centimetres inside the 0.30 the hitbox can overhang — and a
@@ -3310,18 +4396,42 @@ export function createPathfinder (options: PathfinderOptions = {}) {
             // parkouradv1 (both a head and a post). The margin is more than
             // a sneaking tick moves, so a single unguarded tick stays on.
             const physicalLip = half + 0.3 - NARROW_LIP_SAFETY
-            takeoffCap = Math.min(TAKEOFF_STAND, half + TAKEOFF_NARROW_MARGIN, physicalLip) * len / Math.max(Math.abs(dx), Math.abs(dz))
+            let lipAlong = physicalLip * axisScale
+            let rearAlong = physicalLip
+            if (faces.length > 0) {
+              const fwd = geometry.supportReach(bot, faces, ox, oz, ux, uz)
+              if (fwd >= 0) lipAlong = fwd - NARROW_LIP_SAFETY * axisScale
+              const back = geometry.supportReach(bot, faces, ox, oz, -ux, -uz)
+              if (back >= 0) rearAlong = back / axisScale - NARROW_LIP_SAFETY
+            }
+            takeoffCap = Math.min(Math.min(TAKEOFF_STAND, half + TAKEOFF_NARROW_MARGIN) * axisScale, lipAlong)
             takeoffProj = (px * dx + pz * dz) / len
             takeoffPx = px
             takeoffPz = pz
+            takeoffFaces = faces
+            takeoffRear = rearAlong
             creep = takeoffProj < takeoffCap
+            // A 3/16 panel offers a tenth of a block of creep at most, and
+            // a sneaking body coasts about that far after the creep ends
+            // (arena mcc-2-2: crept to .59 for a cap at .59, coasted to .51,
+            // the hitbox's edge met the panel's edge and it fell). Not worth
+            // it: jump from where the body is carried, skip the run-back.
+            if (faces.length > 0 && lipAlong < THIN_CREEP_MIN) {
+              thinTakeoff = true
+              creep = false
+            }
             // On a narrow support the limit is PER AXIS: the projection on a
             // mostly-z flight line read 0.29 while the body's x offset was
             // already 0.56 — past the head's 0.55 of support (parkouradv1);
-            // the same for the back-off, which fell off the far side.
+            // the same for the back-off, which fell off the far side. With
+            // the faces known, "past the limit" is the hitbox no longer
+            // resting on them by the safety margin.
             if (half < 0.5) {
               takeoffLip = physicalLip
-              if (Math.abs(px) >= physicalLip || Math.abs(pz) >= physicalLip) creep = false
+              const off = faces.length > 0
+                ? !geometry.supportedAt(bot, faces, p.x, p.z, NARROW_LIP_SAFETY)
+                : Math.abs(px) >= physicalLip || Math.abs(pz) >= physicalLip
+              if (off) creep = false
             }
           }
         }
@@ -3456,7 +4566,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
           // Without allowRunUp this is the single run-back the executor
           // always had (phase 1 once, no sprint-in, no brake).
           const lineUp = stateMovements.allowRunUp
-          const maxAttempts = narrow || !lineUp ? 1 : (nextPoint as Move).run ? RUN_UP_ATTEMPTS : 1
+          const maxAttempts = thinTakeoff ? 0 : narrow || !lineUp ? 1 : (nextPoint as Move).run ? RUN_UP_ATTEMPTS : 1
           if (runUpPhase === 0 && runUpAttempts < maxAttempts) {
             runUpAttempts++
             runUpPhase = 1
@@ -3467,14 +4577,16 @@ export function createPathfinder (options: PathfinderOptions = {}) {
             // Backing: to the rear point, or as far as the physics says a
             // step back is safe, or until the body stops moving (a post's
             // edge guard, a wall).
-            const rear = narrow ? -(takeoffHalf + 0.3 - NARROW_LIP_SAFETY) : -RUN_UP_REAR
+            const rear = narrow ? -takeoffRear : -RUN_UP_REAR
             // A sneaking body moves ~0.06 a tick, a walking one 0.2: the
             // stall test is sized to the gait, or a narrow back-off ends
             // after two ticks and leaves half the run on the table.
             const stalled = runUpLastPos !== null && runUpTicks >= 2 &&
               p.distanceTo(runUpLastPos) < (narrow ? 0.02 : WEDGE_MOVE)
             runUpLastPos = p.clone()
-            const axisOut = narrow && (Math.abs(takeoffPx) >= takeoffLip || Math.abs(takeoffPz) >= takeoffLip)
+            const axisOut = narrow && (takeoffFaces.length > 0
+              ? !geometry.supportedAt(bot, takeoffFaces, p.x, p.z, NARROW_LIP_SAFETY)
+              : Math.abs(takeoffPx) >= takeoffLip || Math.abs(takeoffPz) >= takeoffLip)
             if (runUpTicks < RUN_UP_MAX_TICKS && takeoffProj > rear && !stalled && !axisOut &&
                 (narrow || physics.canNudge({ back: true }, 2))) {
               runUpTicks++
@@ -3532,7 +4644,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         // every gate refusing, tick after tick: give the jump up now, ban
         // its landing cell and re-solve, rather than sit out the futility
         // timer for a replan that brings the same jump back (LIP_WAIT_TICKS).
-        const attemptsDone = runUpAttempts >= (narrowSupport || !stateMovements.allowRunUp ? 1 : (nextPoint as Move).run ? RUN_UP_ATTEMPTS : 1)
+        const attemptsDone = runUpAttempts >= (thinTakeoff ? 0 : narrowSupport || !stateMovements.allowRunUp ? 1 : (nextPoint as Move).run ? RUN_UP_ATTEMPTS : 1)
         // A creep the edge guard is holding still counts as waiting: the lip
         // it wants is past the edge it is on.
         const creepStalled = creep && stillTicks >= 3
@@ -3558,6 +4670,56 @@ export function createPathfinder (options: PathfinderOptions = {}) {
     }
 
     bot.on('physicsTick', monitorMovement)
+
+    // Onto slime (improvement): a touchdown on a slime block is made with
+    // sneak pressed on that tick — prismarine throws a body that lands on
+    // slime without it back up, the planner models no rebound but a planned
+    // bounce's, and the rebound off a table jump's landing carried the bot
+    // off the arena's slime walls. The control programs' own rule
+    // (sneakLanding: in the air, coming down, the feet reaching the block's
+    // top this tick, the box over it), for every slime block under the box,
+    // decided after every branch has set its controls. Not while the node is
+    // a planned bounce (its `via` is ridden, not landed on), nor during a
+    // program's replay, which applies the rule to its own landing.
+    const slimeLand = { slimeLand: true, tx: 0, ty: 0, tz: 0 } as HopProgram
+    bot.on('physicsTick', () => {
+      if (path.length === 0 || stateGoal === null) return
+      const ent = bot.entity as { onGround?: boolean, position: Vec3, velocity: Vec3 }
+      const vy = ent.velocity.y
+      const n0 = path[0] as Move
+      if (n0.via !== null && n0.chain !== true) return
+      if (progNode === n0 && progPhase === 1) return
+      const p = ent.position
+      // And ON slime between jumps: sneak held, unless jumping this tick. A
+      // body let go on slime rebounds off its own weight every other tick
+      // (vy -0.078 thrown back up), which drops onGround and with it the
+      // sneak edge guard, and slides on the block's 0.8: landed at 0.23 a
+      // tick on the arena's 3-block slime wall shelf, it slid off before
+      // any gate could take off.
+      if (ent.onGround === true) {
+        if ((n0 as { parkour?: boolean }).parkour !== true || (bot as { getControlState?: (c: string) => boolean }).getControlState?.('jump') === true) return
+        const under = bot.blockAt(p.offset(0, -0.2, 0)) as { name?: string } | null
+        if (under !== null && under.name === 'slime_block') bot.setControlState('sneak', true)
+        return
+      }
+      if (vy >= 0) return
+      const top = Math.floor(p.y + 1e-9)
+      if (p.y + vy > top + 1e-9) return // no block top crossed this tick
+      const hw = (bot.physics as unknown as { playerHalfWidth?: number }).playerHalfWidth ?? 0.3
+      for (let x = Math.floor(p.x - hw); x <= Math.floor(p.x + hw); x++) {
+        for (let z = Math.floor(p.z - hw); z <= Math.floor(p.z + hw); z++) {
+          const under = bot.blockAt(new Vec3(x, top - 1, z)) as { name?: string } | null
+          if (under === null || under.name !== 'slime_block') continue
+          slimeLand.tx = x
+          slimeLand.ty = top
+          slimeLand.tz = z
+          if (sneakLanding(slimeLand, false, p.x, p.y, p.z, vy, hw)) {
+            bot.setControlState('sneak', true)
+            return
+          }
+        }
+      }
+    })
     if (execTraceFile !== null) {
       // Server-side overwrites of the bot's own velocity/position, so a
       // trace can tell a physics decision from a packet that undid it.
@@ -3582,8 +4744,13 @@ export function createPathfinder (options: PathfinderOptions = {}) {
           n ? [+n.x.toFixed(1), +n.y.toFixed(1), +n.z.toFixed(1), (n as { parkour?: boolean }).parkour ? 1 : 0] : null,
           [+v.x.toFixed(3), +v.y.toFixed(3), +v.z.toFixed(3)],
           +lastTickMs.toFixed(2),
-          execBranch === 'sprint' ? ((physics as { hopRefusal?: string }).hopRefusal ?? '') : ''
+          takeoffNote !== ''
+            ? takeoffNote
+            : execBranch === 'sprint' || execBranch === 'hop'
+            ? `${(physics as { hopRefusal?: string }).hopRefusal ?? ''}${(physics as { hopJumpNote?: string }).hopJumpNote ? ':' + (physics as { hopJumpNote?: string }).hopJumpNote : ''}`
+            : ''
         ]))
+        takeoffNote = ''
         execBranch = 'idle'
         // Flush on the batch, and on every idle tick (a race's last ticks
         // were lost in the buffer when the process exited on arrival).

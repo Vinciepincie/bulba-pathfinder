@@ -22,7 +22,7 @@ import {
   MANGROVE_STAIRS,
   CREEPER_HEAD
 } from './helpers/voxelWorld.js'
-import { MoveGen, META_PARKOUR, META_BOUNCE, META_CHAIN, META_RUN, MOM_NONE, momentumOf, momentumDx, momentumDz } from '../src/moveGen.js'
+import { MoveGen, META_PARKOUR, META_BOUNCE, META_CHAIN, META_RUN, META_AIM, MOM_NONE, momentumOf, momentumDx, momentumDz } from '../src/moveGen.js'
 import { Snapshot } from '../src/snapshot.js'
 
 interface GenMove {
@@ -33,6 +33,8 @@ interface GenMove {
   meta: number
   /** Slime stand cell index of a bounce move, -1 otherwise. */
   via: number
+  /** AIM byte of an aimed parkour move (META_AIM), 0 otherwise. */
+  aim: number
 }
 
 interface GenCtx {
@@ -41,9 +43,13 @@ interface GenCtx {
 }
 
 /** Build bot → movements → lut → snapshot → MoveGen over one voxel world. */
+// The move-generator tests pin the COMFORTABLE envelope (the profile's safety
+// margin): the zero-margin fallback (allowParkourTight) is off unless a test
+// turns it on, or every "this jump is out of reach" assertion would meet the
+// dearer tight edge that is offered in its place.
 function makeGen (world: VoxelWorld, overrides: Record<string, unknown> = {}): GenCtx {
   const bot = makeFakeBot(world)
-  const movements = makeOurMovements(bot, overrides)
+  const movements = makeOurMovements(bot, { allowParkourTight: false, ...overrides })
   const lut = lutFor(bot, movements)
   const snap = snapshotFromWorld(world, lut)
   const gen = new MoveGen(snap, movements.toConfig(), null)
@@ -88,7 +94,8 @@ function movesOf (ctx: GenCtx, x: number, y: number, z: number): GenMove[] {
       z: lz + m.z0,
       cost: gen.outCost[i],
       meta: gen.outMeta[i],
-      via: gen.outVia[i]
+      via: gen.outVia[i],
+      aim: gen.outAim[i]
     }
     // Decode round-trip: our arithmetic must agree with Snapshot.index().
     expect(idxOf(snap, mv.x, mv.y, mv.z)).to.equal(idx)
@@ -289,7 +296,7 @@ describe('MoveGen', () => {
       expect(at(moves, 1, 1, 0), 'no plain forward over the gap').to.have.length(0)
       const parkour = moves.filter(mv => (mv.meta & META_PARKOUR) !== 0)
       expect(parkour).to.have.length(1)
-      expect(parkour[0]).to.deep.equal({ x: 2, y: 1, z: 0, cost: 1, meta: META_PARKOUR, via: -1 })
+      expect(parkour[0]).to.deep.equal({ x: 2, y: 1, z: 0, cost: 1, meta: META_PARKOUR, via: -1, aim: 0 })
     })
 
     it('3-cell gap (distance-4 jump): present with sprinting, absent without', () => {
@@ -338,6 +345,129 @@ describe('MoveGen', () => {
       expect(at(moves, 2, 1, 2)[0].cost).to.be.closeTo(FULL, 1e-12)
     })
 
+    it('shifted line: a pillar at the corner of the centre line moves the jump a hitbox-width aside (Lateral Leaps)', () => {
+      // Take-off block at (0,0,0), landing block at (-1,0,3): the (-1,3)
+      // centre line's corner cells are (0,2) and (-1,1). A body-high pillar
+      // at (-1,1) refuses the centre line; the line shifted EAST (world +x,
+      // AIM_VARIANTS[3] = -0.35 parallel, the table's +0.35 mirrored) clears it
+      // and is emitted instead, dearer by SHIFT_COST and flagged for the
+      // executor. A second pillar on the east side (1,0), which the shifted
+      // line's take-off overhang sweeps, leaves nothing.
+      const world = new VoxelWorld({ x0: -4, y0: -2, z0: -3, x1: 4, y1: 7, z1: 6 })
+      world.set(0, 0, 0, STONE)
+      world.set(-1, 0, 3, STONE)
+      const plain = at(movesOf(makeGen(world, FLAG), 0, 1, 0), -1, 1, 3)
+      expect(plain).to.have.length(1)
+      expect(plain[0].meta).to.equal(META_PARKOUR)
+      expect(plain[0].cost).to.be.closeTo(Math.hypot(1, 3) + 0.5, 1e-12)
+
+      world.set(-1, 1, 1, STONE)
+      world.set(-1, 2, 1, STONE)
+      const shifted = at(movesOf(makeGen(world, FLAG), 0, 1, 0), -1, 1, 3)
+      expect(shifted.length).to.be.at.least(1)
+      // cheapest of the aimed lines that clear: the 0.35 parallel one, the
+      // table's +side (variant 3) mirrored in world space (sx*sz < 0)
+      const best0 = shifted.reduce((p, q) => (p.cost <= q.cost ? p : q))
+      expect(best0.meta).to.equal(META_PARKOUR | META_AIM)
+      expect(best0.aim).to.equal(3 | 0x80)
+      expect(best0.cost).to.be.closeTo(Math.hypot(1, 3) + 0.5 + 1, 1e-12)
+
+      world.set(1, 1, 0, STONE)
+      world.set(1, 2, 0, STONE)
+      // nothing that takes off from the east side of the block any more
+      // (variants 3, 5, 9, 12 mirrored...): every surviving line leaves from
+      // the centre or the west, and none is the 0.35 parallel one
+      const rest = at(movesOf(makeGen(world, FLAG), 0, 1, 0), -1, 1, 3)
+      expect(rest.some(mv => mv.aim === (3 | 0x80))).to.equal(false)
+    })
+
+    it('shifted line: a corner the centre line clips by centimetres takes the SMALL shift (Tuning Forks)', () => {
+      // (1,4) down one: the centre line's hitbox enters the corner cell (1,1)
+      // by 0.2 on both axes, over the 0.15 nick allowance. A body-high pillar
+      // there refuses it; 0.2 to the west clears the pillar with the body
+      // still inside its own column at both ends, so that line is the one
+      // emitted (cheaper than the big shift, which would also fly).
+      const world = new VoxelWorld({ x0: -4, y0: -3, z0: -4, x1: 5, y1: 7, z1: 7 })
+      world.set(0, 0, 0, STONE)
+      world.set(0, 0, -1, STONE)
+      world.set(0, 0, -2, STONE)
+      world.set(1, -1, 4, STONE)
+      const plain = at(movesOf(makeGen(world, FLAG), 0, 1, 0), 1, 0, 4)
+      expect(plain).to.have.length(1)
+      expect(plain[0].meta & META_AIM).to.equal(0)
+      expect(plain[0].aim).to.equal(0)
+      world.set(1, 1, 1, STONE)
+      world.set(1, 2, 1, STONE)
+      const shifted = at(movesOf(makeGen(world, FLAG), 0, 1, 0), 1, 0, 4)
+      expect(shifted.length).to.be.at.least(1)
+      const best = shifted.reduce((a, b) => (a.cost <= b.cost ? a : b))
+      expect(best.meta & META_AIM).to.equal(META_AIM)
+      expect(best.aim).to.equal(1) // +0.2 parallel, not mirrored
+      expect(best.cost).to.be.closeTo(plain[0].cost + 0.5, 1e-12)
+    })
+
+    it('edge panels: the step across an inner corner is a hop, and a diagonal off the panel gets no run (mcc-2-2)', () => {
+      // Two walls with open-trapdoor ledges: wall A's west face (panels in
+      // column x=0, z 0..2, against the east edge of their cells) and wall
+      // B's north face (panels in row z=3, x -3..-1, against the south edge).
+      const trapdoor = (facing: string): number => {
+        const t = mcData.blocksByName.birch_trapdoor as unknown as { minStateId: number, maxStateId: number }
+        for (let s = t.minStateId; s <= t.maxStateId; s++) {
+          const p = (Block.fromStateId(s, 0) as unknown as { getProperties: () => Record<string, unknown> }).getProperties()
+          if (String(p.facing) === facing && String(p.half) === 'top' && String(p.open) === 'true' &&
+              String(p.powered) === 'false' && String(p.waterlogged) === 'false') return s
+        }
+        throw new Error('no trapdoor state')
+      }
+      const world = new VoxelWorld({ x0: -6, y0: -3, z0: -3, x1: 4, y1: 6, z1: 7 })
+      for (let z = 0; z <= 3; z++) for (let y = -1; y <= 2; y++) world.set(1, y, z, STONE) // wall A
+      for (let z = 0; z <= 2; z++) world.set(0, 0, z, trapdoor('west'))
+      for (let x = -3; x <= -1; x++) for (let y = -1; y <= 2; y++) world.set(x, y, 4, STONE) // wall B
+      for (let x = -3; x <= -1; x++) world.set(x, 0, 3, trapdoor('north'))
+      const gen = makeGen(world, { ...FLAG, allowParkourMomentum: true })
+      // from the END of ledge A: the diagonal to ledge B's first cell is a hop
+      const hop = at(movesOf(gen, 0, 1, 2), -1, 1, 3)
+      expect(hop).to.have.length(1)
+      expect(hop[0].meta).to.equal(META_PARKOUR)
+      expect(hop[0].cost).to.be.closeTo(Math.SQRT2 + 0.5, 1e-12)
+      // along the ledge it is still a walk
+      const walk = at(movesOf(gen, 0, 1, 1), 0, 1, 2)
+      expect(walk).to.have.length(1)
+      expect(walk[0].meta).to.equal(0)
+      // and from the middle of ledge A no (-2,+2) across the panel's width
+      expect(at(movesOf(gen, 0, 1, 1), -2, 1, 3)).to.have.length(0)
+    })
+
+    it('tight jump: what only the zero-margin envelope flies is offered at TIGHT_COST, run-flagged (mcc-4-1)', () => {
+      // Ladder Hops: from a 1x1 pillar, catch a ladder (4,5) away and two
+      // below. Inside the 0.1 safety margin: refused comfortably, offered
+      // tight at +6, and plain-priced for a zero-margin profile.
+      const world = new VoxelWorld({ x0: -3, y0: -6, z0: -3, x1: 9, y1: 7, z1: 9 })
+      world.set(0, 0, 0, STONE)
+      world.set(4, -1, 5, LADDER)
+      world.set(4, -1, 6, STONE)
+      const MOMF = { ...FLAG, allowParkourMomentum: true }
+      expect(at(movesOf(makeGen(world, MOMF), 0, 1, 0), 4, -1, 5)).to.have.length(0)
+      const tight = at(movesOf(makeGen(world, { ...MOMF, allowParkourTight: true }), 0, 1, 0), 4, -1, 5)
+      expect(tight).to.have.length(1)
+      expect(tight[0].meta).to.equal(META_PARKOUR | META_RUN)
+      const risky = at(movesOf(makeGen(world, { ...MOMF, parkourSafetyMargin: 0, allowParkourTight: true }), 0, 1, 0), 4, -1, 5)
+      expect(risky).to.have.length(1)
+      expect(tight[0].cost).to.be.closeTo(risky[0].cost + 6, 1e-12)
+    })
+
+    it('shifted line: never from or onto a narrow support', () => {
+      const world = new VoxelWorld({ x0: -4, y0: -2, z0: -3, x1: 4, y1: 7, z1: 6 })
+      world.set(0, 0, 0, STONE)
+      world.set(-1, 0, 3, STONE)
+      world.set(-1, 1, 1, STONE)
+      world.set(-1, 2, 1, STONE)
+      expect(at(movesOf(makeGen(world, FLAG), 0, 1, 0), -1, 1, 3).length).to.be.at.least(1)
+      world.set(-1, 0, 3, OAK_FENCE)
+      expect(at(movesOf(makeGen(world, FLAG), 0, 1, 0), -1, 1, 3)).to.have.length(0)
+      expect(at(movesOf(makeGen(world, FLAG), 0, 1, 0), -1, 2, 3)).to.have.length(0)
+    })
+
     it('flag off (default), sprint off or parkour off: nothing', () => {
       expect(movesOf(makeGen(pillarWorld()), 0, 1, 0)).to.have.length(0)
       expect(movesOf(makeGen(pillarWorld(), { ...FLAG, allowSprinting: false }), 0, 1, 0)).to.have.length(0)
@@ -375,7 +505,8 @@ describe('MoveGen', () => {
       // A block at HEAD height over a line cell blocks the body — veto.
       const body = pillarWorld()
       body.set(1, 2, 1, STONE) // y+1 over shared line cell (1,1)
-      expect(movesOf(makeGen(body, FLAG), 0, 1, 0).filter(mv => (mv.meta & META_PARKOUR) !== 0)).to.have.length(0)
+      // (the centre lines: an aimed line that does not sweep that cell still flies)
+      expect(movesOf(makeGen(body, FLAG), 0, 1, 0).filter(mv => (mv.meta & META_PARKOUR) !== 0 && mv.aim === 0)).to.have.length(0)
     })
 
     it('corner nick is cleared (vanilla slides); real cuts and line cells veto', () => {
@@ -403,9 +534,14 @@ describe('MoveGen', () => {
         w.set(fenceX, 0, 0, OAK_FENCE)
         return w
       }
-      const ext = (w: VoxelWorld): unknown[] => at(movesOf(makeGen(w, FLAG), 0, 1, 0), 4, 1, 0)
+      // the CENTRE line (aim 0); past a lone post an aimed line goes beside it
+      const ext = (w: VoxelWorld): unknown[] => at(movesOf(makeGen(w, FLAG), 0, 1, 0), 4, 1, 0).filter(mv => mv.aim === 0)
       expect(ext(build(2)), 'apex clears the fence').to.have.length(1)
       expect(ext(build(1)), 'fence right after takeoff vetoes').to.have.length(0)
+      const beside = at(movesOf(makeGen(build(1), FLAG), 0, 1, 0), 4, 1, 0).filter(mv => mv.aim !== 0)
+      expect(beside.length, 'an aimed line passes beside the post').to.be.at.least(1)
+      // only the lines a whole hitbox beside it: the 0.2 / 0.35 parallels still touch the post
+      expect(beside.some(mv => (mv.aim & 0x7f) <= 4)).to.equal(false)
     })
 
     it('supersedes upstream\'s cardinal parkour rather than coexisting with it', () => {
@@ -577,6 +713,25 @@ describe('MoveGen', () => {
       expect(up).to.have.length(1)
       expect(up[0].cost).to.equal(1)
       expect(up[0].meta).to.equal(0)
+    })
+
+    it('ladder starting at head height: a jump into it, extended repertoire only (10 Ways slime room)', () => {
+      // Floor at y=0, ladder cells at y 2..4 against a wall: the feet cell
+      // (y=1) is air, the head cell is the first ladder.
+      const world = ladderWorld()
+      world.set(0, 2, 0, LADDER_DRY)
+      world.set(0, 3, 0, LADDER_DRY)
+      world.set(0, 4, 0, LADDER_DRY)
+      world.set(0, 2, 1, STONE)
+      world.set(0, 3, 1, STONE)
+      world.set(0, 4, 1, STONE)
+      expect(at(movesOf(makeGen(world), 0, 1, 0), 0, 2, 0)).to.have.length(0)
+      const up = at(movesOf(makeGen(world, { allowParkourExtended: true }), 0, 1, 0), 0, 2, 0)
+      expect(up).to.have.length(1)
+      expect(up[0].cost).to.equal(2)
+      expect(up[0].meta).to.equal(0)
+      // and the climb continues as before from inside the ladder
+      expect(at(movesOf(makeGen(world, { allowParkourExtended: true }), 0, 2, 0), 0, 3, 0)).to.have.length(1)
     })
 
     it('ladder but block at y+2: up rejected (safeOrBreak of y+2 is 100)', () => {

@@ -100,6 +100,81 @@ export function floorUnder (bot: Bot, x: number, feetY: number, z: number): bool
   return boxCollides(bot, x - 0.05, feetY - 0.55, z - 0.05, x + 0.05, feetY - EPS, z + 0.05)
 }
 
+/** A face of a support a body can rest on, as a world-space XZ rectangle. */
+export interface FaceRect { x0: number, x1: number, z0: number, z1: number, top: number }
+
+/**
+ * The faces of the block in cell (x, y, z) that carry a body: every
+ * collision box whose top is within step height (0.6) of the block's highest
+ * top, as world XZ rectangles. Empty for a block with no collision. The
+ * executor's take-off geometry reads these instead of assuming a support is
+ * centred in its cell: an open trapdoor's panel is 3/16 deep at the cell's
+ * edge, a pane runs 2/16 wide through the middle, a ladder's top is its
+ * wall-side strip.
+ */
+export function supportFaces (bot: Bot, x: number, y: number, z: number): FaceRect[] {
+  const shapes = shapesAt(bot, x, y, z)
+  if (shapes.length === 0) return []
+  let top = -Infinity
+  for (const s of shapes) if (s[4] > top) top = s[4]
+  const out: FaceRect[] = []
+  for (const s of shapes) {
+    if (s[4] > top - 0.6) out.push({ x0: s[0], x1: s[3], z0: s[2], z1: s[5], top: s[4] })
+  }
+  return out
+}
+
+/** Is a body centred at (x, z), its hitbox shrunk by `margin` on every side, resting on one of these faces? */
+export function supportedAt (bot: Bot, faces: readonly FaceRect[], x: number, z: number, margin = 0): boolean {
+  const h = bodyHalf(bot) - margin
+  for (const f of faces) {
+    if (x + h > f.x0 && x - h < f.x1 && z + h > f.z0 && z - h < f.z1) return true
+  }
+  return false
+}
+
+/**
+ * How far a body centred at (ox, oz) can move along the unit direction
+ * (ux, uz) before its hitbox has left every face it rests on now. -1 when it
+ * rests on none. A face the body only reaches later is not counted, so a
+ * cross of iron bars reads as its longest arm and an L of two boxes as the
+ * longer leg the body is already on.
+ */
+export function supportReach (bot: Bot, faces: readonly FaceRect[], ox: number, oz: number, ux: number, uz: number): number {
+  const h = bodyHalf(bot)
+  let best = -1
+  for (const f of faces) {
+    const ax0 = f.x0 - h
+    const ax1 = f.x1 + h
+    const az0 = f.z0 - h
+    const az1 = f.z1 + h
+    if (ox <= ax0 || ox >= ax1 || oz <= az0 || oz >= az1) continue
+    let t = Infinity
+    if (ux > 1e-9) t = Math.min(t, (ax1 - ox) / ux)
+    else if (ux < -1e-9) t = Math.min(t, (ax0 - ox) / ux)
+    if (uz > 1e-9) t = Math.min(t, (az1 - oz) / uz)
+    else if (uz < -1e-9) t = Math.min(t, (az0 - oz) / uz)
+    if (t > best) best = t
+  }
+  return best
+}
+
+/**
+ * The deepest a body centred at (x, z) rests on any one of these faces: the
+ * smaller of its two overlaps with that face, maximised over faces. 0.6 on a
+ * full block, 0.25 on a fence post, 0.19 on an open trapdoor's panel aimed at
+ * upstream's averaged point.
+ */
+export function supportDepth (bot: Bot, faces: readonly FaceRect[], x: number, z: number): number {
+  const h = bodyHalf(bot)
+  let best = 0
+  for (const f of faces) {
+    const d = Math.min(Math.min(x + h, f.x1) - Math.max(x - h, f.x0), Math.min(z + h, f.z1) - Math.max(z - h, f.z0))
+    if (d > best) best = d
+  }
+  return best
+}
+
 /** Does this world-space box overlap any block collision box? */
 export function boxCollides (
   bot: Bot,

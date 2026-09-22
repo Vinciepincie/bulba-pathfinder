@@ -14,10 +14,10 @@
 // lists, like upstream.
 import { LutFlags, LutSpecial, DigFlags } from './types.js';
 import type { MovementsConfig, SnapshotMeta, DigData } from './types.js';
-import { getParkourExtTable } from './parkourTable.js';
+import { getParkourExtTable, AIM_P0_MASK } from './parkourTable.js';
 import type { ParkourExtEntry, ParkourExtTable } from './parkourTable.js';
 import { J_RUN, J_LOW_RUN, runRow, J_CHAIN, CHAIN_MIN_COS, CHAIN_TAKEOFF_FRACTION, CHAIN_TURN_LOSS, LIP_PHASE, reachBucket, ENVELOPE_SAFETY_MARGIN, TAKEOFF_STAND, LAND_HALF, TAKEOFF_NARROW_MARGIN, LAND_NARROW_MARGIN, BOUNCE_APEX, BOUNCE_MAX_DROP, BOUNCE_MARGIN, BOUNCE_MARGIN_FAR } from './parkourEnvelope.js';
-import { CATCH_HALF } from './shapes.js';
+import { CATCH_HALF, CARRY_SHIFT, carrySide, carryTouch } from './shapes.js';
 /** cos(angle) gate as an exact integer test: dot > 0 and dot² ≥ c²·|u|²·|v|². */
 const CHAIN_MIN_COS2 = CHAIN_MIN_COS * CHAIN_MIN_COS;
 /**
@@ -56,9 +56,9 @@ export function momentumDz (m: number): number {
  * flightNeeded/takeoff pair for arbitrary credits (the narrow-support case;
  * the wasm core mirrors this arithmetic op for op).
  */
-function flightFrom (a: number, b: number, dist: number, s: number, lCred: number): number {
-    const dx = a - a / dist * s - lCred;
-    const dz = b - b / dist * s - lCred;
+function flightFrom2 (a: number, b: number, dist: number, s: number, lCredX: number, lCredZ: number): number {
+    const dx = a - a / dist * s - lCredX;
+    const dz = b - b / dist * s - lCredZ;
     const px = dx > 0 ? dx : 0;
     const pz = dz > 0 ? dz : 0;
     // sqrt of a sum, not hypot: correctly rounded everywhere, so JS and the
@@ -78,6 +78,8 @@ export interface SnapshotView {
   states?: Uint16Array | null
   /** LutSpecial byte per cell — required for useBubbleColumns. */
   special?: Uint8Array | null
+  /** Thin footprint byte per cell (shapes.ts thinFootprint) — with allowParkourExtended. */
+  thin?: Uint8Array | null
 }
 
 export interface DigContext {
@@ -98,7 +100,63 @@ export const META_CHAIN = 8;
  * it, only the running rows, a lip take-off or a chain can. Tells the
  * executor to line up a run instead of creeping to the corner and jumping
  * from rest. Always paired with META_PARKOUR. Never affects the search. */
+/** Extra flight a diagonal jump off an edge panel's empty side must have in hand (parkourExtTarget offPanel). */
+const OFF_PANEL_MARGIN = 0.3;
+/** Thin footprint interval classes in sixteenths (mirror of shapes.ts THIN_INTERVALS). */
+const THIN_LO = [0, 0, 13, 7, 6, 5, 4, 0, 0, 0, 0, 7, 6, 5, 4, 0];
+const THIN_HI = [16, 3, 16, 9, 10, 11, 12, 9, 10, 11, 12, 16, 16, 16, 16, 16];
+/** Hitbox half-width a thin footprint is tested against (a centimetre of grace). */
+const THIN_BODY_HALF = 0.29;
+/** Does the segment P -> P+D enter the open rect [x0,x1]x[z0,z1]? (parkourTable.ts clipRect, as a predicate.) */
+function segHits (px: number, pz: number, dx: number, dz: number, x0: number, x1: number, z0: number, z1: number): boolean {
+    let t0 = 0;
+    let t1 = 1;
+    if (dx === 0) {
+        if (px <= x0 || px >= x1)
+            return false;
+    }
+    else {
+        let e = (x0 - px) / dx;
+        let x = (x1 - px) / dx;
+        if (e > x) {
+            const sw = e;
+            e = x;
+            x = sw;
+        }
+        if (e > t0)
+            t0 = e;
+        if (x < t1)
+            t1 = x;
+    }
+    if (dz === 0) {
+        if (pz <= z0 || pz >= z1)
+            return false;
+    }
+    else {
+        let e = (z0 - pz) / dz;
+        let x = (z1 - pz) / dz;
+        if (e > x) {
+            const sw = e;
+            e = x;
+            x = sw;
+        }
+        if (e > t0)
+            t0 = e;
+        if (x < t1)
+            t1 = x;
+    }
+    return t1 - t0 > 1e-9;
+}
+/** Added to a jump only the zero-margin envelope flies (parkourExtTarget, tight pass). */
+const TIGHT_COST = 6;
 export const META_RUN = 16;
+/** The jump flies an AIMED line (parkourTable.ts AIM_VARIANTS): take-off and
+ * landing points sit beside their cell centres. The variant travels with the
+ * move as its AIM byte (outAim): bits 0-6 the 1-based AIM_VARIANTS index, bit
+ * 7 set when the table's side is mirrored in world space (one mirrored axis
+ * flips the perpendicular, two do not). Always paired with META_PARKOUR;
+ * executor information only. */
+export const META_AIM = 32;
 const SAFE = LutFlags.SAFE;
 const PHYSICAL = LutFlags.PHYSICAL;
 const LIQUID = LutFlags.LIQUID;
@@ -181,14 +239,24 @@ export class MoveGen {
   readonly outBreaks!: Array<number[] | null>
     /** Slime stand cell (index) a META_BOUNCE neighbour drops onto; -1 otherwise. */
   readonly outVia!: Int32Array
+    /** AIM byte of an aimed parkour move (META_AIM), 0 otherwise. */
+  readonly outAim!: Uint8Array
     /** Momentum the neighbour arrives with (MOM_NONE unless a support landing
      * with allowParkourMomentum on). */
   readonly outMom!: Uint8Array
   outCount = 0
     /** Set by slimeBounce for the push it is about to make. */
   private pendingVia = -1
+    /** Set by parkourExtTarget for the aimed move it is about to push. */
+  private pendingAim = 0
     /** Set by parkourExtTarget for the landing it is about to push. */
   private pendingMom = MOM_NONE
+    /** The centre line's landing (node y, support y), reused by its aimed variants. */
+    private extLandY = 0
+    private extLandSupY = NaN
+    /** Set by parkourExtTarget when a corridor pass refused the line: the aimed
+     * variants worth trying (bit v = AIM_VARIANTS[v]), 0 = none (extTarget). */
+  private extTryMask = 0
     /** allowParkourMomentum && parkourExtended: landings carry momentum. */
   readonly parkourMomentum!: boolean
     /** Momentum of the node being expanded (set per generate()). */
@@ -223,10 +291,14 @@ export class MoveGen {
   private readonly entityCost!: number
     // ── bubble columns (null when useBubbleColumns is off — zero overhead) ──
   private readonly special!: Uint8Array | null
+    /** Thin footprint grid (null without the extended repertoire). */
+  private readonly thin!: Uint8Array | null
   private readonly bubbleCost!: number
     /** Added to every usable-flight row: ENVELOPE_SAFETY_MARGIN − the profile's
      * parkourSafetyMargin (0 at the default; positive plans tighter jumps). */
   private readonly marginCredit!: number
+    /** The margin credit of the TIGHT pass (= marginCredit when allowParkourTight is off: no second pass). */
+  private readonly tightCredit!: number
     // ── digging (null when canDig is off — the hot path never touches it) ──
   private readonly dig!: DigContext | null
   private readonly digCost!: number
@@ -269,6 +341,7 @@ export class MoveGen {
         this.outMeta = new Uint8Array(cap);
         this.outBreaks = new Array(cap).fill(null);
         this.outVia = new Int32Array(cap).fill(-1);
+        this.outAim = new Uint8Array(cap);
         this.outMom = new Uint8Array(cap);
         this.parkourMomentum = this.parkourExtended && cfg.allowParkourMomentum === true;
         this.canOpenDoors = cfg.canOpenDoors;
@@ -280,8 +353,10 @@ export class MoveGen {
         // Presence of the grid is the signal — it exists only when a feature
         // (bubble columns, climbable vines) marked cells into it.
         this.special = snap.special ?? null;
+        this.thin = snap.thin ?? null;
         this.bubbleCost = cfg.bubbleCost;
         this.marginCredit = ENVELOPE_SAFETY_MARGIN - (cfg.parkourSafetyMargin ?? ENVELOPE_SAFETY_MARGIN);
+        this.tightCredit = cfg.allowParkourTight === false ? this.marginCredit : ENVELOPE_SAFETY_MARGIN;
         this.dig = cfg.canDig ? dig : null;
         this.digCost = cfg.digCost;
         this.dontCreateFlow = cfg.dontCreateFlow;
@@ -312,6 +387,10 @@ export class MoveGen {
   private catchAt (x: number, y: number, z: number): number {
         const idx = this.cellIndex(x, y, z);
         return idx < 0 ? 0 : this.heights[idx] >> 6;
+    }
+    /** carryCode of the cell's block (shapes.ts): where a narrow support sits in its cell; 0 = centred. */
+  private carryAt (x: number, y: number, z: number): number {
+        return this.specialAt(x, y, z) >> CARRY_SHIFT;
     }
     /** Upstream block.safe, plus the open-door/open-gate improvement when enabled. */
   private isSafe (f: number): boolean {
@@ -433,6 +512,8 @@ export class MoveGen {
         this.outMeta[i] = meta;
         this.outVia[i] = this.pendingVia;
         this.pendingVia = -1;
+        this.outAim[i] = this.pendingAim;
+        this.pendingAim = 0;
         this.outMom[i] = mom;
         if (this.moveBreaks.length > 0) {
             this.outBreaks[i] = this.moveBreaks;
@@ -501,11 +582,11 @@ export class MoveGen {
                 const tab = this.extTable!;
                 if (dx !== 0) {
                     for (const t of tab.cardX)
-                        this.parkourExtTarget(x, y, z, dx, 1, h0, lowTakeoff, t);
+                        this.extTarget(x, y, z, dx, 1, h0, lowTakeoff, t);
                 }
                 else {
                     for (const t of tab.cardZ)
-                        this.parkourExtTarget(x, y, z, 1, dz, h0, lowTakeoff, t);
+                        this.extTarget(x, y, z, 1, dz, h0, lowTakeoff, t);
                 }
             }
         }
@@ -513,7 +594,7 @@ export class MoveGen {
             this.moveDiagonal(x, y, z, DIAGONAL_X[i], DIAGONAL_Z[i]);
             if (jumps) {
                 for (const t of this.extTable!.diag) {
-                    this.parkourExtTarget(x, y, z, DIAGONAL_X[i], DIAGONAL_Z[i], h0, lowTakeoff, t);
+                    this.extTarget(x, y, z, DIAGONAL_X[i], DIAGONAL_Z[i], h0, lowTakeoff, t);
                 }
             }
         }
@@ -909,8 +990,20 @@ export class MoveGen {
         if (cost > 100)
             return;
         // Upstream's non-climbable branch is 1x1 towering (placement) — dead.
-        if ((f1 & CLIMBABLE) === 0)
+        if ((f1 & CLIMBABLE) === 0) {
+            // Improvement (allowParkourExtended): a ladder that starts at HEAD
+            // height — the column is climbable from the cell above the feet.
+            // A jump puts the feet into it and the climb goes on from there;
+            // upstream has no way up (the arena's 10 Ways slime room starts
+            // with one). Cost is a jump-up's.
+            if (!this.parkourExtended)
+                return;
+            const fH = this.flagsAt(x, y + 1, z);
+            if ((fH & CLIMBABLE) === 0 || !this.isSafe(fH) || !this.climbUsable(x, y + 1, z))
+                return;
+            this.push(x, y + 1, z, cost + 1, 0);
             return;
+        }
         // Vines climb only with an adjacent solid block to press against —
         // vanilla's collision climb, and the only way prismarine-physics
         // ascends. A free-hanging curtain is passable but not climbable.
@@ -983,7 +1076,19 @@ export class MoveGen {
         else if (((fD & PHYSICAL) !== 0 && !this.isThinFloor(fD)) || (fC & LIQUID) !== 0 ||
             this.isThinFloor(fC) ||
             (this.specialAt(x + dx, y, z + dz) & BUBBLE_MASK) !== 0) {
-            this.push(x + dx, y, z + dz, cost, 0);
+            // Extended: a diagonal between two EDGE supports (open trapdoor
+            // panels, ladder tops, pane lines — shapes.ts carryCode) is only
+            // continuous ground where their faces meet. The ledges of two
+            // walls across an inner corner do not: the body is unsupported
+            // for ~0.45 (arena mcc-2-2). A hop, flagged for the executor,
+            // dearer than the step it replaces.
+            let hop = false;
+            if (this.parkourExtended) {
+                const cA = this.carryAt(x, y - 1, z);
+                const cB = cA === 0 ? 0 : this.carryAt(x + dx, y - 1, z + dz);
+                hop = cB !== 0 && !carryTouch(cA, cB, dx, dz);
+            }
+            this.push(x + dx, y, z + dz, hop ? cost + 0.5 : cost, hop ? META_PARKOUR : 0);
         }
         else if ((this.flagsAt(x + dx, y - 2, z + dz) & PHYSICAL) !== 0 || (fD & LIQUID) !== 0) {
             if (!this.isSafe(fD))
@@ -1160,6 +1265,100 @@ export class MoveGen {
      * rest are held to the J_CHAIN row from the landing point, and the push
      * carries `chainVia` and the first hop's cost.
      */
+    /**
+     * Floor that is not a way through: a thin shape (a pane post, bars, a
+     * fence) STANDS on it at body height, so the cell is no walk — the floor
+     * under a hoop's centre post must not void the jump that passes beside it
+     * (arena mcc-1-2). A full cube standing there leaves the rules as they were.
+     */
+  private thinStands (cx: number, y: number, cz: number): boolean {
+        return (this.thinAt(cx, y, cz) !== 0 && !this.isSafe(this.flagsAt(cx, y, cz))) ||
+            (this.thinAt(cx, y + 1, cz) !== 0 && !this.isSafe(this.flagsAt(cx, y + 1, cz)));
+    }
+    /** Thin footprint byte of a cell (0 = solid, or no thin grid). */
+  private thinAt (cx: number, ly: number, cz: number): number {
+        if (this.thin === null)
+            return 0;
+        const idx = this.cellIndex(cx, ly, cz);
+        return idx < 0 ? 0 : this.thin[idx];
+    }
+    /**
+     * A corridor cell that is not passable may still hold only a THIN shape —
+     * a pane or bars post, a fence arm, an open trapdoor's panel, a door —
+     * that the flight passes beside. True when the path of entry `t` (its
+     * `pts`, table space) keeps the hitbox off the block's footprint in cell
+     * `k` of its corridor; the footprint byte is a WORLD rect, mirrored into
+     * table space by the quadrant signs. Solid cells (byte 0) always veto.
+     */
+  private thinClear (cx: number, ly: number, cz: number, t: ParkourExtEntry, k: number, sx: number, sz: number): boolean {
+        const b = this.thinAt(cx, ly, cz);
+        if (b === 0)
+            return false;
+        let x0 = THIN_LO[b & 15] / 16;
+        let x1 = THIN_HI[b & 15] / 16;
+        let z0 = THIN_LO[b >> 4] / 16;
+        let z1 = THIN_HI[b >> 4] / 16;
+        if (sx < 0) {
+            const lo = 1 - x1;
+            x1 = 1 - x0;
+            x0 = lo;
+        }
+        if (sz < 0) {
+            const lo = 1 - z1;
+            z1 = 1 - z0;
+            z0 = lo;
+        }
+        const ax = t.cells[k * 2];
+        const az = t.cells[k * 2 + 1];
+        x0 += ax - THIN_BODY_HALF;
+        x1 += ax + THIN_BODY_HALF;
+        z0 += az - THIN_BODY_HALF;
+        z1 += az + THIN_BODY_HALF;
+        const p = t.pts;
+        for (let i = 0; i + 3 < p.length; i += 2) {
+            if (segHits(p[i], p[i + 1], p[i + 2] - p[i], p[i + 3] - p[i + 1], x0, x1, z0, z1))
+                return false;
+        }
+        return true;
+    }
+    /**
+     * The centred flight line, then — only where a corridor pass refused it —
+     * its SHIFTED lines (parkourTable.ts LATERAL_SHIFT_SMALL / LATERAL_SHIFT):
+     * the same jump beside the centre line, clear of the pillar the centre
+     * line clips. Tried only after a blocked CORNER cell — a blocked line
+     * cell is a wall across the flight, and reach or floor refusals are not
+     * about the line at all — so open ground pays nothing; never emitted
+     * where the centred line flies (A* would only see a dearer duplicate).
+     * Momentum chains never shift: a re-jump on the landing tick has no
+     * line-up. A solid block that refuses one aimed line at its body cells
+     * refuses every sibling that sweeps that cell too (the same two probes,
+     * the same answer), so those are dropped unseen (`avoid` on the variant).
+     */
+  private extTarget (x: number, y: number, z: number, sx: number, sz: number, h0: number, lowTakeoff: boolean, t: ParkourExtEntry): void {
+        this.extTryMask = 0;
+        this.parkourExtTarget(x, y, z, sx, sz, h0, lowTakeoff, t);
+        let mask = this.extTryMask;
+        if (mask === 0)
+            return;
+        // A line that stands the body off the cell's centre needs a full top to
+        // stand on; off a post, a pane or a panel only the lines that keep the
+        // take-off centred are worth evaluating (parkourExtTarget refuses the
+        // rest anyway — a course of posts and heads would otherwise pay for
+        // them at every node).
+        if (this.catchAt(x, y - 1, z) !== 0 || this.carryAt(x, y - 1, z) !== 0) {
+            mask &= AIM_P0_MASK;
+            if (mask === 0)
+                return;
+        }
+        const vs = t.variants;
+        for (let v = 0; v < vs.length && mask !== 0; v++) {
+            if ((mask >> v & 1) === 0)
+                continue;
+            this.extTryMask = -1;
+            this.parkourExtTarget(x, y, z, sx, sz, h0, lowTakeoff, vs[v]);
+            mask &= this.extTryMask;
+        }
+    }
   private parkourExtTarget (x: number, y: number, z: number, sx: number, sz: number, h0: number, lowTakeoff: boolean, t: ParkourExtEntry, chainVia = -1, chainBase = 0): void {
         this.beginMove();
         const cells = t.cells;
@@ -1167,12 +1366,15 @@ export class MoveGen {
         // means this isn't a gap (2 probes; kills almost every open-terrain node).
         const flx = x + cells[0] * sx;
         const flz = z + cells[1] * sz;
-        if ((this.flagsAt(flx, y - 1, flz) & PHYSICAL) !== 0 && this.heightAt(flx, y - 1, flz) >= h0)
+        if ((this.flagsAt(flx, y - 1, flz) & PHYSICAL) !== 0 && this.heightAt(flx, y - 1, flz) >= h0 &&
+            !this.thinStands(flx, y, flz)) {
+            // A walk for every aimed line over this floor too (extTarget).
+            if (t.aimIndex !== 0)
+                this.extTryMask &= t.lineAvoid[0];
             return;
+        }
         const tx = x + t.tx * sx;
         const tz = z + t.tz * sz;
-        const idxT = this.cellIndex(tx, y, tz);
-        const fT = idxT < 0 ? 0 : this.flags[idxT];
         let nodeY;
         let cost = t.cost;
         // Top-catch class of the support the feet land ON (0 full … 3 post);
@@ -1184,7 +1386,18 @@ export class MoveGen {
         // node cells do not carry — a fence stand (feet 0.5 into its node) to a
         // head (feet at its node's floor) is a flat jump one node cell up.
         let supY = NaN;
-        if ((fT & CLIMBABLE) !== 0 && this.isSafe(fT) && this.climbUsable(tx, y, tz)) {
+        const idxT = t.aimIndex !== 0 ? -1 : this.cellIndex(tx, y, tz);
+        const fT = idxT < 0 ? 0 : this.flags[idxT];
+        if (t.aimIndex !== 0) {
+            // An aimed line lands where the centre line that selected it lands
+            // (extTarget): a full top, classified once on the centre line.
+            nodeY = this.extLandY;
+            supY = this.extLandSupY;
+            landCatch = 0;
+            if (nodeY > y)
+                cost += nodeY - y;
+        }
+        else if ((fT & CLIMBABLE) !== 0 && this.isSafe(fT) && this.climbUsable(tx, y, tz)) {
             // Grab a ladder/vine at flight level. Checked before PHYSICAL because
             // ladders classify as physical too (type-level bbox 'block') — and
             // grabbing one is real, landing on its thin collision top is not.
@@ -1260,6 +1473,10 @@ export class MoveGen {
                 supY = nodeY - 1;
             }
         }
+        if (landCatch === 0 && t.aimIndex === 0) {
+            this.extLandY = nodeY;
+            this.extLandSupY = supY;
+        }
         // Corridor pass 1 — body cells at feet/head level must be passable, line
         // cells with walkable floor void the jump, and a blocked head+1 anywhere
         // (takeoff included) puts the jump into the head-hitter class: the arc
@@ -1268,14 +1485,24 @@ export class MoveGen {
         for (let k = 0; k * 2 < cells.length; k++) {
             const cx = x + cells[k * 2] * sx;
             const cz = z + cells[k * 2 + 1] * sz;
-            if (!this.isSafe(this.flagsAt(cx, y, cz)) ||
-                !this.isSafe(this.flagsAt(cx, y + 1, cz)))
+            for (let ly = y; ly <= y + 1; ly++) {
+                if (this.isSafe(this.flagsAt(cx, ly, cz)) || this.thinClear(cx, ly, cz, t, k, sx, sz))
+                    continue;
+                // Worth an aimed line: past a thin shape any of them might go;
+                // past a full cube, the ones that do not sweep its cell at all.
+                // And only onto a full top (the variants' own rule).
+                if (landCatch === 0)
+                    this.extTryMask = this.thinAt(cx, ly, cz) !== 0 ? -1 : t.avoid[k];
                 return;
-            if (!this.isSafe(this.flagsAt(cx, y + 2, cz)))
+            }
+            if (!this.isSafe(this.flagsAt(cx, y + 2, cz)) && !this.thinClear(cx, y + 2, cz, t, k, sx, sz))
                 low = true;
             if (k < t.nLine && (this.flagsAt(cx, y - 1, cz) & PHYSICAL) !== 0 &&
-                this.heightAt(cx, y - 1, cz) >= h0)
+                this.heightAt(cx, y - 1, cz) >= h0 && !this.thinStands(cx, y, cz)) {
+                if (t.aimIndex !== 0)
+                    this.extTryMask &= t.lineAvoid[k];
                 return; // walkable — not a gap
+            }
         }
         // Reach envelope: flight needed (per-axis corner credits, precomputed in
         // the table) vs usable flight for the landing bucket, at the speed the
@@ -1325,11 +1552,72 @@ export class MoveGen {
             return;
         const lCred = landCatch < 0 ? LAND_HALF : LAND_NARROW_MARGIN + CATCH_HALF[landCatch];
         const half = CATCH_HALF[takeoffCatch];
-        const front = Math.min(TAKEOFF_STAND, TAKEOFF_NARROW_MARGIN + half);
-        let run = front + half + TAKEOFF_NARROW_MARGIN;
+        // Direction-dependent carry (shapes.ts carryCode) on narrow
+        // supports: an open trapdoor's panel or a ladder's top is a strip at
+        // the cell's EDGE and a pane is a line, so what they credit depends
+        // on which way the flight goes. Toward the strip's own edge the body
+        // is carried as on a full block; toward the far edge it must already
+        // be past centre (nothing to creep to, nothing to land short on);
+        // along a line, full. The class model stands for everything centred,
+        // so a post, a head, a pot and every full block keep their numbers.
+        const major = t.tx > t.tz ? t.tx : t.tz;
+        const majX = t.tx > t.tz;
+        const tCarry = this.carryAt(x, y - 1, z);
+        // An aimed line stands and lands off its cell's centre — and an END it
+        // moves needs a full top under it, since a post, a panel or a catch has
+        // no room beside its centre. Per end: a line that only moves the
+        // take-off may land on a post, and one that only moves the landing may
+        // leave from one.
+        if (t.pOff !== 0 && (takeoffCatch !== 0 || tCarry !== 0))
+            return;
+        if (t.qOff !== 0 && landCatch !== 0)
+            return;
+        const fwdX = majX ? sx : 0;
+        const fwdZ = majX ? 0 : sz;
+        const cFront = carrySide(tCarry, fwdX, fwdZ);
+        const cBack = carrySide(tCarry, -fwdX, -fwdZ);
+        // A diagonal leaves an edge panel across its WIDTH as well. Where the
+        // MINOR axis heads off the panel's empty side, the major one runs
+        // along the strip and the flight line crosses its 3/16: no creep and
+        // no run along it, a jump from the spot (arena mcc-2-2: (-3,+3) off a
+        // wall-mounted trapdoor ledge, planned with the run of the ledge's
+        // length and never flown). A jump whose MAJOR axis leaves the empty
+        // side is the ordinary one off a ledge, and flies ((-3,+1), same
+        // stage); a pure diagonal has no major axis and counts as crossing.
+        // MEASURED: narrowing this to PURE diagonals only (on the theory that a
+        // non-pure diagonal's major axis lies along the strip and can be run)
+        // restored the (3,2) off a trapdoor ledge that spiral3-b detours round
+        // — worth 1.03 of model cost but only 0.05 s on the clock — and cost
+        // parkouradv1 BOTH arrivals, spiral3-c 0.27 s and basic3 0.30 s. The
+        // extra panel edges it admits are flown worse than the detour. Left as
+        // it was; the real fix is a take-off model that tells "runs along the
+        // strip" from "crosses its 3/16", not a looser gate.
+        const offPanel = tCarry !== 0 && t.tx !== 0 && t.tz !== 0 &&
+            (carrySide(tCarry, majX ? 0 : sx, majX ? sz : 0) === 1 || (t.tx === t.tz && cFront === 1));
+        const front = offPanel || cFront === 1 ? 0 : cFront === 2 ? TAKEOFF_STAND : Math.min(TAKEOFF_STAND, TAKEOFF_NARROW_MARGIN + half);
+        const back = offPanel || cBack === 1 ? 0 : cBack === 2 ? 0.5 + TAKEOFF_NARROW_MARGIN : half + TAKEOFF_NARROW_MARGIN;
+        /** Half-extent the lip take-off (allowParkourMomentum) leaves from, toward the target. */
+        const lipHalf = offPanel || cFront === 1 ? -LAND_NARROW_MARGIN : cFront === 2 ? 0.5 : half;
+        let run = front + back;
+        // The landing's credit per axis: the side the body arrives at.
+        let lCredX = lCred;
+        let lCredZ = lCred;
+        if (landCatch > 0 && !Number.isNaN(supY)) {
+            const lCarry = this.carryAt(tx, supY, tz);
+            if (lCarry !== 0) {
+                if (t.tx !== 0) {
+                    const c = carrySide(lCarry, -sx, 0);
+                    lCredX = c === 2 ? LAND_HALF : c === 1 ? 0 : lCred;
+                }
+                if (t.tz !== 0) {
+                    const c = carrySide(lCarry, 0, -sz);
+                    lCredZ = c === 2 ? LAND_HALF : c === 1 ? 0 : lCred;
+                }
+            }
+        }
         const rx = x + t.runX * sx;
         const rz = z + t.runZ * sz;
-        if (this.isSafe(this.flagsAt(rx, y, rz)) && this.isSafe(this.flagsAt(rx, y + 1, rz))) {
+        if (!offPanel && this.isSafe(this.flagsAt(rx, y, rz)) && this.isSafe(this.flagsAt(rx, y + 1, rz))) {
             if ((this.flagsAt(rx, y - 1, rz) & PHYSICAL) !== 0 && this.catchAt(rx, y - 1, rz) === 0) {
                 // Level (or within step height) cell behind.
                 const hR = this.heightAt(rx, y - 1, rz);
@@ -1355,66 +1643,105 @@ export class MoveGen {
         let usable = rows[bucket];
         if (frac > 0)
             usable = usable + (rows[bucket - 1] - usable) * frac;
-        usable += this.marginCredit;
-        const fn = takeoffCatch === 0 && landCatch <= 0
+        let fn = takeoffCatch === 0 && landCatch <= 0
             ? t.fnStand
-            : flightFrom(t.tx, t.tz, t.dist, front * t.dist / (t.tx > t.tz ? t.tx : t.tz), lCred);
-        let feasible = fn <= usable;
-        // Any run at all flies the running arc (the corridor curves).
-        let needsRunning = row >= 1;
+            : flightFrom2(t.tx, t.tz, t.dist, front * t.dist / major, lCredX, lCredZ);
+        // Off a panel's empty side the body starts pressed to the panel's own
+        // side of the cell, not at its centre, and leaves without the sprint
+        // jam the standing row is measured with (the first tick goes into
+        // coming off the wall): the jump has to clear with room to spare.
+        if (offPanel)
+            fn += OFF_PANEL_MARGIN;
+        // An aimed line is that much longer than the centre line it was priced on.
+        fn += t.extra;
         // Would the STANDING row (a creep to the lip, jump from rest) fly it?
         // Executor information only (META_RUN); never changes what is emitted.
         const standRows = (low ? J_LOW_RUN : J_RUN)[0];
         let usableStand = standRows[bucket];
         if (frac > 0)
             usableStand = usableStand + (standRows[bucket - 1] - usableStand) * frac;
-        const runNeeded = fn > usableStand + this.marginCredit;
+        // Two passes over the reach test. The first keeps the profile's safety
+        // margin. Where it finds nothing, a TIGHT pass gives the margin back
+        // (the rows are the measured flight less ENVELOPE_SAFETY_MARGIN): the
+        // frame-perfect jump a practised player makes, offered at TIGHT_COST
+        // so the search only buys it where the comfortable envelope has no
+        // way through (arena mcc-4-1: ladder catches at (4,-2,5) off a 1x1).
+        let mc = this.marginCredit;
+        let tight = false;
+        let feasible = false;
+        let needsRunning = false;
+        let runNeeded = false;
         let chained = false;
         let lipJump = false;
-        if (chainVia < 0) {
-            if (!feasible && this.parkourMomentum) {
-                // Momentum (allowParkourMomentum): a RUNNING take-off leaves from
-                // the lip — half + 0.3 past centre plus the median tick phase
-                // (parkourEnvelope.ts LIP_STRIDE / LIP_PHASE) — tried only where
-                // the creep credit falls short, so every edge the plain model
-                // emits keeps its arc and its corridor; the lip corridor
-                // (mfLip) bounds the later, lower rising arc.
-                const sLip = (half + LAND_NARROW_MARGIN + LIP_PHASE) * t.dist / (t.tx > t.tz ? t.tx : t.tz);
-                if (flightFrom(t.tx, t.tz, t.dist, sLip, lCred) <= usable) {
-                    feasible = true;
-                    lipJump = true;
+        for (;;) {
+            const usableM = usable + mc;
+            let ok = true;
+            feasible = fn <= usableM;
+            // Any run at all flies the running arc (the corridor curves).
+            needsRunning = row >= 1;
+            runNeeded = fn > usableStand + mc;
+            chained = false;
+            lipJump = false;
+            if (chainVia < 0) {
+                if (!feasible && this.parkourMomentum && !offPanel) {
+                    // Momentum (allowParkourMomentum): a RUNNING take-off leaves from
+                    // the lip — half + 0.3 past centre plus the median tick phase
+                    // (parkourEnvelope.ts LIP_STRIDE / LIP_PHASE) — tried only where
+                    // the creep credit falls short, so every edge the plain model
+                    // emits keeps its arc and its corridor; the lip corridor
+                    // (mfLip) bounds the later, lower rising arc.
+                    const sLip = (lipHalf + LAND_NARROW_MARGIN + LIP_PHASE) * t.dist / major;
+                    if (flightFrom2(t.tx, t.tz, t.dist, sLip, lCredX, lCredZ) <= usableM) {
+                        feasible = true;
+                        lipJump = true;
+                    }
+                }
+                if (!feasible) {
+                    // Momentum (allowParkourMomentum): the body LANDED here from a
+                    // jump along momIn; a re-jump on the landing tick that continues
+                    // it (CHAIN_MIN_COS cone) flies the chain row from the same
+                    // far-side landing point the compound chain below uses, less the
+                    // measured turn loss. Never under a lid (no bonked chain row).
+                    if (this.momIn === MOM_NONE || low || t.aimIndex !== 0 || offPanel ||
+                        !this.chainAligned(this.momDx, this.momDz, this.momD2, t.tx * sx, t.tz * sz)) {
+                        ok = false;
+                    }
+                    else {
+                        const sChain = front * CHAIN_TAKEOFF_FRACTION * t.dist / major;
+                        const cosTurn = (this.momDx * (t.tx * sx) + this.momDz * (t.tz * sz)) / Math.sqrt(this.momD2 * (t.tx * t.tx + t.tz * t.tz));
+                        if (flightFrom2(t.tx, t.tz, t.dist, sChain, lCredX, lCredZ) > J_CHAIN[bucket] - CHAIN_TURN_LOSS * (1 - cosTurn) + mc) {
+                            ok = false;
+                        }
+                        else {
+                            needsRunning = true;
+                            chained = true;
+                        }
+                    }
                 }
             }
-            if (!feasible) {
-                // Momentum (allowParkourMomentum): the body LANDED here from a
-                // jump along momIn; a re-jump on the landing tick that continues
-                // it (CHAIN_MIN_COS cone) flies the chain row from the same
-                // far-side landing point the compound chain below uses, less the
-                // measured turn loss. Never under a lid (no bonked chain row).
-                if (this.momIn === MOM_NONE || low ||
-                    !this.chainAligned(this.momDx, this.momDz, this.momD2, t.tx * sx, t.tz * sz))
+            else {
+                // A chain is only worth an edge where the stone's own jump falls
+                // short. The executor lands the first hop on the FAR side of the stone
+                // (the same creep credit a standing jump gets, so a post lands at its
+                // tip's edge), and the re-jump flies the chain row from there — never
+                // under a lid, on the running arc.
+                if (feasible || low)
                     return;
-                const sChain = Math.min(TAKEOFF_STAND, TAKEOFF_NARROW_MARGIN + CATCH_HALF[takeoffCatch]) * CHAIN_TAKEOFF_FRACTION * t.dist / (t.tx > t.tz ? t.tx : t.tz);
-                const cosTurn = (this.momDx * (t.tx * sx) + this.momDz * (t.tz * sz)) / Math.sqrt(this.momD2 * (t.tx * t.tx + t.tz * t.tz));
-                if (flightFrom(t.tx, t.tz, t.dist, sChain, lCred) > J_CHAIN[bucket] - CHAIN_TURN_LOSS * (1 - cosTurn) + this.marginCredit)
-                    return;
-                needsRunning = true;
-                chained = true;
+                const sChain = front * CHAIN_TAKEOFF_FRACTION * t.dist / major;
+                if (flightFrom2(t.tx, t.tz, t.dist, sChain, lCredX, lCredZ) > J_CHAIN[bucket] + mc)
+                    ok = false;
+                else
+                    needsRunning = true;
             }
-        }
-        else {
-            // A chain is only worth an edge where the stone's own jump falls
-            // short. The executor lands the first hop on the FAR side of the stone
-            // (the same creep credit a standing jump gets, so a post lands at its
-            // tip's edge), and the re-jump flies the chain row from there — never
-            // under a lid, on the running arc.
-            if (feasible || low)
+            if (ok)
+                break;
+            if (tight || mc >= this.tightCredit)
                 return;
-            const sChain = Math.min(TAKEOFF_STAND, TAKEOFF_NARROW_MARGIN + CATCH_HALF[takeoffCatch]) * CHAIN_TAKEOFF_FRACTION * t.dist / (t.tx > t.tz ? t.tx : t.tz);
-            if (flightFrom(t.tx, t.tz, t.dist, sChain, lCred) > J_CHAIN[bucket] + this.marginCredit)
-                return;
-            needsRunning = true;
+            tight = true;
+            mc = this.tightCredit;
         }
+        if (tight)
+            cost += TIGHT_COST;
         // Corridor pass 2 — per cell the flight-curve bound mf = the lowest the
         // feet can be over that cell (standing curve when a standing takeoff is
         // possible — it is the lower of the two; bonked curves for head-hitters).
@@ -1437,11 +1764,19 @@ export class MoveGen {
             const lim = h0 + mf[k] + 0.05;
             const loLy = Math.floor(lim) - 1;
             for (let ly = y - 1; ly >= loLy; ly--) {
+                // A refusal here is this arc's (mf is per line): the centre
+                // line selects the variants that avoid the cell, a variant's
+                // says nothing about its siblings.
                 if (ly + 1 > lim) {
-                    if (!this.isSafe(this.flagsAt(cx, ly, cz)))
+                    if (!this.isSafe(this.flagsAt(cx, ly, cz)) && !this.thinClear(cx, ly, cz, t, k, sx, sz)) {
+                        if (landCatch === 0 && t.aimIndex === 0)
+                            this.extTryMask = this.thinAt(cx, ly, cz) !== 0 ? -1 : t.avoid[k];
                         return; // body cell
+                    }
                 }
-                else if (this.heightAt(cx, ly, cz) > lim) {
+                else if (this.heightAt(cx, ly, cz) > lim && !this.thinClear(cx, ly, cz, t, k, sx, sz)) {
+                    if (landCatch === 0 && t.aimIndex === 0)
+                        this.extTryMask = this.thinAt(cx, ly, cz) !== 0 ? -1 : t.avoid[k];
                     return; // pokes up into the flight path
                 }
             }
@@ -1467,7 +1802,7 @@ export class MoveGen {
         // arena's route book for no edge the cell lacks.
         if (this.parkourMomentum && landCatch >= 1 && rise >= -MOMENTUM_MAX_DROP)
             this.pendingMom = momentumOf(t.tx * sx, t.tz * sz);
-        const runBit = (runNeeded || lipJump) ? META_RUN : 0;
+        const runBit = (runNeeded || lipJump || tight) ? META_RUN : 0;
         if (chainVia >= 0) {
             this.pendingVia = chainVia;
             this.push(tx, nodeY, tz, chainBase + cost, META_PARKOUR | META_CHAIN | META_RUN);
@@ -1479,7 +1814,12 @@ export class MoveGen {
             this.push(tx, nodeY, tz, cost, META_PARKOUR | META_CHAIN | META_RUN);
         }
         else {
-            this.push(tx, nodeY, tz, cost, META_PARKOUR | runBit);
+            // Aimed line: the variant, and whether its side is mirrored in world
+            // space (the perpendicular flips with one mirrored axis, not two).
+            if (t.aimIndex !== 0)
+                this.pendingAim = t.aimIndex | (sx * sz < 0 ? 0x80 : 0);
+            const shiftBit = t.aimIndex !== 0 ? META_AIM : 0;
+            this.push(tx, nodeY, tz, cost, META_PARKOUR | runBit | shiftBit);
         }
     }
     /**
