@@ -239,6 +239,44 @@ describe('HopOracle', function () {
     expectFlies(o, q)
   })
 
+  it('bounces a chain of slime pads to a landing far past the first', () => {
+    // a ledge at y 8, a pad eight below and four out, a second pad six on,
+    // and a landing two up and four on from that: ten from the first pad
+    const x0 = -8
+    const y0 = -4
+    const z0 = -8
+    const w = 17
+    const h = 22
+    const l = 32
+    const states = new Int32Array(w * h * l).fill(AIR)
+    const put = (x: number, y: number, z: number, s: number): void => { states[((y - y0) * l + (z - z0)) * w + (x - x0)] = s }
+    for (const [x, , z] of floor([-2, 2], [-2, 1])) put(x, 8, z, STONE)
+    for (let x = -1; x <= 1; x++) for (let z = 3; z <= 5; z++) put(x, 0, z, SLIME)
+    for (let x = -1; x <= 1; x++) for (let z = 9; z <= 11; z++) put(x, 0, z, SLIME)
+    for (const [x, , z] of floor([-2, 2], [13, 15])) put(x, 2, z, STONE)
+    const stateAt = (x: number, y: number, z: number): number => {
+      const lx = x - x0
+      const ly = y - y0
+      const lz = z - z0
+      if (lx < 0 || lx >= w || ly < 0 || ly >= h || lz < 0 || lz >= l) return -1
+      return states[(ly * l + lz) * w + lx]
+    }
+    const o = new HopOracle({ ...tables, stateAt, grid: { states, x0, y0, z0, w, h, l } },
+      (x, y, z) => { const s = stateAt(x, y, z); return s < 0 ? 0 : lut.flags[s] }, 0.30001, 1.80001)
+    const p = o.hop([0, 9, 0], [0, 3, 14], performance.now() + 30000, 'simple')
+    expect(p).to.not.equal(null)
+    const q = p as HopProgram
+    expect(q.bounces?.length).to.equal(1)
+    expect(o.fly(q), 'from scratch').to.equal(q.ticks)
+    expect(o.verify(q), 'robust to its first rebound').to.equal(q.ticks)
+    // two rebounds on the way: the track comes down to the pads' top twice
+    const track: number[] = []
+    o.fly(q, 0, 0, track)
+    let downs = 0
+    for (let i = 4; i + 3 < track.length; i += 3) if (track[i] < 1.05 && track[i] < track[i - 3] && track[i] <= track[i + 3]) downs++
+    expect(downs).to.equal(2)
+  })
+
   it('offers the highest reached ground near the goal as vantage take-offs, above the stalled tail', () => {
     // reached: a floor at y 1 under the goal, and a ladder column (x -5) up to y 9
     const reached = (x: number, y: number, z: number): boolean =>

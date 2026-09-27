@@ -265,6 +265,13 @@ const CLIMB_PRESS = 0.6
  * along-wall aim the coast may end before the climb steers against it.
  */
 const CLIMB_DRIFT = 0.91 / 0.09
+/**
+ * A fall to the node deeper than this (blocks) is flown by landing aim (the
+ * drop-aim branch), to the landing: far past any parkour drop, whose apex
+ * sits four above its node and whose landing is a block's face to clear,
+ * not a column to come down in (spiral3-c: coasting there came up short).
+ */
+const DROP_AIM_ENTER = 8
 const CLIMB_HOLD = 0.15
 /** A final node on a climbable is held until the body is within this of its height. */
 const CLIMB_FINISH_DY = 0.2
@@ -540,6 +547,8 @@ export function createPathfinder (options: PathfinderOptions = {}) {
     let creepCell: { x: number, z: number } | null = null
     /** Slime-bounce phase, latched per node: has the rebound started? */
     let bounceNode: Move | null = null
+    /** The node a long drop is being flown to by landing aim (the drop-aim branch), latched to its landing. */
+    let dropAimNode: unknown = null
     let bounceRisen = false
     /** Momentum chain, latched per node: has the re-jump left the stone? */
     let chainNode: Move | null = null
@@ -1166,7 +1175,23 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       const postT0 = solveTimingOn ? performance.now() : 0
       if (!inTick) physics.beginTick?.() // between ticks: never reuse the last tick's block cache
       results.path = postProcessPath(results.path)
-      pathFromPlayer(results.path)
+      // Mid-jump (improvement): a path that arrives while the body is in the
+      // air on the way to a parkour landing starts at that landing, when it
+      // has it. pathFromPlayer starts a path at the node NEAREST the body in
+      // 3D, and off a deep drop that is anything but the landing — the
+      // take-off just behind, or the node after the landing if it sits a
+      // block higher: on the arena's mcc-4-2 partials streamed during a
+      // 31-block drop into a pool turned the flight back toward the ledge,
+      // then retired the pool 15 blocks up and steered for the node beyond
+      // it, and the body came down on the obsidian rim — dead, twice.
+      let flightAt = -1
+      if ((bot.entity as { onGround?: boolean }).onGround !== true && path.length > 0 &&
+          (path[0] as { parkour?: boolean }).parkour === true) {
+        const [fx, fy, fz] = (path[0] as Move).cell
+        flightAt = results.path.findIndex(n => n.cell[0] === fx && n.cell[1] === fy && n.cell[2] === fz)
+      }
+      if (flightAt >= 0) results.path.splice(0, flightAt)
+      else pathFromPlayer(results.path)
       if (solveTimingOn) {
         const now = performance.now()
         console.log(`[pf-timing] result ${raw.status} engine=${raw.engine ?? 'js'} final=${final} engineMs=${raw.time.toFixed(1)} visited=${raw.visitedNodes} nodes=${results.path.length} postMs=${(now - postT0).toFixed(2)} wallSinceDispatch=${(now - solveDispatchedAt).toFixed(1)} sinceGoal=${(now - goalSetAt).toFixed(1)}`)
@@ -3220,6 +3245,52 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         return
       }
 
+      // Down a long drop (improvement): aim the LANDING, not the heading.
+      // Holding forward at the node the whole way down arrives above it
+      // still moving, and 0.02 a tick of air control cannot take that back:
+      // on the arena's mcc-4-2, 31 blocks into a pool with an obsidian rim,
+      // the body passed over the water's centre at 0.23 a tick and came down
+      // on the rim — dead. So: where would the body come down if it coasted
+      // from here (the velocity summed under the air drag's 0.91 until the
+      // feet reach the node's level), and is the miss bigger than half of
+      // what one more tick of input moves that landing? Then press toward
+      // the miss; else coast. The landing converges on the node as the
+      // correction a tick buys shrinks with the ticks left.
+      {
+        const ent = bot.entity as { onGround?: boolean, velocity: Vec3 }
+        const drop = p.y - nextPoint.y
+        if (ent.onGround !== true && !swimming && ent.velocity.y < 0 && (drop > DROP_AIM_ENTER || (dropAimNode === nextPoint && drop > 0))) {
+          const feetB = bot.blockAt(p) as BlockLike | null
+          if (feetB === null || (feetB.type !== ladderId && feetB.type !== vineId)) {
+            dropAimNode = nextPoint
+            const v = ent.velocity
+            let y = p.y
+            let vy = v.y
+            let s = 0
+            // (over the column a block before the feet reach its level: a landing
+            // on a block is its top, not a face to meet on the way down)
+            while (y > nextPoint.y + 1 && s < 400) { y += vy; vy = (vy - 0.08) * 0.98; s++ }
+            const sum = (1 - Math.pow(0.91, s)) / 0.09
+            const ex = nextPoint.x - (p.x + v.x * sum)
+            const ez = nextPoint.z - (p.z + v.z * sum)
+            const err = Math.hypot(ex, ez)
+            if (err > 1e-4) bot.look(Math.atan2(-ex, -ez), 0, true)
+            bot.setControlState('forward', err > (0.02 * 0.98 * sum) / 2)
+            bot.setControlState('back', false)
+            bot.setControlState('left', false)
+            bot.setControlState('right', false)
+            bot.setControlState('sprint', false)
+            bot.setControlState('jump', false)
+            bot.setControlState('sneak', false)
+            cutTarget = null
+            hopHold = false
+            execBranch = 'drop-aim'
+            futile(swimming)
+            return
+          }
+        }
+      }
+
       // Corner cut (improvement): walk the line, not the staircase.
       //
       // The planner routes cell centre to cell centre over eight directions,
@@ -4271,10 +4342,16 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         // take-off with no stop at all; the line-up below is the fallback
         // (8-1's diagonal off a strip: 33 ticks of creep and lip wait before
         // the angled escape found a jump).
+        // And once more at rest, when that search ran moving: a landing that
+        // slides (slime's 0.8, ice) comes to rest somewhere else entirely
+        // (tenways-slime-way's third slime: none at touchdown, 16 ticks
+        // standing at the lip before the angled escape jumped).
+        const restNow = Math.hypot(bot.entity.velocity.x, bot.entity.velocity.z) < 0.01
         if (kernelTakeoff && (nextPoint as { parkour?: boolean }).parkour === true && !climbing && !swimming &&
-            (bot.entity as { onGround?: boolean }).onGround === true && takeoffSearched !== nextPoint) {
+            (bot.entity as { onGround?: boolean }).onGround === true &&
+            (takeoffSearched !== nextPoint || (restNow && !takeoffSearchedAtRest))) {
           takeoffSearched = nextPoint
-          takeoffSearchedAtRest = Math.hypot(bot.entity.velocity.x, bot.entity.velocity.z) < 0.01
+          takeoffSearchedAtRest = restNow
           if (cachedLut !== null) physics.setShapeTables?.(cachedLut)
           const live = physics.hopFrom?.((nextPoint as Move).cell, TAKEOFF_SEARCH_MS) ?? null
           takeoffNote = physics.hopNote ?? ''
