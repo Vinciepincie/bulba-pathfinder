@@ -330,6 +330,8 @@ const AIM_COS = Float64Array.from({ length: AIM_STEPS }, (_, i) => Math.cos((i /
 const AIM_SIN = Float64Array.from({ length: AIM_STEPS }, (_, i) => Math.sin((i / AIM_STEPS) * 2 * Math.PI))
 /** Where across a landing arc the extra headings go, and how far (sweep steps) from the best one they must be. */
 const AIM_SPREAD = [0.2, 0.8]
+/** The search's reach test (HopOracle.canReach); PF_REACH_PRUNE=0 turns it off for A/B runs. */
+const REACH_PRUNE = typeof process === 'undefined' || process.env.PF_REACH_PRUNE !== '0'
 const AIM_DISTINCT = 4
 
 function pushAim (out: Heading[], i: number): void {
@@ -371,14 +373,14 @@ export class HopOracle {
   }
 
   private kindAt (x: number, y: number, z: number): number {
-    const s = this.world.stateAt(x, y, z)
+    const s = this.sim.stateAt(x, y, z)
     return s < 0 ? 0 : this.world.kind[s]
   }
 
   /** The top of the cell's highest collision box, relative to the cell (0 when it has none). */
   private cellTop (x: number, y: number, z: number): number {
     const w = this.world
-    const s = w.stateAt(x, y, z)
+    const s = this.sim.stateAt(x, y, z)
     if (s < 0 || w.shapeStart[s] < 0) return 0
     let top = 0
     for (let k = 0; k < w.shapeCount[s]; k++) top = Math.max(top, w.boxes[(w.shapeStart[s] + k) * 6 + 4])
@@ -387,7 +389,7 @@ export class HopOracle {
 
   /** Does the cell hold any collision box? */
   private shaped (x: number, y: number, z: number): boolean {
-    const s = this.world.stateAt(x, y, z)
+    const s = this.sim.stateAt(x, y, z)
     return s >= 0 && this.world.shapeStart[s] >= 0 && this.world.shapeCount[s] > 0
   }
 
@@ -422,7 +424,7 @@ export class HopOracle {
     const hit = this.standCache.get(k)
     if (hit !== undefined) return hit
     const out: Stand[] = []
-    if (this.world.stateAt(x, y, z) >= 0 && this.world.stateAt(x, y + 1, z) >= 0) {
+    if (this.sim.stateAt(x, y, z) >= 0 && this.sim.stateAt(x, y + 1, z) >= 0) {
       if ((this.kindAt(x, y, z) & SIM_CLIMBABLE) !== 0) {
         out.push({ x: x + 0.5, y, z: z + 0.5, catch: true })
       } else if (this.shaped(x, y, z) || this.shaped(x, y - 1, z) || this.shaped(x, y - 2, z)) {
@@ -430,7 +432,12 @@ export class HopOracle {
         // Dropped from just above the feet cell's own boxes (a thin floor):
         // from any higher, a ceiling two blocks up (a hoop's top, a
         // headhitter) has the body start embedded in it.
-        const drop = y + this.cellTop(x, y, z) + 0.001
+        // ...and above what reaches up into it from the cell below: a fence
+        // or a wall is a box 1.5 tall, its top half a block into the feet
+        // cell, and a body dropped from the cell's floor started inside it —
+        // no stand on any post (parkouradv1's fence posts: every take-off
+        // search onto one came back empty, and the run-up line-up flew them)
+        const drop = y + Math.max(this.cellTop(x, y, z), this.cellTop(x, y - 1, z) - 1) + 0.001
         const tryAt = (ox: number, oz: number): void => {
           const b = newBody(x + ox, drop, z + oz)
           // a body dropped INTO a pane or a panel falls through it and
@@ -450,7 +457,7 @@ export class HopOracle {
         const w = this.world
         const e = this.sim.halfWidth - LAND_OVERLAP
         for (const yy of [y - 1, y]) {
-          const s = w.stateAt(x, yy, z)
+          const s = this.sim.stateAt(x, yy, z)
           if (s < 0 || w.shapeStart[s] < 0) continue
           for (let k = 0; k < w.shapeCount[s]; k++) {
             const o = (w.shapeStart[s] + k) * 6
@@ -547,6 +554,33 @@ export class HopOracle {
     return d
   }
 
+  /**
+   * Can a flight from airborne `b` still come down in column (tx, tz) at
+   * level `ty` or above? The most ground it covers before it has fallen
+   * past that level — forward held on any headings — is the speed it carries
+   * and its air acceleration, summed over the ticks the fall takes, and
+   * nothing in the way adds to either. (PF_REACH_PRUNE=0 flies everything,
+   * for A/B runs: the programs found are the same.)
+   */
+  private canReach (b: SimBody, sprint: boolean, tx: number, ty: number, tz: number): boolean {
+    let y = b.y
+    let vy = b.vy
+    let n = 0
+    while (n < MAX_AIR && !(vy < 0 && y < ty)) {
+      y += vy
+      vy = (vy - SIM.gravity) * SIM.airdrag
+      n++
+    }
+    const drag = SIM.airborneInertia
+    const sum = (1 - Math.pow(drag, n)) / (1 - drag)
+    const reach = Math.hypot(b.vx, b.vz) * sum + airAccel(sprint) * (n - drag * sum) / (1 - drag)
+    // (to the column widened by what a box may hang over its edge: overCol)
+    const e = this.sim.halfWidth - LAND_OVERLAP
+    const dx = Math.max(tx - e - b.x, 0, b.x - tx - 1 - e)
+    const dz = Math.max(tz - e - b.z, 0, b.z - tz - 1 - e)
+    return dx * dx + dz * dz <= (reach + 1e-6) * (reach + 1e-6)
+  }
+
   private aimHeadings (b: SimBody, sprint: boolean, tx: number, tz: number, landY: number, out: Heading[]): void {
     out.length = 0
     const disc = this.landingDisc(b, sprint, landY)
@@ -559,7 +593,7 @@ export class HopOracle {
     const drag = SIM.airborneInertia
     // the slide: the landing tick's air drag, then ground friction on the
     // landing block to rest — velocity (drag · w_{s-1}) times 1/(1 - slip·0.91)
-    const under = this.world.stateAt(tx, Math.floor(landY - 1), tz)
+    const under = this.sim.stateAt(tx, Math.floor(landY - 1), tz)
     const slip = under >= 0 && this.world.slip[under] > 0 ? this.world.slip[under] : SIM.defaultSlipperiness
     const slide = drag / (1 - slip * SIM.airborneInertia)
     const q1 = Math.pow(drag, s - 1)
@@ -699,7 +733,7 @@ export class HopOracle {
       let hx = x + 0.5
       let hz = z + 0.5
       const w = this.world
-      const st = w.stateAt(x, y, z)
+      const st = this.sim.stateAt(x, y, z)
       if (st >= 0 && w.shapeStart[st] >= 0 && w.shapeCount[st] > 0) {
         const o = w.shapeStart[st] * 6
         const hw = this.sim.halfWidth
@@ -1100,7 +1134,7 @@ export class HopOracle {
     const d = Math.hypot(dx, dz)
     const along = d > 1e-6 ? (b.vx * dx + b.vz * dz) / d : 0
     if (along >= BEAM_SPRINT_SPEED) return 0
-    const under = this.world.stateAt(Math.floor(b.x), Math.floor(b.y - 1), Math.floor(b.z))
+    const under = this.sim.stateAt(Math.floor(b.x), Math.floor(b.y - 1), Math.floor(b.z))
     const slip = (under >= 0 && this.world.slip[under] > 0 ? this.world.slip[under] : SIM.defaultSlipperiness) * SIM.airborneInertia
     const accel = this.sim.speedBase * 1.3 * 0.98 * (0.1627714 / (slip * slip * slip))
     return (BEAM_SPRINT_SPEED - along) / Math.max(accel * (1 - slip) * 3, 1e-3)
@@ -1317,6 +1351,10 @@ export class HopOracle {
     for (const pad of pads) {
       const st = pad.f.b
       const climb = this.climbing(st)
+      // The reach test (canReach) holds for a flight that only falls: not
+      // where slime may throw it back up, nor off a climbable it may regain.
+      const falls = REACH_PRUNE && family !== 'bounce' && !climb && !slimeLand &&
+        this.slimeTops(Math.floor(st.x), Math.floor(st.y + 1e-9), Math.floor(st.z)).length === 0
       for (const cls of this.classes(family, st, aims, tcx, tcz, walk, grid)) {
         if ((++n & 3) === 0 && performance.now() > deadline) { this.noVerdict = true; return this.quickestRobust(found, deadline) }
         // the run (no jump) and the first air phase (no turn) of this class
@@ -1330,7 +1368,9 @@ export class HopOracle {
           // ran off an edge before tick j: no later jump tick is pressed either
           const walkedOff = run.fired
           const pj: HopProgram = { ...base, jumpAt: j }
-          if (this.advance(flightInto(launch, run), pj, Infinity, 0, null) === FLYING) {
+          // (a take-off the landing is out of reach of: no turn brings it in)
+          if (this.advance(flightInto(launch, run), pj, Infinity, 0, null) === FLYING &&
+              (!falls || this.canReach(launch.b, cls.sprint, t[0], t[1], t[2]))) {
             flightInto(air, launch)
             for (const k of cls.turnAirs) {
               const ra = this.advance(air, pj, Infinity, k, null)
@@ -1339,6 +1379,8 @@ export class HopOracle {
                 if (ra >= 0) found.push({ ...pj, turnAir: k, ticks: ra })
                 break
               }
+              // flown out of reach on the first heading: so is every later turn
+              if (falls && !this.canReach(air.b, cls.sprint, t[0], t[1], t[2])) break
               aimed.length = 0
               if (cls.aim) {
                 if (catchTarget) aimed.push(point(tcx, tcz))

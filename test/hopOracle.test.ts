@@ -330,4 +330,39 @@ describe('HopOracle', function () {
     }
     expect(aimed).to.be.greaterThan(50)
   })
+
+  it('never rules out a column a flight can come down in (the reach test)', () => {
+    // open air over a floor far below, and walls to hit: flights on headings
+    // changed every few ticks, each column passed at or above a level asked
+    const o = oracleOver([...floor([-8, 8], [-8, 11]).map(([x, , z]): [number, number, number] => [x, -4, z]),
+      [2, 1, 2], [2, 2, 2], [-3, 0, 4], [-3, 1, 4]], true) as unknown as {
+      canReach: (b: unknown, sprint: boolean, tx: number, ty: number, tz: number) => boolean
+      sim: { step: (b: unknown, c: unknown) => void }
+    }
+    let seed = 12345
+    const rnd = (): number => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff }
+    let asked = 0
+    for (let k = 0; k < 300; k++) {
+      const sprint = k % 3 !== 0
+      const b0 = newBody(-1 + rnd() * 3, 1 + rnd() * 2, rnd() * 3)
+      b0.vx = (rnd() - 0.5) * 0.6
+      b0.vy = rnd() * 0.42 - 0.1
+      b0.vz = (rnd() - 0.5) * 0.6
+      const ty = Math.floor(b0.y) - (k % 4)
+      const b = { ...b0 }
+      const c = { forward: true, back: false, left: false, right: false, jump: false, sprint, sneak: false, hx: 0, hz: 1 }
+      for (let t = 0; t < 60 && !b.onGround && b.y >= ty; t++) {
+        if (t % 3 === 0) { const a = rnd() * 2 * Math.PI; c.hx = Math.cos(a); c.hz = Math.sin(a) }
+        o.sim.step(b, c)
+        if (b.y < ty) break
+        expect(o.canReach(b0, sprint, Math.floor(b.x), ty, Math.floor(b.z)), `flight ${k} tick ${t}`).to.equal(true)
+        asked++
+      }
+    }
+    expect(asked).to.be.greaterThan(1500)
+    // and it does rule out: a column nine blocks off a standing jump
+    const up = newBody(0.5, 1, 0.5)
+    up.vy = 0.42
+    expect(o.canReach(up, true, 0, 1, 9)).to.equal(false)
+  })
 })

@@ -38,6 +38,11 @@ import { serializeGoal, goalNeedsRaycast, descriptorTargets } from './goalSerde.
 import { TAKEOFF_STAND, TAKEOFF_NARROW_MARGIN, CHAIN_TAKEOFF_FRACTION } from './parkourEnvelope.js'
 import { CATCH_HALF, topCatchClass } from './shapes.js'
 import { headingDir, programHeading, sneakLanding, F_FWD, F_SPRINT, F_JUMP, LAND_OVERLAP } from './hopOracle.js'
+import { HOP_TURN_COS, PARKOUR_LAND_DY, strafeYaw } from './gaitSearch.js'
+import { landingHurts, SAFE_FALL } from './fallDamage.js'
+import { simKindOf } from './playerSim.js'
+import { sideStandoff, wallSlide, againstWall as wallAhead, SPRINT_WALL_MARGIN, STEP_UP_MIN, WALK_STEP_REACH } from './wallSteer.js'
+import type { Heading as SteerHeading } from './wallSteer.js'
 import type { HopProgram } from './hopOracle.js'
 import { getSharedWorkerHost } from './worker/host.js'
 import * as geometry from './geometry.js'
@@ -95,29 +100,6 @@ interface BlockLike {
 const FORCED_MOVE_GRACE_MS = 3000
 
 /**
- * How far from a wall the body has to be for sprinting to be safe. Any
- * positive margin makes exact contact — what prismarine-physics leaves after
- * every horizontal collision — count as "against the wall".
- */
-const SPRINT_WALL_MARGIN = 0.03
-
-/**
- * A walking step is at most a diagonal; anything longer is a jump and must
- * not be re-steered along a wall.
- */
-const WALK_STEP_REACH = 1.8
-
-/** How far ahead the wall-slide probe looks — over one tick of sprinting. */
-const SLIDE_PROBE = 0.35
-
-/**
- * Sideways probe for a body FLUSH with a wall it is walking along. Slightly
- * more than SPRINT_WALL_MARGIN plus playerCollides' own inset, so the probe
- * fires on exactly the contact the sprint gate refuses.
- */
-const SIDE_TOUCH = 0.06
-
-/**
  * Consecutive airborne ticks before "not on the ground" is believed. Both
  * mineflayer (after any server position packet) and prismarine-physics (on a
  * post's edge) report onGround=false for a single tick while the body is
@@ -126,25 +108,6 @@ const SIDE_TOUCH = 0.06
  */
 const AIRBORNE_TICKS = 2
 
-/**
- * Steering bias AWAY from a wall we are sliding along, as a fraction of the
- * along-wall component. Sliding with a heading exactly parallel is not enough:
- * whatever momentum the bot still carries into the wall gets clamped, and a
- * clamped position sits EXACTLY on the block face — the one value the server
- * disagrees with us about, because prismarine-physics reconstructs the body
- * from `minZ + halfWidth` while the server reconstructs it from the centre,
- * and the two round to opposite sides of the boundary (the 1.21 hitbox
- * precision class again — see geometry.ts). A hair of standoff keeps every
- * position we claim unambiguously outside the block.
- */
-const WALL_STANDOFF = 0.25
-
-/**
- * Above this, the next node is something to climb ONTO, not a wall to walk
- * around: a shelf, a step, a ladder exit. Steering away from it there is how a
- * wall-slide turns a one-block step-up into an unreachable node.
- */
-const STEP_UP_MIN = 0.1
 /**
  * Run-up line-up (the creep branch). A jump the planner flagged META_RUN is
  * given RUN_UP_ATTEMPTS lines-ups (any other parkour node one); each backs
@@ -290,9 +253,6 @@ const SHIFT_LINE_TOL = 0.1
  */
 const THIN_CREEP_MIN = 0.2
 
-/** Ground distance one sprinting tick covers, the sprint gate's look-ahead. */
-const SPRINT_TICK = 0.3
-
 /**
  * Arrival box height while sprint-hopping. The hop apex is 1.25 above the
  * take-off, so upstream's |dy| < 1 would fly the bot over a node without
@@ -300,13 +260,6 @@ const SPRINT_TICK = 0.3
  */
 const HOP_ARRIVE_DY = 1.45
 
-/**
- * Cosine of the largest angle between the body's velocity and the commanded
- * heading at which a sprint-hop may still take off (20°). See the take-off
- * decision in the sprint branch: a hop into a sharper turn flies the OLD
- * heading and lands off the line. PF_HOP_TURN_DEG overrides it for A/B runs.
- */
-const HOP_TURN_COS = Math.cos((Number(process.env.PF_HOP_TURN_DEG ?? 20) || 20) * Math.PI / 180)
 
 /**
  * Parkour nodes this close ahead switch the corner cut off. A cut ends with
@@ -392,30 +345,19 @@ const CUT_MARGIN_LEN = Number(process.env.PF_CUT_MARGIN_LEN ?? 5) || 5
 const CUT_LAG_NEAR = 2
 
 /**
- * Under a live cut the wall-slide probes only the axes the chord actually
- * moves along: a component below this fraction of the heading is a line
- * running a few degrees off a wall, not into it.
+ * A landing that hurts (fallDamage.ts) is followed by an entity_velocity
+ * packet that overwrites the client's motion with the server's: horizontal
+ * ZERO. Traced on the arena's parkouradv1: the bot landed a 4.25-block drop
+ * on a fence post, the rollout approved the next take-off with the landing
+ * speed, the packet arrived, and the jump left from rest and fell short. So
+ * after such a landing the executor decides nothing until the packet is in.
+ * It comes before the next tick at best and four ticks late when the server
+ * stalls (both traced), so no fixed wait is right: this many ticks, plus the
+ * ping's, is only when the executor stops waiting for it.
  */
-const SLIDE_AXIS_MIN = 0.2
-
-/**
- * How far ABOVE a parkour node the body may be and still retire it in the
- * air. Roughly one tick of fall: at that height the landing is committed, so
- * holding the node buys nothing and costs the momentum the next move wants.
- */
-const PARKOUR_LAND_DY = 0.5
-/**
- * Fall (apex to landing, blocks) past which vanilla deals damage — and, with
- * the damage, sends the client an entity_velocity packet that overwrites its
- * motion with the server's: horizontal ZERO. Traced on the arena's
- * parkouradv1 (bench/arena/.run/scratch/exec3-*.jsonl): the bot landed a
- * 4.25-block drop on a fence post, the rollout approved the next take-off on
- * the landing tick with the landing speed, the packet arrived before the
- * next physics tick, and the jump left from rest and fell short. So after a
- * damaging landing the executor sits out the tick (plus the ping) the packet
- * needs, and decides from the velocity it actually has.
- */
-const FALL_DAMAGE_DISTANCE = 3
+const HURT_WAIT_TICKS = 8
+/** The most a body falls in a tick (terminal velocity, 3.92). */
+const MAX_TICK_DROP = 4
 
 /**
  * Air (of mineflayer's 0..20) below which the executor abandons the node and
@@ -501,6 +443,18 @@ export function createPathfinder (options: PathfinderOptions = {}) {
     let hopHold = false
     /** The hop in the air was chosen by the kernel (allowHopIntoJump): flown as it was flown there. */
     let kernelHop = false
+    /** ...its flight (PhysicsSim.hopFlight), and the tick of it being flown. */
+    /** The executor's collision probe for the wall steering (wallSteer.ts), and its scratch heading. */
+    const boxProbe = (x: number, y: number, z: number): boolean => geometry.playerCollides(bot, x, y, z)
+    const steer: SteerHeading = { dx: 0, dz: 0 }
+    let khopFlight: number[] | null = null
+    let khopTick = 0
+    /** ...with the strafe key held after the take-off's tick (GaitResult.strafe). */
+    let khopStrafe = false
+    /** The gait pressed the strafe key this tick: released at the top of the next. */
+    let gaitStrafed = false
+    /** The node being walked round a corner over nothing (the hug-corner rule), until it is retired. */
+    let hugNode: unknown = null
     /**
      * Physics-verified hop being flown (Move.program, allowParkourPhysics):
      * the node, the phase (0 lining up at the program's start, 1 replaying),
@@ -566,10 +520,15 @@ export function createPathfinder (options: PathfinderOptions = {}) {
     const bannedCells = new Map<string, number>()
     /** The parkour node `creepCell` was latched for. */
     let creepNode: Move | null = null
-    /** Highest point of the current flight, for the fall-damage settle (FALL_DAMAGE_DISTANCE). */
-    let airPeakY = -Infinity
-    let wasAirborne = false
+    /** The fall so far, as the server counts it, for the landings that hurt (HURT_WAIT_TICKS). */
+    let fallen = 0
+    /** Ticks left to wait for the velocity packet of a landing that hurt, and whether it came. */
     let landSettle = 0
+    let hurtSeen = false
+    /** The server counts the whole fall (fallDamage.ts): the version's rule, until a packet says otherwise. */
+    let wholeFall = (bot.registry as unknown as { isNewerOrEqualTo?: (v: string) => boolean }).isNewerOrEqualTo?.('1.21.5') === true
+    /** Ticks since a landing only the older rule hurts, in which a velocity packet proves that rule. */
+    let spared = 0
     /** Consecutive ticks with onGround=false (see AIRBORNE_TICKS). */
     let airTicks = 0
     let prevTickY = 0
@@ -1176,22 +1135,30 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       if (!inTick) physics.beginTick?.() // between ticks: never reuse the last tick's block cache
       results.path = postProcessPath(results.path)
       // Mid-jump (improvement): a path that arrives while the body is in the
-      // air on the way to a parkour landing starts at that landing, when it
-      // has it. pathFromPlayer starts a path at the node NEAREST the body in
-      // 3D, and off a deep drop that is anything but the landing — the
-      // take-off just behind, or the node after the landing if it sits a
+      // air on the way to a parkour landing starts at that landing — the
+      // flight is committed, and nothing the new path says changes where it
+      // comes down. Where the path has the landing, from there on; where it
+      // has not (a partial of a search still running: its best guess moves
+      // about), the landing is kept in front of it, and the path is taken up
+      // from the ground. pathFromPlayer starts a path at the node NEAREST the
+      // body in 3D, and off a deep drop that is anything but the landing —
+      // the take-off just behind, or the node after the landing if it sits a
       // block higher: on the arena's mcc-4-2 partials streamed during a
       // 31-block drop into a pool turned the flight back toward the ledge,
       // then retired the pool 15 blocks up and steered for the node beyond
-      // it, and the body came down on the obsidian rim — dead, twice.
+      // it, and the body came down on the obsidian rim — dead.
+      const flying = (bot.entity as { onGround?: boolean }).onGround !== true && path.length > 0 &&
+        (path[0] as { parkour?: boolean }).parkour === true
       let flightAt = -1
-      if ((bot.entity as { onGround?: boolean }).onGround !== true && path.length > 0 &&
-          (path[0] as { parkour?: boolean }).parkour === true) {
+      if (flying) {
         const [fx, fy, fz] = (path[0] as Move).cell
         flightAt = results.path.findIndex(n => n.cell[0] === fx && n.cell[1] === fy && n.cell[2] === fz)
       }
       if (flightAt >= 0) results.path.splice(0, flightAt)
-      else pathFromPlayer(results.path)
+      else {
+        pathFromPlayer(results.path)
+        if (flying) results.path.unshift(path[0])
+      }
       if (solveTimingOn) {
         const now = performance.now()
         console.log(`[pf-timing] result ${raw.status} engine=${raw.engine ?? 'js'} final=${final} engineMs=${raw.time.toFixed(1)} visited=${raw.visitedNodes} nodes=${results.path.length} postMs=${(now - postT0).toFixed(2)} wallSinceDispatch=${(now - solveDispatchedAt).toFixed(1)} sinceGoal=${(now - goalSetAt).toFixed(1)}`)
@@ -2361,6 +2328,14 @@ export function createPathfinder (options: PathfinderOptions = {}) {
     }
 
     function monitorMovementInner (): void {
+      // The gait's strafe key (allowStrafe) is held for the tick it was
+      // pressed on: no branch but the one that pressed it knows to let it go,
+      // and held through a brake it walked the body off its platform (arena
+      // mcc-8-1, sideways under sneak until the sneak ended).
+      if (gaitStrafed) {
+        gaitStrafed = false
+        bot.setControlState('left', false)
+      }
       // Improvement: a requested stop takes effect within one tick, even
       // mid-edge — controls are always released.
       if (stopPathing) {
@@ -2835,7 +2810,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
 
 
       // A landing that hurt is a landing whose speed the server is about to
-      // take away (FALL_DAMAGE_DISTANCE): no take-off decision on that tick.
+      // take away (HURT_WAIT_TICKS): no take-off decision until it has.
       // Standing still for a tick costs nothing on a full block, and on a
       // post it is the only thing that does not walk off it.
       //
@@ -2854,30 +2829,32 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         } else {
           airTicks = 0
         }
+        // The fall as the server counts it: every tick's descent, the
+        // landing's too, until the ground, water or a ladder takes it.
+        // (More than a tick can fall is a teleport.)
+        const drop = prevTickY - p.y
         prevTickY = p.y
         prevTickPos = p.clone()
-        if (!grounded && !swimming) {
-          wasAirborne = true
-          if (p.y > airPeakY) airPeakY = p.y
-        } else if (wasAirborne) {
-          wasAirborne = false
-          // (a rebound off slime is no landing: vanilla takes no fall damage
-          // there unless sneaking, which is what cancels the rebound)
-          const under = grounded && bot.entity.velocity.y > 0.05 ? bot.blockAt(p.offset(0, -0.2, 0)) as { name?: string } | null : null
-          const rebound = under !== null && under.name === 'slime_block'
-          if (grounded && !rebound && airPeakY - p.y > FALL_DAMAGE_DISTANCE) {
-            // Two ticks at zero ping, not one: the server processes the
-            // landing position on ITS next tick and the damage velocity
-            // packet comes back a tick after that. Traced on parkouradv1's
-            // fence-post landing: settle at tick N, packet at N+1 — and in
-            // between the gates had approved a delayed jump and pressed
-            // forward, which put the body on the post's edge with the sneak
-            // guard off when the packet flipped onGround. Off it went.
-            const ping = (bot as unknown as { player?: { ping?: number } }).player?.ping ?? 0
-            landSettle = 2 + Math.min(4, Math.ceil(ping / 50))
+        if (spared > 0) spared--
+        // (water and a climbable take the fall with them: caughtNow off the ground is one or the other)
+        if ((caughtNow && !grounded) || drop > MAX_TICK_DROP) fallen = 0
+        else if (drop > 0 && (!grounded || fallen > 0)) fallen += drop
+        if (grounded) {
+          if (fallen > SAFE_FALL) {
+            const under = simKindOf((bot.blockAt(p.offset(0, -0.2, 0)) as { name?: string } | null)?.name ?? '', false)
+            const sneaking = (bot.controlState as unknown as Record<string, boolean>).sneak
+            const last = Math.max(0, drop)
+            if (landingHurts(fallen, last, under, sneaking, wholeFall)) {
+              const ping = (bot as unknown as { player?: { ping?: number } }).player?.ping ?? 0
+              landSettle = HURT_WAIT_TICKS + Math.min(4, Math.ceil(ping / 50))
+              hurtSeen = false
+            } else if (wholeFall && landingHurts(fallen, last, under, sneaking, false)) {
+              spared = HURT_WAIT_TICKS
+            }
           }
-          airPeakY = -Infinity
+          fallen = 0
         }
+        if (hurtSeen) landSettle = 0
         // (not in the middle of a control program's replay: its flight was
         // verified as flown, touch-downs and all, and a tick taken from it
         // desyncs every phase counter after — the landing that ends it
@@ -3608,6 +3585,31 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         }
       }
 
+      // Round a corner over nothing (improvement): a flat diagonal step with
+      // one corner blocked and no floor in the other is walked hard against
+      // the blocked one. The two supports touch at a point, and a body gets
+      // from one to the other only by passing within a tick's travel of the
+      // blocked corner's edge — which is where aiming at the node puts it:
+      // the physics slides it along the face and round the end. The wall
+      // standoff and the wall-slide both hold it OFF that face, over the
+      // hole. On the arena's climb2 the body walked off its block there, was
+      // given a jump from the air onto the raised step beyond its node, and
+      // came back down: 22 ticks for a step of six. Latched to the node: a
+      // body half round the corner is in the open corner's own cell.
+      if (hugNode !== nextPoint && walkNode && !swimming && !squeezed && Math.abs(dy) <= 0.1) {
+        const bx = Math.floor(p.x)
+        const by = Math.floor(p.y + 0.001)
+        const bz = Math.floor(p.z)
+        const tx = Math.floor(nextPoint.x)
+        const tz = Math.floor(nextPoint.z)
+        if (Math.abs(tx - bx) === 1 && Math.abs(tz - bz) === 1) {
+          const openA = !geometry.playerCollides(bot, tx + 0.5, by, bz + 0.5)
+          const openB = !geometry.playerCollides(bot, bx + 0.5, by, tz + 0.5)
+          if (openA !== openB && !geometry.isStandable(bot, new Vec3(openA ? tx : bx, by, openA ? bz : tz))) hugNode = nextPoint
+        }
+      }
+      const hugCorner = hugNode === nextPoint
+
       // Climb aid (improvement): with the next node directly ABOVE, the look
       // direction is degenerate — steer into an adjacent solid block instead
       // so 'forward' presses against it. Both vanilla and prismarine-physics
@@ -3796,21 +3798,13 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       // slide uses, on the chord being walked (a corner cut included), and
       // only where the ground continues that way. Before the sprint gate, so
       // its one-tick look-ahead probes the heading actually taken.
-      if (!climbing && !swimming && (nextPoint as { parkour?: boolean }).parkour !== true &&
+      if (!climbing && !swimming && !hugCorner && (nextPoint as { parkour?: boolean }).parkour !== true &&
           dy <= STEP_UP_MIN && Math.hypot(dx, dz) > 0.15) {
-        const floorAway = (ox: number, oz: number): boolean =>
-          geometry.playerCollides(bot, p.x + ox, p.y - 0.55, p.z + oz)
-        const negX = geometry.playerCollides(bot, p.x - SIDE_TOUCH, p.y, p.z)
-        const posX = geometry.playerCollides(bot, p.x + SIDE_TOUCH, p.y, p.z)
-        const negZ = geometry.playerCollides(bot, p.x, p.y, p.z - SIDE_TOUCH)
-        const posZ = geometry.playerCollides(bot, p.x, p.y, p.z + SIDE_TOUCH)
-        if (negX !== posX && Math.abs(dz) >= Math.abs(dx)) {
-          const away = negX ? 1 : -1
-          if (floorAway(away * 0.3, 0)) dx += away * Math.abs(dz) * WALL_STANDOFF
-        } else if (negZ !== posZ && Math.abs(dx) >= Math.abs(dz)) {
-          const away = negZ ? 1 : -1
-          if (floorAway(0, away * 0.3)) dz += away * Math.abs(dx) * WALL_STANDOFF
-        }
+        steer.dx = dx
+        steer.dz = dz
+        sideStandoff(boxProbe, p.x, p.y, p.z, steer)
+        dx = steer.dx
+        dz = steer.dz
       }
 
       // Sprint gate. A vanilla client cancels sprinting the moment a
@@ -3829,10 +3823,8 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       // the touching position it refuses has already been sent. Reacting
       // instead of predicting was worth 7 corrections on this route; looking
       // ahead took it to none.
-      const slideLen = Math.hypot(dx, dz)
-      const againstWall = !climbing && (geometry.nearWall(bot, SPRINT_WALL_MARGIN) ||
-        (slideLen > 0.01 && geometry.playerCollides(
-          bot, p.x + dx / slideLen * SPRINT_TICK, p.y, p.z + dz / slideLen * SPRINT_TICK)))
+      const againstWall = !climbing &&
+        wallAhead(boxProbe, geometry.nearWall(bot, SPRINT_WALL_MARGIN), p.x, p.y, p.z, dx, dz)
       // The one exception is a parkour jump already in flight: it was
       // approved on a rollout that held sprint the whole way, and a corner
       // nick mid-arc is exactly what that model tolerates. Cutting sprint
@@ -3867,37 +3859,32 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       const slideLive = cutTarget !== null
       const slideDx = slideLive ? dx : nodeDx
       const slideDz = slideLive ? dz : nodeDz
-      if (!climbing && (nextPoint as { parkour?: boolean }).parkour !== true &&
+      if (!climbing && !hugCorner && (nextPoint as { parkour?: boolean }).parkour !== true &&
           dy <= STEP_UP_MIN && (slideLive || Math.hypot(nodeDx, nodeDz) <= WALK_STEP_REACH)) {
         // (plain steps too: down a one-wide tunnel a lateral part of 0.01
         // picked a wall to probe, and the standoff steered 14° into the
         // other one — arena tunnel1, a hop pressed against it, +2.3 s)
-        const slideLen = Math.hypot(slideDx, slideDz) || 1
-        const sx = Math.abs(slideDx) / slideLen < SLIDE_AXIS_MIN ? 0 : Math.sign(slideDx)
-        const sz = Math.abs(slideDz) / slideLen < SLIDE_AXIS_MIN ? 0 : Math.sign(slideDz)
-        const xBlocked = sx !== 0 && geometry.playerCollides(bot, p.x + sx * SLIDE_PROBE, p.y, p.z)
-        const zBlocked = sz !== 0 && geometry.playerCollides(bot, p.x, p.y, p.z + sz * SLIDE_PROBE)
+        //
         // The standoff is a fraction of the ALONG-wall component, and it
         // REPLACES the into-wall one. With nothing to slide along — a step
         // square-on to the face — that turns a heading of (0.02, 1.0) into
         // (0.02, -0.005) and hands Math.atan2 a direction made of float
         // noise, so the bot faces sideways at a wall instead of at its node.
-        // There is no slide to steer there; leave the heading alone and let
-        // the wedge recovery below deal with it if nothing moves.
-        if (zBlocked || xBlocked) {
-          cutTarget = null
-          gatePath = path
-          dx = nodeDx
-          dz = nodeDz
-        }
+        // There is no slide to steer there; the heading is left alone, and
+        // the wedge recovery below deals with it if nothing moves.
+        //
         // Only where the ground extends AWAY from the wall. The standoff
         // walked the bot off a ladder's 3/16 top edge on parkouradv1's
         // spiral column: the column blocked the step, the standoff steered
         // away from it, and away from it was air.
-        const floorAway = (ox: number, oz: number): boolean =>
-          geometry.playerCollides(bot, p.x + ox, p.y - 0.55, p.z + oz)
-        if (zBlocked && !xBlocked && Math.abs(dx) >= 0.15 && floorAway(0, -sz * 0.3)) dz = -sz * Math.abs(dx) * WALL_STANDOFF
-        else if (xBlocked && !zBlocked && Math.abs(dz) >= 0.15 && floorAway(-sx * 0.3, 0)) dx = -sx * Math.abs(dz) * WALL_STANDOFF
+        steer.dx = dx
+        steer.dz = dz
+        if (wallSlide(boxProbe, p.x, p.y, p.z, slideDx, slideDz, nodeDx, nodeDz, steer)) {
+          cutTarget = null
+          gatePath = path
+          dx = steer.dx
+          dz = steer.dz
+        }
       }
 
       // Air, before anything else can spend it. Vanilla gives 300 ticks of it
@@ -4138,7 +4125,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         }
       }
 
-      // A hop the kernel chose (hopIntoJumpBetter) is flown the way the
+      // A hop the kernel chose (PhysicsSim.gaitVerdict) is flown the way the
       // kernel flew it — at the next node, forward and sprint held, nothing
       // else — until it touches down. The cascade below re-decides a body in
       // the air with rollouts of its own (a walk-angled heading, a straight
@@ -4149,10 +4136,15 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         if ((bot.entity as { onGround?: boolean }).onGround === true || climbing || swimming) {
           kernelHop = false
         } else {
-          bot.look(Math.atan2(-nodeDx, -nodeDz), 0)
+          // (its own yaws, tick for tick; at the next node once they run out)
+          khopTick++
+          const taped = khopFlight !== null && khopTick < khopFlight.length
+          if (taped) bot.look((khopFlight as number[])[khopTick], 0, true)
+          else bot.look(Math.atan2(-nodeDx, -nodeDz), 0)
           bot.setControlState('forward', true)
           bot.setControlState('back', false)
-          bot.setControlState('left', false)
+          bot.setControlState('left', taped && khopStrafe)
+          gaitStrafed = taped && khopStrafe
           bot.setControlState('right', false)
           bot.setControlState('sneak', false)
           bot.setControlState('jump', false)
@@ -4283,16 +4275,30 @@ export function createPathfinder (options: PathfinderOptions = {}) {
           const head = Math.hypot(dx, dz)
           const turning = speed > 0.1 && head > 1e-6 &&
             (v.x * dx + v.z * dz) / (speed * head) < HOP_TURN_COS
+          const kernelGait = stateMovements.allowHopIntoJump
+          if (kernelGait && cachedLut !== null) physics.setShapeTables?.(cachedLut)
+          physics.gaitFrom = prevRetired
+          physics.wholeFall = wholeFall
+          physics.gaitStrafe = kernelGait && stateMovements.allowStrafe
+          // (with the kernel, allowHopIntoJump, the verdict is its search's:
+          // toward a jump or a rise, and to the path's end, too)
           hopHold = stateMovements.allowSprintHop && !turning &&
-            physics.sprintHopBetter(gatePath, stateMovements.allowLowCeilingHop)
-          // A jump ahead is where the gait above gives up (its rollout cannot
-          // fly the jump); the kernel flies both policies through it and the
-          // hop is taken only where it lands the jump sooner (allowHopIntoJump).
-          if (!hopHold && stateMovements.allowSprintHop && stateMovements.allowHopIntoJump && !turning &&
-              physics.hopRefusal === 'jump-ahead' && physics.hopIntoJumpBetter !== undefined) {
-            if (cachedLut !== null) physics.setShapeTables?.(cachedLut)
-            hopHold = physics.hopIntoJumpBetter(gatePath)
-            kernelHop = hopHold
+            physics.sprintHopBetter(gatePath, stateMovements.allowLowCeilingHop, 16, kernelGait)
+          // A hop the kernel chose is flown as the kernel flew it, from the
+          // take-off on: the verdict was on that flight.
+          const flight = hopHold ? (physics.hopFlight ?? null) : null
+          kernelHop = flight !== null && flight.length > 0
+          if (flight !== null && flight.length > 0) {
+            khopFlight = flight
+            khopTick = 0
+            khopStrafe = physics.hopStrafe === true
+            bot.look(flight[0], 0, true)
+          } else if (physics.gaitStrafe === true && !hopHold) {
+            // a tick on the ground, as the kernel's schedules run it: the
+            // same line, 2% more push (gaitSearch.ts kStrafe)
+            bot.look(strafeYaw(Math.atan2(-dx, -dz)), 0, true)
+            bot.setControlState('left', true)
+            gaitStrafed = true
           }
         }
         // PRESS on the landing tick, never hold. prismarine-physics charges a
@@ -4797,12 +4803,32 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         }
       }
     })
+    const client = (bot as unknown as { _client?: { on: (ev: string, fn: (p: Record<string, unknown>) => void) => void } })._client
+    // The server's overwrite of the bot's own motion: what a landing that
+    // hurt waits for. From 1.21.9 the packet carries blocks a tick (lpVec3)
+    // and mineflayer still scales it as the old 1/8000 fixed point, which
+    // leaves the body no downward speed and a tick off the ground after
+    // every hurt: there it is applied as sent.
+    const motionType = (bot.registry as unknown as { protocol?: { play?: { toClient?: { types?: Record<string, unknown> } } } })
+      .protocol?.play?.toClient?.types?.packet_entity_velocity
+    const motionExact = JSON.stringify(motionType ?? null).includes('lpVec3')
+    client?.on('entity_velocity', (packet) => {
+      const self = bot.entity as { id?: number, velocity: Vec3 } | undefined
+      if (self === undefined || packet.entityId !== self.id) return
+      const v = packet.velocity as { x: number, y: number, z: number } | undefined
+      if (motionExact && v !== undefined) self.velocity.set(v.x, v.y, v.z)
+      hurtSeen = true
+      // (a landing the newer rule spares hurt after all: the server keeps the older one)
+      if (spared > 0) {
+        wholeFall = false
+        spared = 0
+      }
+    })
     if (execTraceFile !== null) {
       // Server-side overwrites of the bot's own velocity/position, so a
       // trace can tell a physics decision from a packet that undid it.
-      const client = (bot as unknown as { _client: { on: (ev: string, fn: (p: Record<string, unknown>) => void) => void } })._client
       for (const ev of ['entity_velocity', 'sync_entity_position', 'position']) {
-        client.on(ev, (packet) => {
+        client?.on(ev, (packet) => {
           if (ev !== 'position' && packet.entityId !== (bot.entity as { id?: number }).id) return
           execTraceBuf.push(JSON.stringify([execTick, 'packet', ev, packet.velocity ?? [packet.dx, packet.dy, packet.dz], packet.x ?? null, packet.y ?? null, packet.z ?? null, packet.flags ?? null]))
         })

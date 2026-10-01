@@ -268,6 +268,8 @@ export function applyProfile (
     movements.allowLandingRetire = process.env.ARENA_NO_LANDRETIRE !== '1'
     // The gait flown INTO a jump (executor only, opt-in); ARENA_NO_HOPJUMP=1 bisects it.
     movements.allowHopIntoJump = process.env.ARENA_NO_HOPJUMP !== '1'
+    // The 45° strafe on the gait's runs and flights (executor only, opt-in); ARENA_NO_STRAFE=1 bisects it.
+    movements.allowStrafe = movements.allowHopIntoJump === true && process.env.ARENA_NO_STRAFE !== '1'
     // Physics-verified hops where the search fails (opt-in); ARENA_NO_PHYSICS=1 bisects it.
     movements.allowParkourPhysics = profile.extendedParkour && process.env.ARENA_NO_PHYSICS !== '1'
     // Bisect switch for the sprint-hop gait on any engine (bulba-nohop is JS only).

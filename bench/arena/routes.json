@@ -775,6 +775,134 @@
         -581
       ],
       "notes": "Ten Ways slime room, along the west wall: up the west ladder, off its top onto the slime at 575,270,-592, rebound onto 575,271,-587, across to 575,271,-584, into the south-west ladder (bottom rung 5 above the floor) and up to its top"
+    },
+    {
+      "id": "opk-1",
+      "name": "opk-1",
+      "scenario": "parkour-advanced",
+      "start": [
+        710,
+        206,
+        -406
+      ],
+      "end": [
+        711,
+        210,
+        -370
+      ],
+      "notes": "Optimizing Parkour (Heppe) stage 1, \"tutorial\": from the stage's spawn to its finish platform; the map's required time is 85 ticks from leaving the start box to entering the finish"
+    },
+    {
+      "id": "opk-2",
+      "name": "opk-2",
+      "scenario": "parkour-advanced",
+      "start": [
+        711,
+        210,
+        -365
+      ],
+      "end": [
+        711,
+        213,
+        -337
+      ],
+      "notes": "Optimizing Parkour (Heppe) stage 2, \"double neo\": from the stage's spawn to its finish platform; the map's required time is 67 ticks from leaving the start box to entering the finish"
+    },
+    {
+      "id": "opk-3",
+      "name": "opk-3",
+      "scenario": "parkour-advanced",
+      "start": [
+        712,
+        213,
+        -330
+      ],
+      "end": [
+        712,
+        218,
+        -285
+      ],
+      "notes": "Optimizing Parkour (Heppe) stage 3, \"the thinker\": from the stage's spawn to its finish platform; the map's required time is 109 ticks from leaving the start box to entering the finish"
+    },
+    {
+      "id": "opk-4",
+      "name": "opk-4",
+      "scenario": "parkour-advanced",
+      "start": [
+        712,
+        218,
+        -281
+      ],
+      "end": [
+        711,
+        219,
+        -235
+      ],
+      "notes": "Optimizing Parkour (Heppe) stage 4, \"airwalk\": from the stage's spawn to its finish platform; the map's required time is 147 ticks from leaving the start box to entering the finish"
+    },
+    {
+      "id": "opk-6",
+      "name": "opk-6",
+      "scenario": "parkour-advanced",
+      "start": [
+        710,
+        216,
+        -164
+      ],
+      "end": [
+        711,
+        214,
+        -133
+      ],
+      "notes": "Optimizing Parkour (Heppe) stage 6, \"the sneaky one\": from the stage's spawn to its finish platform; the map's required time is 139 ticks from leaving the start box to entering the finish"
+    },
+    {
+      "id": "opk-7",
+      "name": "opk-7",
+      "scenario": "parkour-advanced",
+      "start": [
+        711,
+        214,
+        -123
+      ],
+      "end": [
+        713,
+        215,
+        -114
+      ],
+      "notes": "Optimizing Parkour (Heppe) stage 7, \"the funny one\": from the stage's spawn to its finish platform; the map's required time is 126 ticks from leaving the start box to entering the finish"
+    },
+    {
+      "id": "opk-8",
+      "name": "opk-8",
+      "scenario": "parkour-advanced",
+      "start": [
+        699,
+        215,
+        -116
+      ],
+      "end": [
+        699,
+        213,
+        -89
+      ],
+      "notes": "Optimizing Parkour (Heppe) stage 8, \"sticky situation\": from the stage's spawn to its finish platform; the map's required time is 68 ticks from leaving the start box to entering the finish"
+    },
+    {
+      "id": "opk-9",
+      "name": "opk-9",
+      "scenario": "parkour-advanced",
+      "start": [
+        699,
+        212,
+        -85
+      ],
+      "end": [
+        699,
+        217,
+        -49
+      ],
+      "notes": "Optimizing Parkour (Heppe) stage 9, \"golden piglin head\": from the stage's spawn to its finish platform; the map's required time is 79 ticks from leaving the start box to entering the finish"
     }
   ]
 }

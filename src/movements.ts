@@ -143,14 +143,21 @@ export class Movements {
    */
   allowLandingRetire: boolean
   /**
-   * Improvement (opt-in, executor gait only, needs allowSprintHop): keep
-   * sprint-hopping on the approach to a parkour jump when a kernel rollout of
-   * the executor's own policy says hopping now lands that jump sooner than
-   * sprinting to it (PhysicsSim.hopIntoJumpBetter). Without it the gait is
-   * refused whenever a jump is within its look-ahead, and every approach on a
-   * course is sprinted: 4-15 s per parkour route on the arena.
+   * Improvement (opt-in, executor gait only, needs allowSprintHop): the gait
+   * is the exact kernel's to decide (PhysicsSim.gaitVerdict, gaitSearch.ts) —
+   * the hop is taken where a schedule that starts with it reaches the jump
+   * ahead, the rise, or the ground further on soonest. Without it the gait
+   * is refused whenever a jump or a rise is within its look-ahead, and every
+   * approach on a course is sprinted: 4-15 s per parkour route on the arena.
    */
   allowHopIntoJump: boolean
+  /**
+   * Improvement (opt-in, executor gait only, needs allowHopIntoJump): run and
+   * hop with the 45° strafe — the look an eighth of a turn off the line and
+   * the strafe key held, an input 1.0 long where forward alone is 0.98: 2%
+   * more push on the ground and in the air (gaitSearch.ts kStrafe).
+   */
+  allowStrafe: boolean
   allowEntityDetection: boolean
 
   entitiesToAvoid: Set<string>
@@ -217,6 +224,7 @@ export class Movements {
     this.allowRunUp = false // improvement, opt-in (executor take-off only)
     this.allowLandingRetire = false // improvement, opt-in (executor arrival only)
     this.allowHopIntoJump = false // improvement, opt-in (executor gait only)
+    this.allowStrafe = false // improvement, opt-in (executor gait only)
     this.allowEntityDetection = true
 
     this.entitiesToAvoid = new Set()

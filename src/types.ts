@@ -379,7 +379,7 @@ export interface PhysicsLike {
   /** A heading offset that WALKS a flat step round a clipped corner, or null. */
   bestWalkHeading (path: XYZ[], sprint: boolean): number | null
   /** Does hopping while sprinting get further down this path, safely? */
-  sprintHopBetter (path: XYZ[], lowCeilingHop?: boolean, horizon?: number): boolean
+  sprintHopBetter (path: XYZ[], lowCeilingHop?: boolean, horizon?: number, kernel?: boolean): boolean
   /**
    * Optional: what to hold this tick of a flight so it comes down on the
    * node (null = the default forward + sprint). A physics without it flies
@@ -399,8 +399,6 @@ export interface PhysicsLike {
   hopRefusal?: string
   /** Optional: the kernel's shape tables (physics.ts setShapeTables). */
   setShapeTables? (lut: import('./lut.js').BlockLut): void
-  /** Optional: hop now into the parkour jump ahead, or keep sprinting? (allowHopIntoJump) */
-  hopIntoJumpBetter? (path: Array<XYZ & { parkour?: boolean }>): boolean
   /** Optional: the movement-speed attribute without sprinting (the worker kernel's speed). */
   walkSpeed? (): number
   /** Optional: a live control program to this planner node from the body as it is (physics.ts hopFrom). */
@@ -413,6 +411,15 @@ export interface PhysicsLike {
   hopNote?: string
   /** Did the last hopLinedUp fly every family's programs and land none (a verdict, not a timeout)? */
   hopExhausted?: boolean
+  /** Optional: the hop the last gait decision chose, as the kernel flew it (a yaw a tick); the executor replays it. */
+  hopFlight?: number[] | null
+  /** The node the executor retired last, for the gait's landing retirement (GaitGoal.from). */
+  gaitFrom?: { x: number, z: number } | null
+  /** The server counts the whole fall (fallDamage.ts). */
+  wholeFall?: boolean
+  /** Fly and run the gait with the 45° strafe (Movements.allowStrafe); and whether the hop just chosen does. */
+  gaitStrafe?: boolean
+  hopStrafe?: boolean
 }
 
 export type { Vec3 }

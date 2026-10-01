@@ -60,6 +60,18 @@ the column's edge: that is the robust one), the rest point nearest the
 centre, and two spread across the arc (an obstacle cuts into an arc from one
 side). The oracle returns the **quickest** robust program, not the first.
 
+**A take-off out of reach is not flown** (`canReach`). The most ground a
+flight covers before it has fallen past the landing's level is the speed it
+carries plus its air acceleration, summed over the ticks the fall takes:
+nothing in the way adds to either. A take-off (and, later, a first air phase)
+the landing column lies beyond is dropped with its whole subtree of turns.
+Sound, so the programs found are the same (`PF_REACH_PRUNE=0` flies
+everything for A/B); not asked where slime could throw the body back up or
+off a climbable. A ladder catch has no ballistic pre-screen, and there it is
+the difference between a search and a timeout: mcc-4-3's jump to a ladder from
+a moving body took 262k kernel ticks (129 ms, against the executor's 40 ms)
+and takes 6k (9 ms).
+
 `stands()` finds where a body can rest on a node: nine drop tests, from just
 above the feet cell's own boxes (from any higher, a ceiling two blocks up
 starts the body embedded: 6-1's pane rails had no stands at all), and more
@@ -190,17 +202,81 @@ from where it is (`LOOK_STEP`): a live program flies the yaws the replay will.
 `PF_HOP_DEBUG=1` and `PF_BEAM_DEBUG=1` print the pipeline's rounds and the
 beam's layers.
 
-## The gait into a jump (`allowHopIntoJump`)
+## The gait (`allowHopIntoJump`, `src/gaitSearch.ts`)
 
-Separate, but on the same kernel: on a grounded tick before a parkour jump,
-hop now or keep sprinting? Both are flown in the kernel, the hop taken only
-if both land and the hop is at least two ticks sooner, and flown in the air
-exactly as simulated. The kernel's model of the take-off must be the
-executor's gate exactly: `canSprintJump`'s graze rule (a flight touching a
-wall must land with the heading 0.02 rad either way), and before it the
-executor's `maySprint` (never against a wall, the anti-livelock rule). Without
-the second, in a one-wide tunnel the kernel planned hops into sprint jumps the
-executor then walk-jumped: tunnel1 lost 2.3 s.
+Separate, but on the same kernel: on a grounded tick, hop now or keep the
+feet down? A hop is the faster gait and it is ballistic, so the answer turns
+on what its arc comes down in. `gaitSearch` asks it of the SCHEDULES of hops
+the body could fly from here: up to three ticks on the ground before each
+hop, up to four hops, then its feet, depth first, hops first, bounded by the
+best so far. The hop is taken when a schedule that starts with it reaches the
+goal and none that keeps its feet this tick does as well (toward a jump) or a
+tick better (over open ground, where which schedule is first past a node
+eight blocks on is half a tick of noise).
+
+The goal is the ground's own (`PhysicsSim.gaitVerdict`): the landing of the
+first jump ahead — a parkour node that is one (not ground the plan happens to
+jump: `kWalkable`), or a rise too high to step — else a node nine on, else
+the path's end, arrived at on the ground. The old guards ("a rise ahead", "a
+jump ahead", "too little path", "the roof drops") are gone with the kernel
+on: each was a fixed refusal where the search has an exact answer.
+
+Every schedule is flown the way the executor would fly it:
+
+- **Run ticks steer as the executor walks** (`src/wallSteer.ts`, one module
+  for both): off a wall it runs along, along one in its way, no sprint
+  against one.
+- **The take-off at a jump is the executor's gate** (`kJumpLands`): the first
+  tick `canSprintJump` would take it, its graze rule (a flight touching a wall
+  must land with the heading 0.02 rad either way) and `maySprint` before it.
+  A jump onto the path's LAST node is timed to standing in its box, not to
+  landing within a block of it.
+- **A node is passed as the executor retires it**: in the air low over a
+  parkour node, or down within a block and past it. A landing short of the
+  node is a take-off for it still (tenways-headhitters: counted as the jump
+  landed, the gate then jumped from the lip into the next head-hitter, 12
+  ticks a platform).
+- **A landing is a body carried by a block** (`PlayerSim.carried`). The tick
+  a body lands it moves down before it moves on, so it can touch down on the
+  edge it is leaving and end the tick past it, with the ground flag and
+  nothing underneath. The gates' own `caught` asks the same now: a jump that
+  "landed" 0.03 past a slime top was approved and fell five blocks.
+- **A landing that hurts loses its speed** (below): the body stands a tick and
+  starts from rest.
+
+The hop the search chose is replayed as flown: the look of every tick from
+the take-off to the touchdown (`GaitResult.flight`, the `khop` branch). A
+search that runs out of work before the feet had their say gives no verdict,
+and the feet stay down: a hop is thrown for its whole arc, a tick on the
+ground is asked again the next.
+
+**The 45° strafe** (`allowStrafe`, `kStrafe`). Forward alone is an input 0.98
+long; forward and a strafe key are normalised to 1. With the look an eighth
+of a turn off the line and the strafe key held the push is along the line
+and 2% stronger, on the ground and in the air: 5.58 to 5.69 b/s sprinting,
+6.97 to 7.04 hopping (kernel, flat stone). Never on a jump's own tick: a
+sprint jump's boost goes where the body LOOKS. The kernel's schedules run and
+fly with it, the flight's looks carry it, and the executor's sprinting ticks
+hold it; the key is released at the top of the next tick, whichever branch
+that tick takes.
+
+## Landings that hurt (`src/fallDamage.ts`)
+
+A landing the server hurts is followed by an `entity_velocity` packet that
+zeroes the body's horizontal speed. Read from the 1.21.11 server: every
+tick's descent counts, the landing's too, and the damage is rounded DOWN, so
+it takes four blocks, not three (a jump off a ledge two up, 3.25, is free;
+before 1.21.5 the landing tick is left out and any excess rounds up). Hay and
+honey keep a fifth, a bed halves the fall, slime spares a body that bounces,
+water and a ladder take the fall with them. The executor counts the fall the
+same way and, after a landing that hurts, decides nothing until the packet is
+in (at best before the next tick, four ticks late when the server stalls;
+eight ticks is when it stops waiting). A packet after a landing only the
+older rule hurts switches the rule for the session.
+
+From 1.21.9 that packet carries blocks a tick and mineflayer (4.37) still
+scales it by 1/8000, which leaves the body no downward speed and a tick off
+the ground after every hurt; the executor applies it as sent.
 
 ## Measured (arena, 2026-09-22)
 

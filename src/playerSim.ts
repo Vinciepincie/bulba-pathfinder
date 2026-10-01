@@ -29,6 +29,14 @@ export interface SimGrid {
   w: number
   h: number
   l: number
+  /**
+   * A LAZY grid (a window on a live world): a cell is current while its
+   * stamp equals `serial`; any other is read through stateAt and stored, and
+   * cells outside the window are read through stateAt too. Bumping `serial`
+   * forgets the whole window at no cost.
+   */
+  stamps?: Int32Array
+  serial?: number
 }
 
 /** Blocks of the world the simulation reads. */
@@ -52,6 +60,9 @@ export interface SimWorld {
 export const SIM_CLIMBABLE = 1
 export const SIM_LIQUID = 2
 export const SIM_SLIME = 4
+/** Breaks a fall: keeps a fifth of its damage (hay, honey), or halves its height (a bed). See fallDamage.ts. */
+export const SIM_CUSHION = 8
+export const SIM_BED = 16
 
 /** Mutable body state; one per simulated player. */
 export interface SimBody {
@@ -137,6 +148,11 @@ export class PlayerSim {
     this.speedBase = speedBase
   }
 
+  /** State id at a cell, as the simulation reads it (through the grid when there is one). */
+  stateAt (x: number, y: number, z: number): number {
+    return this.sid(x, y, z)
+  }
+
   /** State id at a cell: the grid inline when there is one, else the world's stateAt. */
   private sid (x: number, y: number, z: number): number {
     const g = this.grid
@@ -144,8 +160,14 @@ export class PlayerSim {
     const lx = x - g.x0
     const ly = y - g.y0
     const lz = z - g.z0
-    if (lx < 0 || lx >= g.w || ly < 0 || ly >= g.h || lz < 0 || lz >= g.l) return -1
-    return g.states[(ly * g.l + lz) * g.w + lx]
+    const st = g.stamps
+    if (lx < 0 || lx >= g.w || ly < 0 || ly >= g.h || lz < 0 || lz >= g.l) return st === undefined ? -1 : this.world.stateAt(x, y, z)
+    const i = (ly * g.l + lz) * g.w + lx
+    if (st !== undefined && st[i] !== g.serial) {
+      g.states[i] = this.world.stateAt(x, y, z)
+      st[i] = g.serial as number
+    }
+    return g.states[i]
   }
 
   /** Collect every box of every cell prismarine's getSurroundingBBs would visit for this query. */
@@ -255,7 +277,8 @@ export class PlayerSim {
     return dz
   }
 
-  private kindAt (x: number, y: number, z: number): number {
+  /** The SIM_* bits of the block at a point. */
+  kindAt (x: number, y: number, z: number): number {
     const s = this.sid(Math.floor(x), Math.floor(y), Math.floor(z))
     return s < 0 ? 0 : this.world.kind[s]
   }
@@ -287,6 +310,51 @@ export class PlayerSim {
     return false
   }
 
+  /**
+   * Does the body's box with its feet at (x, y, z), its sides grown by `grow`
+   * (negative: shrunk) and its top and bottom trimmed by `trim`, overlap a
+   * collision box? The executor's probes (geometry.playerCollides, nearWall)
+   * for a kernel that steers as it does.
+   */
+  boxHits (x: number, y: number, z: number, grow: number, trim: number): boolean {
+    const hw = this.halfWidth + grow
+    const minX = x - hw; const maxX = x + hw
+    const minY = y + trim; const maxY = y + this.height - trim
+    const minZ = z - hw; const maxZ = z + hw
+    const n = this.gather(minX, minY, minZ, maxX, maxY, maxZ)
+    const d = this.buf
+    for (let i = 0; i < n; i++) {
+      const o = i * 6
+      if (minX < d[o + 3] && maxX > d[o] && minY < d[o + 4] && maxY > d[o + 1] && minZ < d[o + 5] && maxZ > d[o + 2]) return true
+    }
+    return false
+  }
+
+  /**
+   * Many probes round one place: gather once the boxes any of them could
+   * touch — a body's box within `reach` of (x, y, z) sideways, from `below`
+   * under its feet up — and ask probeHit of each. Valid until the next step
+   * or probe of another kind (they share the scratch buffer).
+   */
+  probeBegin (x: number, y: number, z: number, reach: number, below: number): number {
+    const r = this.halfWidth + reach
+    return this.gather(x - r, y - below, z - r, x + r, y + this.height, z + r)
+  }
+
+  /** boxHits, against the boxes probeBegin gathered. */
+  probeHit (x: number, y: number, z: number, grow: number, trim: number): boolean {
+    const hw = this.halfWidth + grow
+    const minX = x - hw; const maxX = x + hw
+    const minY = y + trim; const maxY = y + this.height - trim
+    const minZ = z - hw; const maxZ = z + hw
+    const d = this.buf
+    for (let i = 0, n = this.nBoxes; i < n; i++) {
+      const o = i * 6
+      if (minX < d[o + 3] && maxX > d[o] && minY < d[o + 4] && maxY > d[o + 1] && minZ < d[o + 5] && maxZ > d[o + 2]) return true
+    }
+    return false
+  }
+
   /** Does the body's box overlap any collision box (an embedded position no move can produce)? */
   collides (b: SimBody): boolean {
     const hw = this.halfWidth
@@ -298,6 +366,26 @@ export class PlayerSim {
     for (let i = 0; i < n; i++) {
       const o = i * 6
       if (minX < d[o + 3] && maxX > d[o] && minY < d[o + 4] && maxY > d[o + 1] && minZ < d[o + 5] && maxZ > d[o + 2]) return true
+    }
+    return false
+  }
+
+  /**
+   * Is the body carried: a collision box under its hitbox, its top at the
+   * feet? A body can be onGround without. The tick it lands it moves down
+   * before it moves on, so it touches down on the edge it is leaving and ends
+   * the tick past it, with the ground flag and nothing underneath: it can
+   * still jump on the next tick, and falls on the one after if it does not.
+   */
+  carried (b: SimBody): boolean {
+    const hw = this.halfWidth
+    const minX = b.x - hw; const maxX = b.x + hw
+    const minZ = b.z - hw; const maxZ = b.z + hw
+    const n = this.gather(minX, b.y - 0.01, minZ, maxX, b.y, maxZ)
+    const d = this.buf
+    for (let i = 0; i < n; i++) {
+      const o = i * 6
+      if (minX < d[o + 3] && maxX > d[o] && minZ < d[o + 5] && maxZ > d[o + 2] && Math.abs(d[o + 4] - b.y) <= 1e-6) return true
     }
     return false
   }
@@ -536,13 +624,16 @@ export function simSlipOf (name: string): number {
 
 /**
  * SIM_* kind bits of a block state: climbable (index.js isOnLadder), liquid
- * (water, lava and prismarine's waterLike set, or any waterlogged state), slime.
+ * (water, lava and prismarine's waterLike set, or any waterlogged state),
+ * slime, and what breaks a fall.
  */
 export function simKindOf (name: string, waterlogged: boolean): number {
   return (name === 'ladder' || name === 'vine' || name === 'scaffolding' ? SIM_CLIMBABLE : 0) |
     (name === 'water' || name === 'lava' || name === 'bubble_column' || name === 'seagrass' ||
      name === 'tall_seagrass' || name === 'kelp' || name === 'kelp_plant' || waterlogged ? SIM_LIQUID : 0) |
-    (name === 'slime_block' ? SIM_SLIME : 0)
+    (name === 'slime_block' ? SIM_SLIME : 0) |
+    (name === 'hay_block' || name === 'honey_block' ? SIM_CUSHION : 0) |
+    (name.endsWith('_bed') ? SIM_BED : 0)
 }
 
 /**
