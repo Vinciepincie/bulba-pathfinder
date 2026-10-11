@@ -16,7 +16,8 @@ import { applySnapshotBlockUpdate } from '../src/snapshot.js'
 import type { DigData } from '../src/types.js'
 import {
   VoxelWorld, makeFakeBot, makeOurMovements, lutFor, snapshotFromWorld,
-  AIR, STONE, DIRT, WATER, OAK_LEAVES, LADDER, LADDER_DRY, OAK_FENCE_DRY, SLIME, CREEPER_HEAD, STONE_SLAB_BOTTOM, MANGROVE_STAIRS
+  AIR, STONE, DIRT, WATER, OAK_LEAVES, LADDER, LADDER_DRY, OAK_FENCE_DRY, SLIME, CREEPER_HEAD, STONE_SLAB_BOTTOM, MANGROVE_STAIRS,
+  mcData, Block
 } from './helpers/voxelWorld.js'
 
 function mulberry32 (seed: number): () => number {
@@ -53,6 +54,51 @@ function genWorld (seed: number): VoxelWorld {
   return world
 }
 
+/** The first state of block `name` with the given properties. */
+function stateWhere (name: string, want: Record<string, string>): number {
+  const b = mcData.blocksByName[name]
+  for (let s = b.minStateId as number; s <= (b.maxStateId as number); s++) {
+    const p = (Block.fromStateId(s, 0) as { getProperties: () => Record<string, unknown> }).getProperties()
+    if (Object.entries(want).every(([k, v]) => String(p[k]) === v)) return s
+  }
+  throw new Error(`no ${name} ${JSON.stringify(want)}`)
+}
+/** Lid bytes (LID_TAG | k): a top slab (k 8), a closed top trapdoor (k 13). */
+const TOP_SLAB = stateWhere('stone_slab', { type: 'top', waterlogged: 'false' })
+const TOP_TRAPDOOR = stateWhere('oak_trapdoor', { half: 'top', open: 'false', waterlogged: 'false', powered: 'false', facing: 'north' })
+/** An open bottom trapdoor: a 3/16 panel on one face of the cell. */
+function openTrapdoor (facing: string): number {
+  return stateWhere('oak_trapdoor', { half: 'bottom', open: 'true', waterlogged: 'false', powered: 'false', facing })
+}
+
+/** genWorld with lids over it: graded blocks at head+1 of the floor's stands, stone a block higher. */
+function lidWorld (seed: number): VoxelWorld {
+  const world = genWorld(seed)
+  const rand = mulberry32(seed * 7 + 1)
+  const lids = [TOP_SLAB, TOP_TRAPDOOR, openTrapdoor('north'), openTrapdoor('east'), openTrapdoor('south'), openTrapdoor('west'), STONE]
+  for (let x = 0; x <= 22; x++) {
+    for (let z = 0; z <= 22; z++) {
+      if (world.stateAt(x, 3, z) !== AIR) continue
+      const r = rand()
+      if (r < 0.14) world.set(x, 3, z, lids[Math.floor(rand() * lids.length)])
+      else if (r < 0.18 && world.stateAt(x, 4, z) === AIR) world.set(x, 4, z, STONE)
+    }
+  }
+  world.fill(0, 1, 0, 2, 3, 2, AIR)
+  return world
+}
+
+/** A one-wide tunnel with a `gap`-block gap, `lid` over every cell at head+1 (y 3). */
+function lidTunnel (lid: number, gap: number): VoxelWorld {
+  const w = new VoxelWorld({ x0: -3, y0: -6, z0: -3, x1: gap + 8, y1: 6, z1: 3 })
+  w.fill(-2, 0, 0, 0, 0, 0, STONE)
+  w.fill(gap + 1, 0, 0, gap + 5, 0, 0, STONE)
+  w.fill(-2, 0, -1, gap + 5, 4, -1, STONE)
+  w.fill(-2, 0, 1, gap + 5, 4, 1, STONE)
+  w.fill(-2, 3, 0, gap + 5, 3, 0, lid)
+  return w
+}
+
 interface Pair {
   js: RawSolveResult
   wasm: RawSolveResult
@@ -64,6 +110,99 @@ function pathKey (r: RawSolveResult): string {
     `${n.via ? `v${n.via.x},${n.via.y},${n.via.z}` : '-'}${n.chain ? 'c' : ''},` +
     `[${(n.toBreak ?? []).map(b => `${b.x},${b.y},${b.z}`).join(';')}]`
   ).join('|')
+}
+
+
+/** A dry ladder facing north: its panel at z 0.8125..1, against a wall on +z. */
+const LADDER_NORTH = ((): number => {
+  const b = mcData.blocksByName.ladder
+  for (let s = b.minStateId as number; s <= (b.maxStateId as number); s++) {
+    const p = Block.fromStateId(s, 0).getProperties() as Record<string, unknown>
+    if (String(p.facing) === 'north' && String(p.waterlogged) === 'false') return s
+  }
+  return -1
+})()
+const LAVA = mcData.blocksByName.lava.minStateId as number
+
+/** An open, dry, unpowered bottom birch trapdoor facing `facing`: a 3/16 panel against the opposite face. */
+function birchTrapdoor (facing: string): number {
+  const b = mcData.blocksByName.birch_trapdoor
+  for (let s = b.minStateId as number; s <= (b.maxStateId as number); s++) {
+    const p = Block.fromStateId(s, 0).getProperties() as Record<string, unknown>
+    if (String(p.facing) === facing && String(p.open) === 'true' && String(p.half) === 'bottom' && String(p.waterlogged) === 'false' && String(p.powered) === 'false') return s
+  }
+  throw new Error('no birch trapdoor facing ' + facing)
+}
+
+/**
+ * A trapdoor-ladder shaft (arena mcc-8-3): plates against three walls in a
+ * period-3 spiral, each under the same plate three up (a lid 0.2 over the
+ * head of a body standing on it). Start (4,3,0) on the first S plate; the
+ * top platform's stand is (-1,21,0).
+ */
+function trapShaftWorld (): VoxelWorld {
+  const S = birchTrapdoor('south')
+  const N = birchTrapdoor('north')
+  const E = birchTrapdoor('east')
+  const w = new VoxelWorld({ x0: -3, y0: -2, z0: -3, x1: 8, y1: 26, z1: 4 })
+  w.fill(-1, 0, -2, 7, 0, 3, STONE)
+  w.fill(0, 1, -1, 4, 19, -1, STONE)
+  w.fill(0, 1, 2, 4, 19, 2, STONE)
+  w.fill(0, 1, 0, 0, 19, 1, STONE)
+  for (let k = 0; k < 6; k++) {
+    const y = 2 + 3 * k
+    w.set(3, y, 0, S); w.set(4, y, 0, S)
+    w.set(3, y + 1, 1, N); w.set(4, y + 1, 1, N)
+    w.set(1, y + 2, 0, E); w.set(1, y + 2, 1, E)
+  }
+  w.fill(-2, 20, 0, 0, 20, 1, STONE)
+  return w
+}
+
+/**
+ * A one-cell ladder one above the take-off's feet (arena opk2-1's moss
+ * pillar to the ladder over the next): post (0,0,0), stand (0,1,0); the
+ * ladder at (0,2,-2) on its wall (0,2,-3), open air under it, and (with
+ * `net`) a floor two under flight level that a missed catch falls onto.
+ */
+function upCatchWorld (net: boolean): VoxelWorld {
+  const b = mcData.blocksByName.ladder
+  let south = -1
+  for (let s = b.minStateId as number; s <= (b.maxStateId as number); s++) {
+    const p = Block.fromStateId(s, 0).getProperties() as Record<string, unknown>
+    if (String(p.facing) === 'south' && String(p.waterlogged) === 'false') south = s
+  }
+  const w = new VoxelWorld({ x0: -3, y0: -6, z0: -6, x1: 3, y1: 6, z1: 3 })
+  w.set(0, 0, 0, STONE)
+  w.set(0, 2, -3, STONE)
+  w.set(0, 2, -2, south)
+  if (net) w.set(0, -2, -2, STONE)
+  return w
+}
+
+/** A row of 1-high ladders on a wall too tall to walk on, over a void: only ladder-top take-offs cross it. */
+function ladderRowWorld (): VoxelWorld {
+  const w = new VoxelWorld({ x0: -2, y0: -8, z0: -2, x1: 10, y1: 8, z1: 2 })
+  w.fill(-1, -6, 1, 9, 6, 1, STONE)
+  w.set(0, 1, 0, LADDER_NORTH)
+  w.set(3, 1, 0, LADDER_NORTH)
+  w.set(6, 1, 0, LADDER_NORTH)
+  return w
+}
+
+/** A 1-wide ledge between two lava cells on the straight line, and a dry way round further off. */
+function lavaLedgeWorld (): VoxelWorld {
+  const w = new VoxelWorld({ x0: -2, y0: -4, z0: -3, x1: 10, y1: 5, z1: 5 })
+  w.fill(0, 0, -1, 1, 0, 1, STONE)
+  w.set(3, 0, 0, STONE)
+  w.set(3, 0, -1, STONE)
+  w.set(3, 0, 1, STONE)
+  w.set(3, 1, -1, LAVA)
+  w.set(3, 1, 1, LAVA)
+  w.fill(5, 0, -1, 7, 0, 1, STONE)
+  w.set(2, 0, 3, STONE)
+  w.set(4, 0, 3, STONE)
+  return w
 }
 
 describe('wasm ↔ JS solver differential', function () {
@@ -188,6 +327,30 @@ describe('wasm ↔ JS solver differential', function () {
     assertIdentical(solveBoth(world, new GoalBlock(9, 2, 8)), 'ext course flag off')
   })
 
+  it('ladder-top take-offs and lava-flanked landings identical', () => {
+    const ladders = solveBoth(ladderRowWorld(), new GoalBlock(6, 2, 0), { momentum: true }, { x: 0, y: 2, z: 0 })
+    expect(ladders.js.status).to.equal('success')
+    assertIdentical(ladders, 'ladder row')
+    assertIdentical(solveBoth(ladderRowWorld(), new GoalBlock(6, 2, 0), { parkourExtended: true }, { x: 0, y: 2, z: 0 }), 'ladder row, no momentum')
+    const lava = solveBoth(lavaLedgeWorld(), new GoalBlock(7, 1, 0), { momentum: true }, { x: 0, y: 1, z: 0 })
+    expect(lava.js.status).to.equal('success')
+    assertIdentical(lava, 'lava ledge')
+  })
+
+  it('+1 climbable catch at head height identical', () => {
+    const up = solveBoth(upCatchWorld(true), new GoalBlock(0, 2, -2), { momentum: true }, { x: 0, y: 1, z: 0 })
+    expect(up.js.status).to.equal('success')
+    assertIdentical(up, 'up catch')
+    assertIdentical(solveBoth(upCatchWorld(false), new GoalBlock(0, 2, -2), { momentum: true }, { x: 0, y: 1, z: 0 }), 'up catch, no net')
+  })
+
+  it('trapdoor-ladder shaft (lid inside the take-off strip) identical', () => {
+    const shaft = solveBoth(trapShaftWorld(), new GoalBlock(-1, 21, 0), { momentum: true }, { x: 4, y: 3, z: 0 })
+    expect(shaft.js.status).to.equal('success')
+    assertIdentical(shaft, 'trapdoor shaft')
+    assertIdentical(solveBoth(trapShaftWorld(), new GoalBlock(-1, 21, 0), { parkourExtended: true }, { x: 4, y: 3, z: 0 }), 'trapdoor shaft, no momentum')
+  })
+
   it('advanced course identical (fence tops, head, spiral ladders, slime stone + bounce)', () => {
     // Start pillar → fence-post hop → creeper head → slime stepping stone →
     // drop onto a slime and bounce up onto a ledge → catch a ladder → climb
@@ -247,6 +410,49 @@ describe('wasm ↔ JS solver differential', function () {
       assertIdentical(solveBoth(world, new GoalBlock(gx, 1, gz), { parkourExtended: true }), `seed ${seed}`)
     })
   }
+
+  // The lid model (moveGen.ts lidWalk, LID bytes): graded lids over random
+  // courses - top slabs, closed top trapdoors, open trapdoor panels and stone
+  // at head+1, 3-high ceilings - so the lid walk, the graded corridor list,
+  // the thin take-off span and the overhang over a drop are all exercised.
+  const LID_CASES = Math.max(10, CASES / 2)
+  for (let i = 0; i < LID_CASES; i++) {
+    const seed = 9100 + i
+    it(`lid world ${i} (seed ${seed}) - the lid model identical`, () => {
+      const world = lidWorld(seed)
+      const rand = mulberry32(seed * 13 + 5)
+      const gx = 4 + Math.floor(rand() * 18)
+      const gz = 4 + Math.floor(rand() * 18)
+      world.set(gx, 0, gz, STONE)
+      world.fill(gx, 1, gz, gx, 2, gz, AIR)
+      assertIdentical(solveBoth(world, new GoalBlock(gx, 1, gz), { momentum: true }), `seed ${seed}`)
+    })
+  }
+
+  it('lid tunnels identical (top slab, top trapdoor, stone; panel behind; overhang over a drop)', () => {
+    for (const lid of [TOP_SLAB, TOP_TRAPDOOR, STONE]) {
+      for (const gap of [1, 2, 3]) {
+        const w = lidTunnel(lid, gap)
+        assertIdentical(solveBoth(w, new GoalBlock(gap + 3, 1, 0), { momentum: true }, { x: 0, y: 1, z: 0 }), `tunnel ${lid} gap ${gap}`)
+        assertIdentical(solveBoth(w, new GoalBlock(gap + 3, 1, 0), { parkourExtended: true }, { x: 0, y: 1, z: 0 }), `tunnel ${lid} gap ${gap}, no momentum`)
+      }
+    }
+    for (const facing of ['north', 'south', 'east', 'west']) {
+      const w = new VoxelWorld({ x0: -3, y0: -6, z0: -3, x1: 9, y1: 6, z1: 3 })
+      w.fill(-2, 0, -1, 0, 0, 1, STONE)
+      w.fill(4, 0, -1, 6, 0, 1, STONE)
+      w.set(0, 2, 0, openTrapdoor(facing))
+      assertIdentical(solveBoth(w, new GoalBlock(5, 1, 0), { momentum: true }, { x: 0, y: 1, z: 0 }), `panel ${facing} over the take-off`)
+    }
+    for (const over of [STONE, TOP_SLAB, openTrapdoor('west')]) {
+      // a drop landing two down beyond a gap, an overhang at flight level over it
+      const w = new VoxelWorld({ x0: -3, y0: -8, z0: -3, x1: 9, y1: 6, z1: 3 })
+      w.fill(-2, 0, -1, 0, 0, 1, STONE)
+      w.fill(3, -2, -1, 5, -2, 1, STONE)
+      w.set(3, 1, 0, over)
+      assertIdentical(solveBoth(w, new GoalBlock(4, -1, 0), { momentum: true }, { x: 0, y: 1, z: 0 }), `overhang ${over}`)
+    }
+  })
 
   it('momentum: three-hop chain course identical, and the same course without momentum', () => {
     // A → head (3,0) → head (5,0) one down → head (5,0) one down: the last

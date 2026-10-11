@@ -292,6 +292,13 @@ export interface PathfinderOptions {
    * worker startup fails or the goal isn't serializable (custom goal class).
    */
   useWorkerThreads?: boolean
+  /**
+   * The solver core the worker runs (default 'wasm'): the Rust core, or the
+   * JavaScript reference implementation it is pinned bit-identical to. Both
+   * run the physics-hop pipeline; only the search's speed differs. Ignored
+   * on the main thread, which is always the JavaScript core.
+   */
+  core?: 'wasm' | 'js'
   /** Override the worker entry file (tests / exotic bundlers). */
   workerEntryPath?: string
   /** Hard cap on snapshot cells before giving up growth (memory bound). */
@@ -374,12 +381,18 @@ export interface PhysicsLike {
   canBackOff (ticks?: number): boolean
   /** Would this control combination actually move the body, safely? */
   canNudge (control: { forward?: boolean, back?: boolean, left?: boolean, right?: boolean, jump?: boolean, sneak?: boolean }, ticks?: number): boolean
+  /** Optional: these keys a tick (null: the controls as set), then a coast to rest - still on what carries it (physics.ts holdsOn)? */
+  holdsOn? (keys: { forward?: boolean, back?: boolean, sneak?: boolean } | null, ticks?: number): boolean
   /** A take-off heading offset that lands this jump, or null. */
   bestHeading (path: XYZ[], jump: boolean, sprint: boolean): number | null
   /** A heading offset that WALKS a flat step round a clipped corner, or null. */
   bestWalkHeading (path: XYZ[], sprint: boolean): number | null
   /** Does hopping while sprinting get further down this path, safely? */
-  sprintHopBetter (path: XYZ[], lowCeilingHop?: boolean, horizon?: number, kernel?: boolean): boolean
+  sprintHopBetter (path: XYZ[], lowCeilingHop?: boolean, horizon?: number): boolean
+  /** Optional: does the kernel walk from the body, as it stands, to `node` (physics.ts walksTo)? */
+  walksTo? (node: XYZ): boolean
+  /** Optional: the tick from the exact kernel (physics.ts gaitDrive, allowHopIntoJump). */
+  gaitDrive? (path: ReadonlyArray<XYZ & { parkour?: boolean }>): GaitDrive
   /**
    * Optional: what to hold this tick of a flight so it comes down on the
    * node (null = the default forward + sprint). A physics without it flies
@@ -402,24 +415,49 @@ export interface PhysicsLike {
   /** Optional: the movement-speed attribute without sprinting (the worker kernel's speed). */
   walkSpeed? (): number
   /** Optional: a live control program to this planner node from the body as it is (physics.ts hopFrom). */
-  hopFrom? (cell: readonly [number, number, number], budgetMs: number): import('./hopOracle.js').HopProgram | null
+  hopFrom? (cell: readonly [number, number, number], budgetTicks: number, land?: { x: number, y: number, z: number }, next?: readonly [number, number, number]): import('./hopOracle.js').HopProgram | null
+  /** On the ground, nothing under the box: the latched tick (HopProgram.jumpOnLeave); null without a kernel. */
+  latchedNow? (): boolean | null
   /** Optional: a control program to this planner node from rest at a stand point of the body's node (physics.ts hopLinedUp). */
-  hopLinedUp? (cell: readonly [number, number, number], budgetMs: number): import('./hopOracle.js').HopProgram | null
+  hopLinedUp? (cell: readonly [number, number, number], budgetTicks: number): import('./hopOracle.js').HopProgram | null
   /** Optional: a planned program re-anchored at the body as it is, if it still lands (physics.ts hopAnchored). */
   hopAnchored? (cell: readonly [number, number, number], prog: import('./hopOracle.js').HopProgram): import('./hopOracle.js').HopProgram | null
+  /** Optional: does the bot's physics keep the faster rise on a jump (vanilla; physics.ts probeVanillaJump)? Sets the kernel's rule. */
+  probeVanillaJump? (): boolean
+  /** Optional: a deep bounce's live check - does the rest of it arrive, does its abort land in the pool (physics.ts deepVerdict)? */
+  deepVerdict? (prog: import('./hopOracle.js').HopProgram, t: number, fired: boolean, air: number, rebounds: number): { arrives: boolean, abortable: boolean } | null
+  /** Optional: the exact line-up for a precision program from the body at rest (physics.ts hopLineUp). */
+  hopLineUp? (prog: import('./hopOracle.js').HopProgram, budgetTicks: number): { yaws: number[], prog: import('./hopOracle.js').HopProgram } | null
   /** Why the last hopFrom / hopLinedUp came out as it did. Trace diagnostics. */
   hopNote?: string
   /** Did the last hopLinedUp fly every family's programs and land none (a verdict, not a timeout)? */
   hopExhausted?: boolean
   /** Optional: the hop the last gait decision chose, as the kernel flew it (a yaw a tick); the executor replays it. */
-  hopFlight?: number[] | null
   /** The node the executor retired last, for the gait's landing retirement (GaitGoal.from). */
   gaitFrom?: { x: number, z: number } | null
   /** The server counts the whole fall (fallDamage.ts). */
   wholeFall?: boolean
-  /** Fly and run the gait with the 45° strafe (Movements.allowStrafe); and whether the hop just chosen does. */
+  /** Fly and run the gait with the 45° strafe (Movements.allowStrafe). */
   gaitStrafe?: boolean
-  hopStrafe?: boolean
+  /** The executor retires a parkour node the body came down past (Movements.allowLandingRetire). */
+  gaitLandRetire?: boolean
+}
+
+/**
+ * The tick the exact kernel decided (physics.ts gaitDrive): a jump now, flown
+ * as `flight` says (a look a tick, take-off to touchdown; `strafe`: the
+ * strafe key held after the take-off's tick); a tick on the ground (look
+ * `yaw`, sprint and strafe as given); or none — the kernel has no schedule
+ * from here.
+ */
+export interface GaitDrive {
+  kind: 'hop' | 'run' | 'none'
+  flight: number[] | null
+  strafe: boolean
+  /** The tick of the flight from which forward and the strafe key are let go (gaitSearch.ts EASE_NEVER: held throughout). */
+  ease: number
+  yaw: number
+  sprint: boolean
 }
 
 export type { Vec3 }

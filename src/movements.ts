@@ -42,6 +42,9 @@ export function vineClimbingDefault (registry: unknown, version: string | undefi
 
 export type ExclusionArea = (block: unknown) => number
 
+/** The vines of the vanilla `climbable` block tag beside `vine` itself (1.16 nether vines, 1.17 cave vines). */
+export const VINE_CLIMBABLES = ['weeping_vines', 'weeping_vines_plant', 'twisting_vines', 'twisting_vines_plant', 'cave_vines', 'cave_vines_plant'] as const
+
 export class Movements {
   bot: Bot
 
@@ -144,11 +147,13 @@ export class Movements {
   allowLandingRetire: boolean
   /**
    * Improvement (opt-in, executor gait only, needs allowSprintHop): the gait
-   * is the exact kernel's to decide (PhysicsSim.gaitVerdict, gaitSearch.ts) —
-   * the hop is taken where a schedule that starts with it reaches the jump
-   * ahead, the rise, or the ground further on soonest. Without it the gait
-   * is refused whenever a jump or a rise is within its look-ahead, and every
-   * approach on a course is sprinted: 4-15 s per parkour route on the arena.
+   * is the exact kernel's to decide (PhysicsSim.gaitDrive, gaitSearch.ts): a
+   * jump — a hop, or the jump over a gap or up a rise — is taken on the tick
+   * a schedule that starts with it gets ten blocks on soonest, and flown as
+   * the kernel flew it; so are the ticks on the ground between. Without it
+   * the hop is refused whenever a jump or a rise is within its look-ahead,
+   * every approach on a course is sprinted (4-15 s per parkour route on the
+   * arena), and each jump is taken on the first tick a gate allows it.
    */
   allowHopIntoJump: boolean
   /**
@@ -262,12 +267,16 @@ export class Movements {
     // executor can perform every vine plan. Auto-enabled on 1.16+ only —
     // older versions gated vine climbing on a backing block, which the
     // planner can't verify, so there we keep upstream's behavior. Opt out
-    // with `movements.climbables.delete(vineId)`. Deliberately ladder+vine
-    // ONLY: nether/cave vines are in the vanilla climbable tag too, but
-    // prismarine-physics does NOT climb them — planning them would produce
-    // paths the bot physically cannot walk.
+    // with `movements.climbables.delete(vineId)`. The nether and cave vines
+    // are in the vanilla climbable tag too (1.16, 1.17) and climb the same;
+    // prismarine-physics does not know them, so the bot climbs them through
+    // the package's patch of it (patches/prismarine-physics).
     if (registry.blocksByName.vine && vineClimbingDefault(registry, (bot as { version?: string }).version)) {
       this.climbables.add(registry.blocksByName.vine.id)
+      for (const name of VINE_CLIMBABLES) {
+        const b = registry.blocksByName[name]
+        if (b !== undefined) this.climbables.add(b.id)
+      }
     }
 
     this.emptyBlocks = new Set()

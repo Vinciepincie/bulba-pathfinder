@@ -622,3 +622,49 @@ describe('executor: the low-ceiling gait (allowLowCeilingHop)', () => {
     }
   })
 })
+
+describe('executor: the support hold (holdSupport, PhysicsSim.holdsOn)', () => {
+  /** An open trapdoor whose 3/16 plate stands on its cell's east face (x .8125..1), as arena mcc-8-2's P3 panel. */
+  const PANEL = ((): number => {
+    const b = mcData.blocksByName.oak_trapdoor
+    for (let st = b.minStateId as number; st <= (b.maxStateId as number); st++) {
+      const blk = Block.fromStateId(st, 0) as { getProperties: () => Record<string, unknown>, shapes: number[][] }
+      const p = blk.getProperties()
+      if (String(p.open) === 'true' && String(p.waterlogged) === 'false' && blk.shapes.length === 1 && blk.shapes[0][0] > 0.8) return st
+    }
+    throw new Error('no east-plate open trapdoor')
+  })()
+
+  function panelSim (x: number, vx: number, sneak: boolean): PhysicsSim {
+    // the panel at (1,0,0) over a floor far below; stand y 1 on its top edge
+    const w = new VoxelWorld({ x0: -4, y0: -10, z0: -4, x1: 6, y1: 4, z1: 4 })
+    w.fill(-4, -8, -4, 6, -8, 4, STONE)
+    w.set(1, 0, 0, PANEL)
+    const bot = physicsBot(w, new Vec3(x, 1, 0.5)) as { entity: { velocity: Vec3, yaw: number }, controlState: Record<string, boolean> }
+    bot.entity.velocity = new Vec3(vx, -0.0784, 0)
+    bot.entity.yaw = Math.PI / 2 // facing -x, the way it coasts
+    bot.controlState.sneak = sneak
+    return new PhysicsSim(bot as never)
+  }
+
+  it('sees a coast off a 3/16 panel that the sneak edge guard lets through, and a brake that keeps the body on', () => {
+    // 0.035 inside the plate's edge (box 1.548-0.3 = 1.248 against a plate at
+    // 1.8125: the box overlaps it from 1.8125 to 1.848), coasting -x at 0.024
+    const sim = panelSim(1.548, -0.024, true)
+    expect(sim.holdsOn(null), 'the coast goes off, sneaking').to.equal(false)
+    expect(sim.holdsOn({}), 'letting go does not help').to.equal(false)
+    expect(sim.holdsOn({ back: true, sneak: true }) || sim.holdsOn({ forward: true, sneak: true }), 'a sneaking press against the coast holds it').to.equal(true)
+  })
+
+  it('stays out of the way on a full block, where the edge guard works', () => {
+    const w = new VoxelWorld({ x0: -4, y0: -10, z0: -4, x1: 6, y1: 4, z1: 4 })
+    w.fill(-4, -8, -4, 6, -8, 4, STONE)
+    w.set(1, 0, 0, STONE)
+    const bot = physicsBot(w, new Vec3(1.65, 1, 0.5)) as { entity: { velocity: Vec3, yaw: number }, controlState: Record<string, boolean> }
+    bot.entity.velocity = new Vec3(0.03, -0.0784, 0)
+    bot.entity.yaw = -Math.PI / 2 // facing +x, creeping to the lip
+    bot.controlState.sneak = true
+    bot.controlState.forward = true
+    expect(new PhysicsSim(bot as never).holdsOn(null)).to.equal(true)
+  })
+})

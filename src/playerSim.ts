@@ -94,6 +94,17 @@ export interface SimControl {
 }
 
 /** prismarine-physics constants (index.js `physics`), as that engine holds them. */
+/**
+ * The jump rule of the prismarine-physics the bot runs (PhysicsSim.probeVanillaJump):
+ * vanilla 1.21's jumpFromGround keeps the faster of the jump and the body's own
+ * rise (max(jumpPower, vy): a jump held on a slime rebound keeps the rebound,
+ * scripts/patchPhysics.mjs), stock prismarine sets the jump's. The kernel
+ * follows whichever the bot's own physics does: one flag per thread.
+ */
+let vanillaJump = false
+export function setVanillaJump (on: boolean): void { vanillaJump = on }
+export function isVanillaJump (): boolean { return vanillaJump }
+
 export const SIM = {
   gravity: 0.08,
   airdrag: Math.fround(1 - 0.02),
@@ -124,6 +135,17 @@ export function copyBody (dst: SimBody, src: SimBody): SimBody {
   return dst
 }
 
+/** A cell-range key's serial when it holds no range (PlayerSim.slotKey): a grid's serial is never negative. */
+const NO_RANGE = -1
+/** PlayerSim.bricks: a brick's side, as a shift (4 cells), and its bits. */
+const BRICK = 2
+const BRICK_MASK = (1 << BRICK) - 1
+const BRICK_SEEN = 1
+/** A cell of the brick has a collision box. */
+const BRICK_SOLID = 2
+/** A cell of the brick is a liquid. */
+const BRICK_WET = 4
+
 /**
  * The simulator: world + body dimensions + scratch space. Not re-entrant
  * (one scratch buffer); one instance per thread of use.
@@ -135,9 +157,35 @@ export class PlayerSim {
   height: number
   /** Movement-speed attribute base (0.1 unless the server says otherwise). */
   speedBase: number
-  /** Scratch: collected boxes, 6 per box, absolute coordinates. */
-  private buf = new Float64Array(6 * 512)
+  /** Scratch: collected boxes, 6 per box, absolute coordinates (the slot gather() last filled). */
+  private buf: Float64Array = new Float64Array(6 * 512)
   private nBoxes = 0
+  /**
+   * The last two gathers, by cell range: a range asked again (the next tick's
+   * move; a move's after the step-up query between two) takes its boxes as
+   * they are. Only over a grid: a stamped grid's ranges inside its window,
+   * keyed by its serial; an unstamped grid is fixed for the sim's life (a
+   * solve's snapshot, which the oracle's stand caches assume too).
+   */
+  private readonly slotBuf: Float64Array[] = [this.buf, new Float64Array(6 * 512)]
+  private readonly slotN = [0, 0]
+  /** Per slot: x0, y0, z0, x1, y1, z1, serial; serial NO_RANGE: holds no range. */
+  private readonly slotKey = new Float64Array([0, 0, 0, 0, 0, 0, NO_RANGE, 0, 0, 0, 0, 0, 0, NO_RANGE])
+  private slot = 0
+  /** touchesLiquid's last answer, by cell range (keyed as a slot). */
+  private readonly liqKey = new Float64Array([0, 0, 0, 0, 0, 0, NO_RANGE])
+  private liqLast = false
+  /**
+   * An unstamped grid by brick of 4³ cells: BRICK_SEEN once looked at, with
+   * BRICK_SOLID when a cell has a collision box and BRICK_WET when one is a
+   * liquid. A gather skips the layers of empty bricks its range crosses (a
+   * fall's range is 4-6 cells tall, mostly air), and a body over dry bricks
+   * touches no liquid without a cell read (touchesLiquid ran every tick; most
+   * courses have none). Built as asked; null for other worlds.
+   */
+  private bricks: Uint8Array | null = null
+  private bw = 0
+  private bl = 0
   private readonly grid: SimGrid | null
 
   constructor (world: SimWorld, halfWidth = 0.3, height = 1.8, speedBase: number = SIM.playerSpeed) {
@@ -170,20 +218,89 @@ export class PlayerSim {
     return g.states[i]
   }
 
+  /**
+   * The key a cell range is kept under (PlayerSim.slotKey): the grid's
+   * serial, 0 for an unstamped grid; NO_RANGE when the range cannot be kept
+   * (no grid, or cells of a stamped grid's range outside its window, which
+   * are read through every time).
+   */
+  private rangeSerial (x0: number, y0: number, z0: number, x1: number, y1: number, z1: number): number {
+    const g = this.grid
+    if (g === null) return NO_RANGE
+    if (g.stamps === undefined) return 0
+    if (x0 < g.x0 || y0 < g.y0 || z0 < g.z0 || x1 >= g.x0 + g.w || y1 >= g.y0 + g.h || z1 >= g.z0 + g.l) return NO_RANGE
+    return g.serial as number
+  }
+
   /** Collect every box of every cell prismarine's getSurroundingBBs would visit for this query. */
   private gather (minX: number, minY: number, minZ: number, maxX: number, maxY: number, maxZ: number): number {
-    const w = this.world
-    let n = 0
     const y0 = Math.floor(minY) - 1
     const y1 = Math.floor(maxY)
     const z0 = Math.floor(minZ)
     const z1 = Math.floor(maxZ)
     const x0 = Math.floor(minX)
     const x1 = Math.floor(maxX)
+    const serial = this.rangeSerial(x0, y0, z0, x1, y1, z1)
+    const key = this.slotKey
+    if (serial !== NO_RANGE) {
+      for (let j = 0; j < 2; j++) {
+        const sl = (this.slot + j) & 1
+        const o = sl * 7
+        if (key[o + 6] === serial && key[o] === x0 && key[o + 1] === y0 && key[o + 2] === z0 && key[o + 3] === x1 && key[o + 4] === y1 && key[o + 5] === z1) {
+          this.slot = sl
+          this.buf = this.slotBuf[sl]
+          this.nBoxes = this.slotN[sl]
+          return this.nBoxes
+        }
+      }
+    }
+    // (into the other slot: the one just used may be asked again next)
+    const sl = this.slot ^ 1
+    this.slot = sl
+    this.buf = this.slotBuf[sl]
+    const n = this.collect(x0, y0, z0, x1, y1, z1)
+    this.slotBuf[sl] = this.buf
+    this.slotN[sl] = n
+    const o = sl * 7
+    key[o] = x0; key[o + 1] = y0; key[o + 2] = z0; key[o + 3] = x1; key[o + 4] = y1; key[o + 5] = z1; key[o + 6] = serial
+    this.nBoxes = n
+    return n
+  }
+
+  /** gather()'s cells, in its order, into this.buf: the box count. */
+  private collect (x0: number, y0: number, z0: number, x1: number, y1: number, z1: number): number {
+    const w = this.world
+    const g = this.grid
+    let n = 0
+    // (a range inside the grid: its cells indexed straight, no bounds test a cell)
+    const inside = g !== null && x0 >= g.x0 && y0 >= g.y0 && z0 >= g.z0 && x1 < g.x0 + g.w && y1 < g.y0 + g.h && z1 < g.z0 + g.l
+    const states = g !== null ? g.states : null
+    const stamps = g !== null ? g.stamps : undefined
+    const serial = g !== null ? g.serial : undefined
+    // (an unstamped grid: whole layers of empty bricks skipped, PlayerSim.bricks)
+    const sparse = inside && stamps === undefined
     for (let y = y0; y <= y1; y++) {
+      if (sparse) {
+        const gg = g as SimGrid
+        const ly = y - gg.y0
+        if ((y === y0 || (ly & BRICK_MASK) === 0) && this.bricksLack(gg, BRICK_SOLID, x0 - gg.x0, ly, z0 - gg.z0, x1 - gg.x0, ly, z1 - gg.z0)) {
+          y = gg.y0 + (((ly >> BRICK) + 1) << BRICK) - 1
+          continue
+        }
+      }
       for (let z = z0; z <= z1; z++) {
-        for (let x = x0; x <= x1; x++) {
-          const s = this.sid(x, y, z)
+        let i = inside ? ((y - (g as SimGrid).y0) * (g as SimGrid).l + z - (g as SimGrid).z0) * (g as SimGrid).w + x0 - (g as SimGrid).x0 : -1
+        for (let x = x0; x <= x1; x++, i++) {
+          let s: number
+          if (!inside) {
+            s = this.sid(x, y, z)
+          } else if (stamps !== undefined && stamps[i] !== serial) {
+            s = w.stateAt(x, y, z)
+            ;(states as SimGrid['states'])[i] = s
+            stamps[i] = serial as number
+          } else {
+            s = (states as SimGrid['states'])[i]
+          }
           if (s < 0) continue
           const start = w.shapeStart[s]
           if (start < 0) continue
@@ -207,7 +324,6 @@ export class PlayerSim {
         }
       }
     }
-    this.nBoxes = n
     return n
   }
 
@@ -299,15 +415,70 @@ export class PlayerSim {
     const minX = b.x - hw + 0.001; const maxX = b.x + hw - 0.001
     const minY = b.y + 0.401; const maxY = b.y + this.height - 0.401
     const minZ = b.z - hw + 0.001; const maxZ = b.z + hw - 0.001
-    for (let y = Math.floor(minY); y <= Math.floor(maxY); y++) {
-      for (let z = Math.floor(minZ); z <= Math.floor(maxZ); z++) {
-        for (let x = Math.floor(minX); x <= Math.floor(maxX); x++) {
+    const x0 = Math.floor(minX); const x1 = Math.floor(maxX)
+    const y0 = Math.floor(minY); const y1 = Math.floor(maxY)
+    const z0 = Math.floor(minZ); const z1 = Math.floor(maxZ)
+    const g = this.grid
+    if (g !== null && g.stamps === undefined && x0 >= g.x0 && y0 >= g.y0 && z0 >= g.z0 && x1 < g.x0 + g.w && y1 < g.y0 + g.h && z1 < g.z0 + g.l &&
+      this.bricksLack(g, BRICK_WET, x0 - g.x0, y0 - g.y0, z0 - g.z0, x1 - g.x0, y1 - g.y0, z1 - g.z0)) return false
+    // (the cells of the last tick's question: its answer, kept as a gather's boxes are)
+    const serial = this.rangeSerial(x0, y0, z0, x1, y1, z1)
+    const k = this.liqKey
+    if (serial !== NO_RANGE && k[6] === serial && k[0] === x0 && k[1] === y0 && k[2] === z0 && k[3] === x1 && k[4] === y1 && k[5] === z1) return this.liqLast
+    let hit = false
+    cells: for (let y = y0; y <= y1; y++) {
+      for (let z = z0; z <= z1; z++) {
+        for (let x = x0; x <= x1; x++) {
           const s = this.sid(x, y, z)
-          if (s >= 0 && (this.world.kind[s] & SIM_LIQUID) !== 0) return true
+          if (s >= 0 && (this.world.kind[s] & SIM_LIQUID) !== 0) { hit = true; break cells }
         }
       }
     }
-    return false
+    k[0] = x0; k[1] = y0; k[2] = z0; k[3] = x1; k[4] = y1; k[5] = z1; k[6] = serial
+    this.liqLast = hit
+    return hit
+  }
+
+  /** Do the bricks over grid cells [lx0..lx1]×[ly0..ly1]×[lz0..lz1] of an unstamped grid all lack `bit` (PlayerSim.bricks)? */
+  private bricksLack (g: SimGrid, bit: number, lx0: number, ly0: number, lz0: number, lx1: number, ly1: number, lz1: number): boolean {
+    for (let by = ly0 >> BRICK; by <= ly1 >> BRICK; by++) {
+      for (let bz = lz0 >> BRICK; bz <= lz1 >> BRICK; bz++) {
+        for (let bx = lx0 >> BRICK; bx <= lx1 >> BRICK; bx++) {
+          if ((this.brick(g, bx, by, bz) & bit) !== 0) return false
+        }
+      }
+    }
+    return true
+  }
+
+  /** A brick's bits (PlayerSim.bricks), its cells read the first time it is asked. */
+  private brick (g: SimGrid, bx: number, by: number, bz: number): number {
+    let bricks = this.bricks
+    if (bricks === null) {
+      this.bw = ((g.w - 1) >> BRICK) + 1
+      this.bl = ((g.l - 1) >> BRICK) + 1
+      bricks = this.bricks = new Uint8Array(this.bw * (((g.h - 1) >> BRICK) + 1) * this.bl)
+    }
+    const bi = (by * this.bl + bz) * this.bw + bx
+    let v = bricks[bi]
+    if (v !== 0) return v
+    v = BRICK_SEEN
+    const w = this.world
+    const ye = Math.min(g.h, (by + 1) << BRICK)
+    const ze = Math.min(g.l, (bz + 1) << BRICK)
+    const xe = Math.min(g.w, (bx + 1) << BRICK)
+    for (let y = by << BRICK; y < ye; y++) {
+      for (let z = bz << BRICK; z < ze; z++) {
+        for (let x = bx << BRICK, i = (y * g.l + z) * g.w + x; x < xe; x++, i++) {
+          const st = g.states[i]
+          if (st < 0) continue
+          if (w.shapeStart[st] >= 0 && w.shapeCount[st] > 0) v |= BRICK_SOLID
+          if ((w.kind[st] & SIM_LIQUID) !== 0) v |= BRICK_WET
+        }
+      }
+    }
+    bricks[bi] = v
+    return v
   }
 
   /**
@@ -339,6 +510,20 @@ export class PlayerSim {
   probeBegin (x: number, y: number, z: number, reach: number, below: number): number {
     const r = this.halfWidth + reach
     return this.gather(x - r, y - below, z - r, x + r, y + this.height, z + r)
+  }
+
+  /**
+   * The collision boxes in a region: their count, six numbers a box in
+   * `scratchBoxes` (minX, minY, minZ, maxX, maxY, maxZ). Valid until the
+   * next step or probe (one scratch buffer).
+   */
+  boxesIn (minX: number, minY: number, minZ: number, maxX: number, maxY: number, maxZ: number): number {
+    return this.gather(minX, minY, minZ, maxX, maxY, maxZ)
+  }
+
+  /** The scratch buffer boxesIn() and the probes fill. */
+  get scratchBoxes (): Float64Array {
+    return this.buf
   }
 
   /** boxHits, against the boxes probeBegin gathered. */
@@ -552,7 +737,7 @@ export class PlayerSim {
     if (c.jump) {
       if (b.jumpTicks > 0) b.jumpTicks--
       if (b.onGround && b.jumpTicks === 0) {
-        b.vy = SIM.jumpVelocity
+        b.vy = vanillaJump && b.vy > SIM.jumpVelocity ? b.vy : SIM.jumpVelocity
         if (c.sprint) {
           b.vx += c.hx * SIM.sprintJumpBoost
           b.vz += c.hz * SIM.sprintJumpBoost
@@ -628,7 +813,7 @@ export function simSlipOf (name: string): number {
  * slime, and what breaks a fall.
  */
 export function simKindOf (name: string, waterlogged: boolean): number {
-  return (name === 'ladder' || name === 'vine' || name === 'scaffolding' ? SIM_CLIMBABLE : 0) |
+  return (name === 'ladder' || name === 'vine' || name === 'scaffolding' || name.endsWith('_vines') || name.endsWith('_vines_plant') ? SIM_CLIMBABLE : 0) |
     (name === 'water' || name === 'lava' || name === 'bubble_column' || name === 'seagrass' ||
      name === 'tall_seagrass' || name === 'kelp' || name === 'kelp_plant' || waterlogged ? SIM_LIQUID : 0) |
     (name === 'slime_block' ? SIM_SLIME : 0) |

@@ -52,11 +52,19 @@ const CARRY_SHIFT: u8 = 5;
 const CARRY_W_NONE: u8 = 1;
 const CARRY_E_NONE: u8 = 2;
 const CARRY_N_NONE: u8 = 3;
+const CARRY_S_NONE: u8 = 4;
 const CARRY_LINE_X: u8 = 5;
 const CARRY_LINE_Z: u8 = 6;
 
 /// Mirror of moveGen.ts OFF_PANEL_MARGIN.
 const OFF_PANEL_MARGIN: f64 = 0.3;
+/// Mirror of moveGen.ts LADDER_CATCH_OVERCREDIT.
+const LADDER_CATCH_OVERCREDIT: f64 = 0.3;
+/// +1 climbable catch at head height: the landing credit is the cell's
+/// half-width less a margin (mirror of moveGen.ts UP_CATCH_CREDIT).
+const UP_CATCH_CREDIT: f64 = 0.45;
+/// Mirror of moveGen.ts LADDER_TOP_COST.
+const LADDER_TOP_COST: f64 = 2.0;
 /// Mirror of moveGen.ts TIGHT_COST.
 const TIGHT_COST: f64 = 6.0;
 
@@ -122,6 +130,9 @@ const META_RUN: u8 = 16;
 /// Aimed flight line (mirror of moveGen.ts META_AIM): the AIM byte follows
 /// the meta byte in the serialized result.
 const META_AIM: u8 = 32;
+/// A drop into liquid deeper than max_drop_down (mirror of moveGen.ts
+/// META_DEEP): inherited down the tree, never the best node of a partial.
+const META_DEEP: u8 = 64;
 /// Mirror of shapes.ts CARRY_WIDE.
 const CARRY_WIDE: u8 = 7;
 /// Thin footprint interval classes in sixteenths (mirror of shapes.ts THIN_INTERVALS).
@@ -220,6 +231,32 @@ const BOUNCE_MARGIN_FAR: f64 = 1.0;
 /// uploaded with the table (serializeParkourTable), never pasted here: a
 /// pasted copy once sat 0.1 below the pinned JS row and diverged the engines.
 const CHAIN_ROW: usize = 140;
+/// The lid model (moveGen.ts lidRows): J_LOW_RUN's offset in ext_reach, and
+/// J_LID8_RUN / J_LID13_RUN / J_LID3_RUN after the chain row (uploaded too).
+const LOW_ROW: usize = 70;
+const LID8_ROW: usize = 150;
+const LID13_ROW: usize = 220;
+const LID3_ROW: usize = 290;
+/// The free arc's apex (parkourEnvelope.ts FREE_APEX): a lid at or above it never touches.
+const FREE_APEX: f64 = 1.2522033402537236;
+/// The running take-off point along the flight line (parkourEnvelope.ts TAKEOFF_RUN).
+const TAKEOFF_RUN: f64 = 0.4;
+/// Lids one candidate is walked against at most (moveGen.ts LID_MAX).
+const LID_MAX: usize = 64;
+/// ext_reach's row block for a bonk height (mirror of moveGen.ts lidRows).
+fn lid_rows_base(cap: f64) -> usize {
+    if cap >= FREE_APEX {
+        0
+    } else if cap >= 1.2 - 1e-9 {
+        LID3_ROW
+    } else if cap >= 1.0125 - 1e-9 {
+        LID13_ROW
+    } else if cap >= 0.7 - 1e-9 {
+        LID8_ROW
+    } else {
+        LOW_ROW
+    }
+}
 const CHAIN_MIN_COS: f64 = 0.70;
 const CHAIN_TAKEOFF_FRACTION: f64 = 0.5;
 /// Chain turn loss per unit cos (parkourEnvelope.ts CHAIN_TURN_LOSS).
@@ -322,6 +359,11 @@ struct ExtEntry {
     /// The flown path in table space (ParkourExtEntry.pts): n_seg segments over up to three points.
     n_seg: usize,
     pts: [f64; 6],
+    /// Head cells (ParkourExtEntry.headCells/headIn/headOut): head_n of them
+    /// at ext_head[head_off·4..], each (ax, az, in, out) - the take-off first,
+    /// the landing last.
+    head_off: usize,
+    head_n: usize,
 }
 
 // ── goal ───────────────────────────────────────────────────────────────────
@@ -594,14 +636,31 @@ struct SolverState {
     /// The centre line's landing (node y, support y), reused by its aimed variants.
     ext_land_y: i32,
     ext_land_sup_y: i32,
+    /// ...and whether an overhang hangs over it (moveGen.ts extLandLid1).
+    ext_land_lid1: bool,
+    /// FLIGHT_ROW's curves (dx, dy pairs), curve r at ext_flight[ext_flight_off[r]..ext_flight_off[r + 1]].
+    ext_flight: Vec<f64>,
+    ext_flight_off: [usize; 8],
+    /// Every entry's head cells: (ax, az, in, out) each (ExtEntry.head_off).
+    ext_head: Vec<f64>,
+    /// The candidate's lids (moveGen.ts lidHb/lidLo/lidHi), its graded corridor lids, and thin_span's result.
+    lid_hb: [f64; LID_MAX],
+    lid_lo: [f64; LID_MAX],
+    lid_hi: [f64; LID_MAX],
+    gr_hb: [f64; 16],
+    gr_lo: [f64; 16],
+    gr_hi: [f64; 16],
+    span_lo: f64,
+    span_hi: f64,
     /// Per-corridor-cell min feet height: six blocks (standing, running,
     /// low-standing, low-running, lip, low-lip), each ext_mf_block long,
     /// indexed by block·ext_mf_block + cells_off + k.
     ext_mf: Vec<f64>,
     ext_mf_block: usize,
-    /// J_RUN (7 run rows × 10 buckets), J_LOW_RUN, then J_CHAIN (CHAIN_ROW)
-    /// — usable flight per run length / landing dy (parkourEnvelope.ts).
-    ext_reach: [f64; 150],
+    /// J_RUN (7 run rows × 10 buckets), J_LOW_RUN, then J_CHAIN (CHAIN_ROW),
+    /// then J_LID8_RUN, J_LID13_RUN, J_LID3_RUN (LID8_ROW..) — usable flight
+    /// per run length / landing dy (parkourEnvelope.ts).
+    ext_reach: [f64; 360],
     ext_diag_n: usize,
     ext_card_x_n: usize,
     ext_card_z_n: usize,
@@ -611,6 +670,8 @@ struct SolverState {
     /// Set by parkour_ext_target when a corridor pass refused the line: the
     /// aimed variants worth trying (mirror of moveGen.ts extTryMask).
     ext_try_mask: i32,
+    /// parkour_ext_target mode: the +1 climbable catch at head height (ext_target).
+    ext_up_catch: bool,
 
     // persistent epoch-stamped arena (grow-only, never zeroed per solve).
     // Slots [0, n_cells) are cells at momentum NONE; momentum states live in
@@ -648,6 +709,8 @@ struct SolverState {
     /// Set by slime_bounce for the push it is about to make.
     pending_via: i32,
     pending_aim: u8,
+    /// generate(): the node's head+1 lid lies inside its support panel's strip (lid_in_strip).
+    lid_here: bool,
     /// Set by parkour_ext_target for the landing it is about to push.
     pending_mom: u8,
     /// Momentum of the node being expanded (mirror of MoveGen.momIn).
@@ -699,15 +762,28 @@ impl SolverState {
             ext_p0_mask: 0,
             ext_land_y: 0,
             ext_land_sup_y: i32::MIN,
+            ext_land_lid1: false,
+            ext_flight: Vec::new(),
+            ext_flight_off: [0; 8],
+            ext_head: Vec::new(),
+            lid_hb: [0.0; LID_MAX],
+            lid_lo: [0.0; LID_MAX],
+            lid_hi: [0.0; LID_MAX],
+            gr_hb: [0.0; 16],
+            gr_lo: [0.0; 16],
+            gr_hi: [0.0; 16],
+            span_lo: 0.0,
+            span_hi: 0.0,
             ext_mf: Vec::new(),
             ext_mf_block: 0,
-            ext_reach: [0.0; 150],
+            ext_reach: [0.0; 360],
             ext_diag_n: 0,
             ext_card_x_n: 0,
             ext_card_z_n: 0,
             ext_main_n: 0,
             ext_var_per: 0,
             ext_try_mask: 0,
+            ext_up_catch: false,
             epoch: 0,
             g: Vec::new(),
             parent: Vec::new(),
@@ -741,6 +817,7 @@ impl SolverState {
             move_breaks: Vec::new(),
             pending_via: -1,
             pending_aim: 0,
+            lid_here: false,
             pending_mom: MOM_NONE,
             mom_in: MOM_NONE,
             mom_dx: 0,
@@ -907,7 +984,7 @@ unsafe fn parse_ext(st: &mut SolverState, ext_ptr: *const u8, ext_len: usize) ->
             entries.push(ExtEntry {
                 tx, tz, n_line, n_cells, cells_off, run_x, run_z,
                 dist: 0.0, cost: 0.0, fn_stand: 0.0, fn_run: 0.0, p_off: 0.0, q_off: 0.0, aim_index: 0, extra: 0.0,
-                n_seg, pts: [0.0; 6],
+                n_seg, pts: [0.0; 6], head_off: 0, head_n: 0,
             });
         }
         for _ in 0..cells_len {
@@ -947,6 +1024,39 @@ unsafe fn parse_ext(st: &mut SolverState, ext_ptr: *const u8, ext_len: usize) ->
         st.ext_mf_block = cells_len / 2;
         for _ in 0..cells_len * 3 {
             st.ext_mf.push(read_f64(ext_ptr, &mut eo));
+        }
+        // The lid model's tail (serializeParkourTable): J_LID rows, FLIGHT_ROW, head spans.
+        for i in LID8_ROW..LID3_ROW + 70 {
+            st.ext_reach[i] = read_f64(ext_ptr, &mut eo);
+        }
+        let mut lens = [0usize; 7];
+        for r in 0..7 {
+            lens[r] = read_f64(ext_ptr, &mut eo) as usize;
+            if lens[r] > 512 {
+                st.ext_main_n = 0;
+                return 5;
+            }
+        }
+        st.ext_flight.clear();
+        for r in 0..7 {
+            st.ext_flight_off[r] = st.ext_flight.len();
+            for _ in 0..lens[r] {
+                st.ext_flight.push(read_f64(ext_ptr, &mut eo));
+            }
+        }
+        st.ext_flight_off[7] = st.ext_flight.len();
+        st.ext_head.clear();
+        for i in 0..n_total {
+            let n = read_f64(ext_ptr, &mut eo) as usize;
+            if n > 256 {
+                st.ext_main_n = 0;
+                return 5;
+            }
+            entries[i].head_off = st.ext_head.len() / 4;
+            entries[i].head_n = n;
+            for _ in 0..n * 4 {
+                st.ext_head.push(read_f64(ext_ptr, &mut eo));
+            }
         }
         if eo != ext_len {
             st.ext_main_n = 0;
@@ -1371,7 +1481,18 @@ impl SolverState {
             return;
         }
 
-        cost += self.safe_or_break(x, y + 2, z);
+        // (across the panel's open side only: the jump on the latched tick,
+        // off the strip — mirror of moveGen.ts lidInStrip)
+        let mut latched = false;
+        if !self.is_safe(f_a) && self.ext_on() && self.lid_in_strip(x, y, z) {
+            let c = self.carry_at(x, y - 1, z);
+            if carry_side(c, dx, dz) == 1 {
+                latched = true;
+            }
+        }
+        if !latched {
+            cost += self.safe_or_break(x, y + 2, z);
+        }
         if cost > 100.0 {
             return;
         }
@@ -1384,7 +1505,7 @@ impl SolverState {
             return;
         }
 
-        self.push_out(x + dx, y + 1, z + dz, cost, 0);
+        self.push_out(x + dx, y + 1, z + dz, cost, if latched { META_PARKOUR } else { 0 });
     }
 
     /// Returns landing stand-cell y, or i32::MIN when none.
@@ -1472,7 +1593,8 @@ impl SolverState {
 
         cost += self.entities_at(x + dx, land_y, z + dz) * self.cfg.entity_cost;
 
-        self.push_out(x + dx, land_y, z + dz, cost, 0);
+        let deep = (y - land_y) > self.cfg.max_drop_down;
+        self.push_out(x + dx, land_y, z + dz, cost, if deep { META_DEEP } else { 0 });
         if self.ext_on() && !self.special.is_empty() {
             self.slime_bounce(x, y, z, x + dx, land_y, z + dz);
         }
@@ -1502,7 +1624,8 @@ impl SolverState {
 
         cost += self.entities_at(x, land_y, z) * self.cfg.entity_cost;
 
-        self.push_out(x, land_y, z, cost, 0);
+        let deep = (y - land_y) > self.cfg.max_drop_down;
+        self.push_out(x, land_y, z, cost, if deep { META_DEEP } else { 0 });
         if self.ext_on() && !self.special.is_empty() {
             self.slime_bounce(x, y, z, x, land_y, z);
         }
@@ -1679,7 +1802,9 @@ impl SolverState {
             }
 
             if ceiling_clear && self.is_safe(f_b) && self.is_safe(f_cd) && (f_dd & PHYSICAL) != 0 {
-                self.push_out(x + dxx, y, z + dzz, cost, META_PARKOUR);
+                if !self.lava_flanked(x + dxx, y, z + dzz) {
+                    self.push_out(x + dxx, y, z + dzz, cost, META_PARKOUR);
+                }
                 break;
             } else if ceiling_clear && self.is_safe(f_b) && (f_cd & PHYSICAL) != 0 {
                 if self.is_safe(f_a) && d != 4 {
@@ -1688,7 +1813,9 @@ impl SolverState {
                         break;
                     }
                     cost += self.entities_at(x + dxx, y + 1, z + dzz) * self.cfg.entity_cost;
-                    self.push_out(x + dxx, y + 1, z + dzz, cost, META_PARKOUR);
+                    if !self.lava_flanked(x + dxx, y + 1, z + dzz) {
+                        self.push_out(x + dxx, y + 1, z + dzz, cost, META_PARKOUR);
+                    }
                     break;
                 }
             } else if (ceiling_clear || d == 2)
@@ -1700,7 +1827,9 @@ impl SolverState {
                 let f_e = self.flags_at(x + dxx, y - 2, z + dzz);
                 if (f_e & PHYSICAL) != 0 {
                     cost += self.entities_at(x + dxx, y - 1, z + dzz) * self.cfg.entity_cost;
-                    self.push_out(x + dxx, y - 1, z + dzz, cost, META_PARKOUR);
+                    if !self.lava_flanked(x + dxx, y - 1, z + dzz) {
+                        self.push_out(x + dxx, y - 1, z + dzz, cost, META_PARKOUR);
+                    }
                 }
                 floor_cleared = floor_cleared && (f_e & PHYSICAL) == 0;
             } else if !self.is_safe(f_b) || !self.is_safe(f_cd) {
@@ -1815,16 +1944,241 @@ impl SolverState {
         if idx < 0 { 0 } else { self.thin[idx as usize] }
     }
 
+    /// The thin byte when it is a FOOTPRINT: a lid byte (0xF0 | k, a
+    /// full-footprint block raised k/16) reads 0 (mirror of moveGen.ts thinShapeAt).
+    fn thin_shape_at(&mut self, cx: i32, ly: i32, cz: i32) -> u8 {
+        let b = self.thin_at(cx, ly, cz);
+        if (b & 0xF0) == 0xF0 { 0 } else { b }
+    }
+
+    /// The path span over which the hitbox overlaps a cell's thin footprint
+    /// (span_lo, span_hi); false when the path keeps it off (mirror of moveGen.ts thinSpan).
+    fn thin_span(&mut self, cx: i32, ly: i32, cz: i32, ax: i32, az: i32, e: &ExtEntry, sx: i32, sz: i32) -> bool {
+        let b = self.thin_shape_at(cx, ly, cz);
+        let mut x0 = THIN_LO[(b & 15) as usize] / 16.0;
+        let mut x1 = THIN_HI[(b & 15) as usize] / 16.0;
+        let mut z0 = THIN_LO[(b >> 4) as usize] / 16.0;
+        let mut z1 = THIN_HI[(b >> 4) as usize] / 16.0;
+        if sx < 0 {
+            let lo = 1.0 - x1;
+            x1 = 1.0 - x0;
+            x0 = lo;
+        }
+        if sz < 0 {
+            let lo = 1.0 - z1;
+            z1 = 1.0 - z0;
+            z0 = lo;
+        }
+        x0 += ax as f64 - THIN_BODY_HALF;
+        x1 += ax as f64 + THIN_BODY_HALF;
+        z0 += az as f64 - THIN_BODY_HALF;
+        z1 += az as f64 + THIN_BODY_HALF;
+        let p = &e.pts;
+        let mut acc = 0.0;
+        let mut lo = f64::INFINITY;
+        let mut hi = f64::NEG_INFINITY;
+        for i in 0..e.n_seg {
+            let (px, pz) = (p[i * 2], p[i * 2 + 1]);
+            let dx = p[i * 2 + 2] - px;
+            let dz = p[i * 2 + 3] - pz;
+            let len = (dx * dx + dz * dz).sqrt();
+            let mut t0 = 0.0;
+            let mut t1 = 1.0;
+            let mut miss = false;
+            if dx == 0.0 {
+                if px <= x0 || px >= x1 {
+                    miss = true;
+                }
+            } else {
+                let mut a = (x0 - px) / dx;
+                let mut q = (x1 - px) / dx;
+                if a > q {
+                    let w = a;
+                    a = q;
+                    q = w;
+                }
+                if a > t0 {
+                    t0 = a;
+                }
+                if q < t1 {
+                    t1 = q;
+                }
+            }
+            if dz == 0.0 {
+                if pz <= z0 || pz >= z1 {
+                    miss = true;
+                }
+            } else {
+                let mut a = (z0 - pz) / dz;
+                let mut q = (z1 - pz) / dz;
+                if a > q {
+                    let w = a;
+                    a = q;
+                    q = w;
+                }
+                if a > t0 {
+                    t0 = a;
+                }
+                if q < t1 {
+                    t1 = q;
+                }
+            }
+            if !miss && t1 - t0 > 1e-9 {
+                if acc + t0 * len < lo {
+                    lo = acc + t0 * len;
+                }
+                if acc + t1 * len > hi {
+                    hi = acc + t1 * len;
+                }
+            }
+            acc += len;
+        }
+        self.span_lo = lo;
+        self.span_hi = hi;
+        hi >= lo
+    }
+
+    /// The arc of take-off row r, jumping s0 along the path, tick by tick
+    /// against the candidate's n lids: the cap it bonks at (INFINITY: none),
+    /// NaN where it meets one side-on (mirror of moveGen.ts lidWalk).
+    fn lid_walk(&self, n: usize, r: usize, s0: f64, land_rise: f64, land_in: f64) -> f64 {
+        let c0 = self.ext_flight_off[r];
+        let c1 = self.ext_flight_off[r + 1];
+        let mut capped = false;
+        let mut cap = f64::INFINITY;
+        let mut yy = 0.0;
+        let mut vy = 0.0;
+        let mut s_prev = s0;
+        let mut i = c0;
+        while i < c1 {
+            let yn;
+            if !capped {
+                let mut y_n = self.ext_flight[i + 1];
+                let mut hb_here = f64::INFINITY;
+                for j in 0..n {
+                    if self.lid_lo[j] <= s_prev && s_prev <= self.lid_hi[j] && self.lid_hb[j] < hb_here {
+                        hb_here = self.lid_hb[j];
+                    }
+                }
+                if y_n > hb_here {
+                    capped = true;
+                    cap = hb_here;
+                    y_n = hb_here;
+                    vy = 0.0;
+                }
+                yn = y_n;
+            } else {
+                vy = (vy - 0.08) * 0.98;
+                yn = yy + vy;
+            }
+            yy = yn;
+            let s_next = s0 + self.ext_flight[i];
+            for j in 0..n {
+                if self.lid_lo[j] > s_prev && self.lid_lo[j] <= s_next && yy > self.lid_hb[j] {
+                    return f64::NAN;
+                }
+            }
+            s_prev = s_next;
+            if yy <= land_rise && s_next >= land_in {
+                break;
+            }
+            i += 2;
+        }
+        cap
+    }
+
+    /// The corridor's uniform cap and the take-off lid over its head span, as
+    /// the first lids of the walk (mirror of moveGen.ts seedLids).
+    fn seed_lids(&mut self, cap_c: f64, cap_t: f64, t_in: f64, t_out: f64) -> usize {
+        let mut n = 0usize;
+        if cap_c < FREE_APEX {
+            self.lid_hb[n] = cap_c;
+            self.lid_lo[n] = -1e9;
+            self.lid_hi[n] = 1e9;
+            n += 1;
+        }
+        if cap_t < FREE_APEX {
+            self.lid_hb[n] = cap_t;
+            self.lid_lo[n] = t_in;
+            self.lid_hi[n] = t_out;
+            n += 1;
+        }
+        n
+    }
+
+    /// lid_walk over a running take-off's window round s0 (row 0 at s0 alone):
+    /// the lowest cap, NaN if any meets a lid side-on (mirror of moveGen.ts lidWalkWindow).
+    fn lid_walk_window(&self, n: usize, r: usize, s0: f64, land_rise: f64, land_in: f64) -> f64 {
+        if r == 0 {
+            return self.lid_walk(n, r, s0, land_rise, land_in);
+        }
+        let mut cap = f64::INFINITY;
+        for k in -2i32..=2 {
+            let c = self.lid_walk(n, r, s0 + (k as f64) * 0.07, land_rise, land_in);
+            if c.is_nan() {
+                return f64::NAN;
+            }
+            if c < cap {
+                cap = c;
+            }
+        }
+        cap
+    }
+
+    /// A lid inside the take-off panel's strip: the head+1 cell's thin
+    /// footprint lies within the support panel's (mirror of moveGen.ts
+    /// lidInStrip).
+    fn lid_in_strip(&mut self, x: i32, y: i32, z: i32) -> bool {
+        let hb = self.thin_shape_at(x, y + 2, z);
+        let sb = self.thin_shape_at(x, y - 1, z);
+        if hb == 0 || sb == 0 {
+            return false;
+        }
+        let c = self.carry_at(x, y - 1, z);
+        if c < CARRY_W_NONE || c > CARRY_S_NONE {
+            return false;
+        }
+        if (self.flags_at(x, y + 2, z) & LIQUID) != 0 {
+            return false;
+        }
+        let (h0, s0) = ((hb & 15) as usize, (sb & 15) as usize);
+        let (h1, s1) = ((hb >> 4) as usize, (sb >> 4) as usize);
+        THIN_LO[h0] >= THIN_LO[s0] && THIN_HI[h0] <= THIN_HI[s0] && THIN_LO[h1] >= THIN_LO[s1] && THIN_HI[h1] <= THIN_HI[s1]
+    }
+
+    /// Does a step (dx, dz) take the body off the strip at this cell's edge
+    /// (mirror of moveGen.ts leavesLid)?
+    fn leaves_lid(&mut self, x: i32, y: i32, z: i32, dx: i32, dz: i32, h_0: f64) -> bool {
+        let c = self.carry_at(x, y - 1, z);
+        if (dx != 0 && carry_side(c, dx, 0) == 1) || (dz != 0 && carry_side(c, 0, dz) == 1) {
+            return true;
+        }
+        if dx != 0 && self.level_support(x + dx, y - 1, z, h_0) {
+            return false;
+        }
+        if dz != 0 && self.level_support(x, y - 1, z + dz, h_0) {
+            return false;
+        }
+        if dx != 0 && dz != 0 && self.level_support(x + dx, y - 1, z + dz, h_0) {
+            return false;
+        }
+        dx != 0 || dz != 0
+    }
+
+    fn level_support(&mut self, x: i32, y: i32, z: i32, h_0: f64) -> bool {
+        (self.flags_at(x, y, z) & PHYSICAL) != 0 && (self.height_at(x, y, z) - h_0).abs() < 0.07
+    }
+
     /// Floor that is no way through: a thin shape stands on it at body height
     /// (mirror of moveGen.ts thinStands).
     fn thin_stands(&mut self, cx: i32, y: i32, cz: i32) -> bool {
-        if self.thin_at(cx, y, cz) != 0 {
+        if self.thin_shape_at(cx, y, cz) != 0 {
             let f0 = self.flags_at(cx, y, cz);
             if !self.is_safe(f0) {
                 return true;
             }
         }
-        if self.thin_at(cx, y + 1, cz) != 0 {
+        if self.thin_shape_at(cx, y + 1, cz) != 0 {
             let f1 = self.flags_at(cx, y + 1, cz);
             return !self.is_safe(f1);
         }
@@ -1834,7 +2188,7 @@ impl SolverState {
     /// A corridor cell that is not passable but holds only a thin shape the
     /// path keeps the hitbox off (mirror of moveGen.ts thinClear).
     fn thin_clear(&mut self, cx: i32, ly: i32, cz: i32, e: &ExtEntry, k: usize, sx: i32, sz: i32) -> bool {
-        let b = self.thin_at(cx, ly, cz);
+        let b = self.thin_shape_at(cx, ly, cz);
         if b == 0 {
             return false;
         }
@@ -1871,6 +2225,20 @@ impl SolverState {
     /// The centred line of main entry `k`, then — only where a corridor pass
     /// refused it — its shifted variants (mirror of moveGen.ts extTarget).
     fn ext_target(&mut self, x: i32, y: i32, z: i32, sx: i32, sz: i32, h_0: f64, low_takeoff: bool, tab: &[ExtEntry], k: usize) {
+        self.ext_target_lines(x, y, z, sx, sz, h_0, low_takeoff, tab, k);
+        // +1 climbable catch at head height: an extra candidate beside the
+        // column's own landing (mirror of moveGen.ts extTarget).
+        let tx = x + tab[k].tx * sx;
+        let tz = z + tab[k].tz * sz;
+        let f_u = self.flags_at(tx, y + 1, tz);
+        if (f_u & CLIMBABLE) != 0 && self.is_safe(f_u) && self.climb_usable(tx, y + 1, tz) {
+            self.ext_up_catch = true;
+            self.parkour_ext_target(x, y, z, sx, sz, h_0, low_takeoff, &tab[k], -1, 0.0);
+            self.ext_up_catch = false;
+        }
+    }
+
+    fn ext_target_lines(&mut self, x: i32, y: i32, z: i32, sx: i32, sz: i32, h_0: f64, low_takeoff: bool, tab: &[ExtEntry], k: usize) {
         self.ext_try_mask = 0;
         self.parkour_ext_target(x, y, z, sx, sz, h_0, low_takeoff, &tab[k], -1, 0.0);
         let mut mask = self.ext_try_mask;
@@ -1900,14 +2268,41 @@ impl SolverState {
         }
     }
 
+    /// Mirror of moveGen.ts lavaFlanked: lava (LIQUID without SAFE) in any of
+    /// the 8 cells round a landing, at feet or head height.
+    fn lava_flanked(&mut self, tx: i32, ny: i32, tz: i32) -> bool {
+        for dx in -1..=1 {
+            for dz in -1..=1 {
+                if dx == 0 && dz == 0 {
+                    continue;
+                }
+                for ly in ny..=ny + 1 {
+                    let idx = self.cell_index(tx + dx, ly, tz + dz);
+                    if idx < 0 {
+                        continue;
+                    }
+                    let f = self.flags[idx as usize];
+                    if (f & LIQUID) != 0 && (f & SAFE) == 0 {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
     fn parkour_ext_target(&mut self, x: i32, y: i32, z: i32, sx: i32, sz: i32, h_0: f64, low_takeoff: bool, e: &ExtEntry, chain_via: i32, chain_base: f64) {
         self.begin_move();
         let cbase = e.cells_off * 2;
         // Flat-ground fast-out: walkable floor on the first flight-line cell.
         let flx = x + self.ext_cells[cbase] * sx;
         let flz = z + self.ext_cells[cbase + 1] * sz;
+        // (open ground: feet and head above that floor open too; mirror of moveGen.ts)
+        let f_feet = self.flags_at(flx, y, flz);
+        let f_head = self.flags_at(flx, y + 1, flz);
         if (self.flags_at(flx, y - 1, flz) & PHYSICAL) != 0 && self.height_at(flx, y - 1, flz) >= h_0
             && !self.thin_stands(flx, y, flz)
+            && self.is_safe(f_feet) && self.is_safe(f_head)
         {
             // A walk for every aimed line over this floor too (ext_target).
             if e.aim_index != 0 {
@@ -1928,11 +2323,37 @@ impl SolverState {
         // Cell whose top the feet land on (support landings): the reach
         // bucket is the real rise to it. i32::MIN = a catch (node delta).
         let mut sup_y: i32 = i32::MIN;
-        if e.aim_index != 0 {
+        // (tx, y+1) blocked over a drop landing: a lid the walk must pass under (F2)
+        let mut land_lid1 = false;
+        if self.ext_up_catch {
+            // +1 catch (mirror of moveGen.ts): the flight-level cell open air,
+            // the head cell above the catch open, through the ladder's open
+            // face, over a planner landing (the net).
+            if (f_t & (PHYSICAL | CLIMBABLE | LIQUID)) != 0 || !self.is_safe(f_t) || (self.special_at(tx, y, tz) & BUBBLE_MASK) != 0 {
+                return;
+            }
+            let f_h = self.flags_at(tx, y + 2, tz);
+            if !self.is_safe(f_h) {
+                return;
+            }
+            let pc = self.carry_at(tx, y + 1, tz);
+            if pc != 0 && ((e.tx != 0 && carry_side(pc, sx, 0) == 1) || (e.tz != 0 && carry_side(pc, 0, sz) == 1)) {
+                return;
+            }
+            if self.find_ext_landing(tx, y, tz).is_none() {
+                return;
+            }
+            node_y = y + 1;
+            cost += 1.0;
+        } else if e.aim_index != 0 {
             // An aimed line lands where the centre line that selected it lands
             // (ext_target): a full top, classified once on the centre line.
             node_y = self.ext_land_y;
             sup_y = self.ext_land_sup_y;
+            // (an overhang over a drop landing on the centre line only, mirror of moveGen.ts)
+            if self.ext_land_lid1 {
+                return;
+            }
             land_catch = 0;
             if node_y > y {
                 cost += (node_y - y) as f64;
@@ -2009,13 +2430,18 @@ impl SolverState {
             land_catch = (self.heights[idx_t as usize] >> 6) as i32;
             sup_y = y;
         } else {
-            let t1 = self.flags_at(tx, y + 1, tz);
-            if !self.is_safe(f_t) || !self.is_safe(t1) {
+            if !self.is_safe(f_t) {
                 return;
             }
+            let t1 = self.flags_at(tx, y + 1, tz);
+            land_lid1 = !self.is_safe(t1);
             match self.find_ext_landing(tx, y, tz) {
                 Some(ly) => node_y = ly,
                 None => return,
+            }
+            // (an overhang at flight level over a landing at flight level: no room to stand)
+            if land_lid1 && node_y >= y {
+                return;
             }
             // Landed ON a support rather than IN a catching cell?
             let f_n = self.flags_at(tx, node_y, tz);
@@ -2030,12 +2456,22 @@ impl SolverState {
         if land_catch == 0 && e.aim_index == 0 {
             self.ext_land_y = node_y;
             self.ext_land_sup_y = sup_y;
+            self.ext_land_lid1 = land_lid1;
         }
 
         // Corridor pass 1 — body cells passable, line-cell walkable rule,
         // and any blocked head+1 (takeoff included) selects the head-hitter
         // class (mirror of moveGen.ts).
-        let mut low = low_takeoff;
+        // (a lid inside the take-off panel's strip bonks nothing once the body
+        // is off the strip: the jump on the latched tick, lid_in_strip)
+        let latched_off = self.lid_here && chain_via < 0 && {
+            let ldx = if e.tx > 0 { sx } else { 0 };
+            let ldz = if e.tz > 0 { sz } else { 0 };
+            self.leaves_lid(x, y, z, ldx, ldz, h_0)
+        };
+        let bonk = low_takeoff;
+        // (graded below, the lid model)
+        let mut low = false;
         for k in 0..e.n_cells {
             let c_ax = self.ext_cells[cbase + k * 2];
             let c_az = self.ext_cells[cbase + k * 2 + 1];
@@ -2050,13 +2486,9 @@ impl SolverState {
                 // aimed line can clear; on a variant the mask is its siblings'
                 // (mirror of moveGen.ts).
                 if land_catch == 0 {
-                    self.ext_try_mask = if self.thin_at(cx, ly, cz) != 0 { -1 } else { self.ext_avoid[e.cells_off + k] };
+                    self.ext_try_mask = if self.thin_shape_at(cx, ly, cz) != 0 { -1 } else { self.ext_avoid[e.cells_off + k] };
                 }
                 return;
-            }
-            let c2 = self.flags_at(cx, y + 2, cz);
-            if !self.is_safe(c2) && !self.thin_clear(cx, y + 2, cz, e, k, sx, sz) {
-                low = true;
             }
             if k < e.n_line {
                 let fd = self.flags_at(cx, y - 1, cz);
@@ -2105,10 +2537,17 @@ impl SolverState {
         // available before the lip — the support itself plus a walkable
         // cell behind, level or one step lower.
         let takeoff_catch = self.catch_at(x, y - 1, z);
-        if (self.flags_at(x, y - 1, z) & CLIMBABLE) != 0 {
-            return; // a ladder's top edge is not a takeoff (mirror of moveGen.ts)
+        // A ladder's top edge: a standing take-off from its strip, no rise
+        // (mirror of moveGen.ts ladderTop).
+        let ladder_top = (self.flags_at(x, y - 1, z) & CLIMBABLE) != 0;
+        if ladder_top && node_y > y {
+            return;
         }
-        let l_cred = if land_catch < 0 { LAND_HALF } else { LAND_NARROW_MARGIN + CATCH_HALF[land_catch as usize] };
+        if ladder_top {
+            cost += LADDER_TOP_COST;
+        }
+        let mut ladder_catch_fix = false; // mirror of moveGen.ts
+        let l_cred = if self.ext_up_catch { UP_CATCH_CREDIT } else if land_catch < 0 { LAND_HALF } else { LAND_NARROW_MARGIN + CATCH_HALF[land_catch as usize] };
         let half = CATCH_HALF[takeoff_catch];
         // Direction-dependent carry on narrow supports (mirror of moveGen.ts).
         let maj_f = if e.tx > e.tz { e.tx as f64 } else { e.tz as f64 };
@@ -2138,7 +2577,7 @@ impl SolverState {
         let front = if off_panel || c_front == 1 { 0.0 } else if c_front == 2 { TAKEOFF_STAND } else { (TAKEOFF_NARROW_MARGIN + half).min(TAKEOFF_STAND) };
         let back = if off_panel || c_back == 1 { 0.0 } else if c_back == 2 { 0.5 + TAKEOFF_NARROW_MARGIN } else { half + TAKEOFF_NARROW_MARGIN };
         let lip_half = if off_panel || c_front == 1 { -LAND_NARROW_MARGIN } else if c_front == 2 { 0.5 } else { half };
-        let mut run = front + back;
+        let mut run = if ladder_top { front } else { front + back };
         let mut l_cred_x = l_cred;
         let mut l_cred_z = l_cred;
         if land_catch > 0 && sup_y != i32::MIN {
@@ -2158,7 +2597,7 @@ impl SolverState {
         let rz = z + e.run_z * sz;
         let r0 = self.flags_at(rx, y, rz);
         let r1 = self.flags_at(rx, y + 1, rz);
-        if !off_panel && self.is_safe(r0) && self.is_safe(r1) {
+        if !off_panel && !ladder_top && self.is_safe(r0) && self.is_safe(r1) {
             let f_r = self.flags_at(rx, y - 1, rz);
             if (f_r & PHYSICAL) != 0 && self.catch_at(rx, y - 1, rz) == 0 {
                 let h_r = self.height_at(rx, y - 1, rz);
@@ -2175,13 +2614,8 @@ impl SolverState {
                 }
             }
         }
-        let row = run_row(run);
-        let base = (if low { 70 } else { 0 }) + row * 10;
-        let mut usable = self.ext_reach[base + bucket];
-        if frac > 0.0 {
-            usable = usable + (self.ext_reach[base + bucket - 1] - usable) * frac;
-        }
-        let mut fn_needed = if takeoff_catch == 0 && land_catch <= 0 {
+        let mut row = run_row(run);
+        let mut fn_needed = if takeoff_catch == 0 && land_catch <= 0 && !self.ext_up_catch {
             e.fn_stand
         } else {
             let a = e.tx as f64;
@@ -2192,9 +2626,198 @@ impl SolverState {
             fn_needed += OFF_PANEL_MARGIN; // mirror of moveGen.ts
         }
         fn_needed += e.extra; // an aimed line is that much longer (mirror of moveGen.ts)
+        if ladder_top {
+            if off_panel {
+                // per-axis credit off a ladder top (mirror of moveGen.ts)
+                let c_x = if e.tx == 0 { 0.0 } else if carry_side(t_carry, sx, 0) == 2 { TAKEOFF_STAND } else { 0.0 };
+                let c_z = if e.tz == 0 { 0.0 } else if carry_side(t_carry, 0, sz) == 2 { TAKEOFF_STAND } else { 0.0 };
+                let ex = e.tx as f64 - c_x - l_cred_x;
+                let ez = e.tz as f64 - c_z - l_cred_z;
+                fn_needed = ((if ex > 0.0 { ex * ex } else { 0.0 }) + (if ez > 0.0 { ez * ez } else { 0.0 })).sqrt() + OFF_PANEL_MARGIN + e.extra;
+            } else if land_catch < 0 && (e.tx == 0 || e.tz == 0) {
+                fn_needed += LADDER_CATCH_OVERCREDIT;
+                ladder_catch_fix = true;
+            }
+        }
+        // LID WALK (mirror of moveGen.ts): the old head-hitter rule graded per
+        // lid, the arc walked against the lids, a slower take-off where the
+        // default one meets one side-on.
+        let mut lid_cap = f64::INFINITY;
+        let s0 = front * e.dist / maj_f;
+        let land_rise = if sup_y == i32::MIN { (node_y - y) as f64 } else { rise };
+        let land_in = if e.head_n > 0 { self.ext_head[(e.head_off + e.head_n - 1) * 4 + 2] } else { f64::NAN };
+        let mut n_lid: usize = 0;
+        let mut n_gr: usize = 0;
+        let mut n_gr_walk: usize = 0;
+        {
+            let mut cap_t = f64::INFINITY;
+            // (a latched take-off leaves its lid before it jumps: lid_in_strip)
+            let f2 = self.flags_at(x, y + 2, z);
+            if !latched_off && !self.is_safe(f2) {
+                let b = self.thin_at(x, y + 2, z);
+                if b != 0 && (b & 0xF0) != 0xF0 {
+                    let lim = if row > 0 { s0.min(TAKEOFF_RUN * e.dist / maj_f) } else { s0 };
+                    if takeoff_catch != 0 || t_carry != 0 || (self.thin_span(x, y + 2, z, 0, 0, e, sx, sz) && self.span_hi >= lim) {
+                        cap_t = (y + 2) as f64 - 1.8 - h_0;
+                    }
+                } else {
+                    cap_t = (y + 2) as f64 + (if b != 0 { (b & 15) as f64 / 16.0 } else { 0.0 }) - 1.8 - h_0;
+                }
+            }
+            let mut cap_c = f64::INFINITY;
+            for k in 0..e.n_cells {
+                let c_ax = self.ext_cells[cbase + k * 2];
+                let c_az = self.ext_cells[cbase + k * 2 + 1];
+                let cx = x + c_ax * sx;
+                let cz = z + c_az * sz;
+                let c2 = self.flags_at(cx, y + 2, cz);
+                if self.is_safe(c2) || self.thin_clear(cx, y + 2, cz, e, k, sx, sz) {
+                    continue;
+                }
+                let b = self.thin_at(cx, y + 2, cz);
+                let lid = (b & 0xF0) == 0xF0;
+                let hb = (y + 2) as f64 + (if lid { (b & 15) as f64 / 16.0 } else { 0.0 }) - 1.8 - h_0;
+                if lid {
+                    // a graded lid the body is not under over the whole take-off
+                    // window: the free arc may reach it side-on (the walk decides)
+                    let mut lo = -1e9;
+                    let mut hi = 1e9;
+                    for h in 0..e.head_n {
+                        let o = (e.head_off + h) * 4;
+                        if self.ext_head[o] == c_ax as f64 && self.ext_head[o + 1] == c_az as f64 {
+                            lo = self.ext_head[o + 2];
+                            hi = self.ext_head[o + 3];
+                            break;
+                        }
+                    }
+                    if lo > s0 - 0.14 && n_gr < 16 {
+                        self.gr_hb[n_gr] = hb;
+                        self.gr_lo[n_gr] = lo;
+                        self.gr_hi[n_gr] = hi;
+                        n_gr += 1;
+                        continue;
+                    }
+                }
+                if hb < cap_c {
+                    cap_c = hb;
+                }
+            }
+            // (the rows' class: the lower of the take-off's lid and the corridor's)
+            let mut cap = if cap_t < cap_c { cap_t } else { cap_c };
+            // the take-off cell's head span (the take-off lid's real span; NaN without one, as JS reads undefined)
+            let (t_in, t_out) = if e.head_n > 0 {
+                (self.ext_head[e.head_off * 4 + 2], self.ext_head[e.head_off * 4 + 3])
+            } else {
+                (f64::NAN, f64::NAN)
+            };
+            let mut gr_below = false;
+            for j in 0..n_gr {
+                if self.gr_hb[j] < cap_c && self.gr_hb[j] < FREE_APEX {
+                    gr_below = true;
+                }
+            }
+            if gr_below {
+                // the arc (default row) against those caps and these lids;
+                // side-on, the old rule: the whole jump in the 0.2 class
+                let mut n = self.seed_lids(cap_c, cap_t, t_in, t_out);
+                for j in 0..n_gr {
+                    if self.gr_hb[j] < cap_c && self.gr_hb[j] < FREE_APEX {
+                        self.lid_hb[n] = self.gr_hb[j];
+                        self.lid_lo[n] = self.gr_lo[j];
+                        self.lid_hi[n] = self.gr_hi[j];
+                        n += 1;
+                    }
+                }
+                let c = self.lid_walk_window(n, row, s0, land_rise, land_in);
+                if c.is_nan() {
+                    let old = (y + 2) as f64 - 1.8 - h_0;
+                    if old < cap {
+                        cap = old;
+                    }
+                } else if !land_lid1 {
+                    n_lid = n;
+                } else {
+                    n_gr_walk = n;
+                }
+            }
+            lid_cap = if cap >= FREE_APEX { f64::INFINITY } else { cap };
+            low = lid_cap != f64::INFINITY;
+            if land_lid1 {
+                // the overhang over a drop landing: the walk decides
+                n_lid = n_gr_walk;
+                if n_lid == 0 {
+                    n_lid = self.seed_lids(cap_c, cap_t, t_in, t_out);
+                }
+                let b1 = self.thin_at(tx, y + 1, tz);
+                let o = (e.head_off + e.head_n - 1) * 4;
+                let mut lo = if e.head_n > 0 { self.ext_head[o + 2] } else { f64::NAN };
+                let mut hi = if e.head_n > 0 { self.ext_head[o + 3] } else { f64::NAN };
+                let mut ok = true;
+                let lid1 = (b1 & 0xF0) == 0xF0;
+                if b1 != 0 && !lid1 {
+                    if self.thin_span(tx, y + 1, tz, e.tx, e.tz, e, sx, sz) {
+                        lo = self.span_lo;
+                        hi = self.span_hi;
+                    } else {
+                        ok = false;
+                    }
+                }
+                if ok {
+                    self.lid_hb[n_lid] = (y + 1) as f64 + (if lid1 { (b1 & 15) as f64 / 16.0 } else { 0.0 }) - 1.8 - h_0;
+                    self.lid_lo[n_lid] = lo;
+                    self.lid_hi[n_lid] = hi;
+                    n_lid += 1;
+                } else if n_gr_walk == 0 {
+                    n_lid = 0;
+                }
+            }
+        }
+        // (the reach rows stay bounded by the caps: the walk's own may be higher)
+        let row_cap = lid_cap;
+        if n_lid > 0 {
+            let mut found = false;
+            let mut r = row as i32;
+            while r >= 0 {
+                let ru = r as usize;
+                let cw = self.lid_walk_window(n_lid, ru, s0, land_rise, land_in);
+                if cw.is_nan() {
+                    r -= 1;
+                    continue;
+                }
+                let c = if cw < row_cap { cw } else { row_cap };
+                if ru < row {
+                    let rb = lid_rows_base(c) + ru * 10;
+                    let mut u = self.ext_reach[rb + bucket];
+                    if frac > 0.0 {
+                        u = u + (self.ext_reach[rb + bucket - 1] - u) * frac;
+                    }
+                    if fn_needed > u + self.cfg.tight_credit {
+                        r -= 1;
+                        continue;
+                    }
+                }
+                row = ru;
+                lid_cap = c;
+                found = true;
+                break;
+            }
+            if !found {
+                if land_catch == 0 && e.aim_index == 0 {
+                    self.ext_try_mask = -1;
+                }
+                return;
+            }
+            low = lid_cap != f64::INFINITY;
+        }
+        let rows_base = lid_rows_base(lid_cap);
+        let base = rows_base + row * 10;
+        let mut usable = self.ext_reach[base + bucket];
+        if frac > 0.0 {
+            usable = usable + (self.ext_reach[base + bucket - 1] - usable) * frac;
+        }
         // Would the standing row fly it? META_RUN for the executor only
         // (mirror of moveGen.ts runNeeded).
-        let stand_base = if low { 70 } else { 0 };
+        let stand_base = rows_base;
         let mut usable_stand = self.ext_reach[stand_base + bucket];
         if frac > 0.0 {
             usable_stand = usable_stand + (self.ext_reach[stand_base + bucket - 1] - usable_stand) * frac;
@@ -2217,13 +2840,24 @@ impl SolverState {
             chained = false;
             lip_jump = false;
             if chain_via < 0 {
-                if !feasible && self.momentum && !off_panel {
+                if !feasible && self.momentum && !off_panel && !ladder_top && !self.ext_up_catch {
                     // Lip take-off (mirror of moveGen.ts): half + 0.3 past centre,
                     // tried only where the creep credit falls short.
                     let a = e.tx as f64;
                     let b = e.tz as f64;
                     let s_lip = (lip_half + LAND_NARROW_MARGIN + LIP_PHASE) * e.dist / maj_f;
-                    if flight_from2(a, b, e.dist, s_lip, l_cred_x, l_cred_z) <= usable_m {
+                    let mut usable_lip = usable_m;
+                    // (under lids, the lip's own walk: a later, lower rising arc)
+                    if n_lid > 0 {
+                        let cw = self.lid_walk_window(n_lid, row, s_lip, land_rise, land_in);
+                        if cw.is_nan() {
+                            usable_lip = f64::NEG_INFINITY;
+                        } else {
+                            let rb = lid_rows_base(if cw < row_cap { cw } else { row_cap }) + row * 10;
+                            usable_lip = self.ext_reach[rb + bucket] + (if frac > 0.0 { (self.ext_reach[rb + bucket - 1] - self.ext_reach[rb + bucket]) * frac } else { 0.0 }) + mc;
+                        }
+                    }
+                    if flight_from2(a, b, e.dist, s_lip, l_cred_x, l_cred_z) <= usable_lip {
                         feasible = true;
                         lip_jump = true;
                     }
@@ -2233,7 +2867,7 @@ impl SolverState {
                     // moveGen.ts): continue the incoming flight within the cone,
                     // chain row from the far-side landing point less the turn
                     // loss, never under a lid.
-                    if self.mom_in == MOM_NONE || low || e.aim_index != 0 || off_panel
+                    if self.mom_in == MOM_NONE || low || bonk || n_lid > 0 || e.aim_index != 0 || off_panel || self.ext_up_catch
                         || !chain_aligned(self.mom_dx, self.mom_dz, self.mom_d2, e.tx * sx, e.tz * sz)
                     {
                         ok = false;
@@ -2254,7 +2888,7 @@ impl SolverState {
             } else {
                 // Chain variant (mirror of moveGen.ts): only where the stone's
                 // own jump falls short, from the landing point, never under a lid.
-                if feasible || low {
+                if feasible || low || n_lid > 0 {
                     return;
                 }
                 let a = e.tx as f64;
@@ -2269,11 +2903,14 @@ impl SolverState {
             if ok {
                 break;
             }
-            if tight || mc >= self.cfg.tight_credit {
+            if tight || mc >= self.cfg.tight_credit || self.ext_up_catch {
                 return;
             }
             tight = true;
             mc = self.cfg.tight_credit;
+            if ladder_catch_fix {
+                fn_needed -= LADDER_CATCH_OVERCREDIT;
+            }
         }
         if tight {
             cost += TIGHT_COST;
@@ -2300,13 +2937,13 @@ impl SolverState {
                     let fd = self.flags_at(cx, ly, cz);
                     if !self.is_safe(fd) && !self.thin_clear(cx, ly, cz, e, k, sx, sz) {
                         if land_catch == 0 && e.aim_index == 0 {
-                            self.ext_try_mask = if self.thin_at(cx, ly, cz) != 0 { -1 } else { self.ext_avoid[e.cells_off + k] };
+                            self.ext_try_mask = if self.thin_shape_at(cx, ly, cz) != 0 { -1 } else { self.ext_avoid[e.cells_off + k] };
                         }
                         return; // body cell
                     }
                 } else if self.height_at(cx, ly, cz) > lim && !self.thin_clear(cx, ly, cz, e, k, sx, sz) {
                     if land_catch == 0 && e.aim_index == 0 {
-                        self.ext_try_mask = if self.thin_at(cx, ly, cz) != 0 { -1 } else { self.ext_avoid[e.cells_off + k] };
+                        self.ext_try_mask = if self.thin_shape_at(cx, ly, cz) != 0 { -1 } else { self.ext_avoid[e.cells_off + k] };
                     }
                     return; // pokes up into the flight path
                 }
@@ -2327,6 +2964,10 @@ impl SolverState {
         // A narrow support landing that does not hurt carries its flight
         // direction (mirror of moveGen.ts: a full block's lip out-reaches a
         // re-jump, a damaging fall's velocity packet zeroes the motion).
+        // (never an airborne landing with lava beside it; mirror of moveGen.ts lavaFlanked)
+        if self.lava_flanked(tx, node_y, tz) {
+            return;
+        }
         if self.momentum && land_catch >= 1 && rise >= -MOMENTUM_MAX_DROP {
             self.pending_mom = momentum_of(e.tx * sx, e.tz * sz);
         }
@@ -2343,7 +2984,9 @@ impl SolverState {
                 self.pending_aim = e.aim_index | if sx * sz < 0 { 0x80 } else { 0 };
             }
             let shift_bit = if e.aim_index != 0 { META_AIM } else { 0 };
-            self.push_out(tx, node_y, tz, cost, META_PARKOUR | run_bit | shift_bit);
+            // (a catch into liquid deeper than max_drop_down: no way back, META_DEEP)
+            let deep = if (y - node_y) > self.cfg.max_drop_down { META_DEEP } else { 0 };
+            self.push_out(tx, node_y, tz, cost, META_PARKOUR | run_bit | shift_bit | deep);
         }
     }
 
@@ -2611,6 +3254,7 @@ impl SolverState {
         let mut jumps = false;
         let mut h_0 = 0.0;
         let mut low_takeoff = false;
+        self.lid_here = false;
         let tab = Rc::clone(&self.ext_entries);
         if self.ext_on() {
             // No y+2 requirement: a blocked head+1 at the takeoff selects the
@@ -2624,6 +3268,7 @@ impl SolverState {
                 h_0 = self.height_at(x, y - 1, z);
                 let head = self.flags_at(x, y + 2, z);
                 low_takeoff = !self.is_safe(head);
+                self.lid_here = low_takeoff && self.lid_in_strip(x, y, z);
             }
         }
         for i in 0..4 {
@@ -2690,14 +3335,16 @@ impl SolverState {
     fn touch_chunk(&mut self, x: i32, z: i32) {
         let cx = x >> 4;
         let cz = z >> 4;
-        let key = (((cx as u32) as u64) << 32 | ((cz as u32) as u64)) + 1; // +1: 0 marks empty
+        // (0 marks an empty slot: the top bit flipped, then +1, so no chunk maps to
+        // it - plain +1 wrapped chunk (-1,-1) to 0, and it was never recorded)
+        let key = ((((cx as u32) as u64) << 32 | ((cz as u32) as u64)) ^ (1u64 << 63)) + 1;
         // Load factor < 1/2 keeps linear probing terminating and fast.
         if self.chunk_list.len() * 2 >= self.chunk_set.len() {
             let cap = self.chunk_set.len() * 2;
             let mask = cap - 1;
             let mut fresh = vec![0u64; cap];
             for &(ocx, ocz) in &self.chunk_list {
-                let okey = (((ocx as u32) as u64) << 32 | ((ocz as u32) as u64)) + 1;
+                let okey = ((((ocx as u32) as u64) << 32 | ((ocz as u32) as u64)) ^ (1u64 << 63)) + 1;
                 let mut slot = ((okey.wrapping_mul(0x9E3779B97F4A7C15)) >> 48) as usize & mask;
                 while fresh[slot] != 0 {
                     slot = (slot + 1) & mask;
@@ -2789,7 +3436,7 @@ impl SolverState {
 
                 self.g[ni] = g2;
                 self.parent[ni] = idx;
-                self.meta[ni] = self.out.meta[i];
+                self.meta[ni] = self.out.meta[i] | (self.meta[ui] & META_DEEP);
                 self.vias[ni] = self.out.via[i];
                 self.aims[ni] = self.out.aim[i];
                 match self.out.breaks[i].take() {
@@ -2802,7 +3449,7 @@ impl SolverState {
                         }
                     }
                 }
-                if h < self.best_h {
+                if h < self.best_h && (self.meta[ni] & META_DEEP) == 0 {
                     self.best_h = h;
                     self.best_idx = n_idx;
                 }

@@ -38,7 +38,7 @@ describe('worker round-trip', function () {
     const host = new SolverWorkerHost()
     host.setEntryPath(workerEntry)
 
-    const req = async (goal: GoalBlock, onPartial: (r: RawSolveResult) => void = () => {}) => {
+    const req = async (goal: GoalBlock, onPartial: (r: RawSolveResult) => void = () => {}, core?: 'wasm' | 'js') => {
       const descriptor = serializeGoal(goal)
       if (!descriptor) throw new Error('goal not serializable')
       const handle = await host.solve({
@@ -50,6 +50,7 @@ describe('worker round-trip', function () {
         timeout: 5000,
         searchRadius: -1,
         sliceMs: 40,
+        core,
         onPartial
       })
       if (!handle) throw new Error('worker unavailable')
@@ -70,6 +71,20 @@ describe('worker round-trip', function () {
       expect(r.visitedNodes).to.be.a('number')
       expect(r.time).to.be.a('number')
       expect(r.touchedChunks.length).to.be.greaterThan(0)
+    } finally {
+      await host.terminate()
+    }
+  })
+
+  it('core: "js" solves on the JavaScript core in the same worker, the same path as the wasm core', async () => {
+    const { host, req } = makeScene()
+    try {
+      const wasm = await (await req(new GoalBlock(30, 0, 30))).result
+      const js = await (await req(new GoalBlock(30, 0, 30), () => {}, 'js')).result
+      expect(js.status).to.equal('success')
+      expect(js.engine).to.equal('js')
+      expect(js.path.map(n => [n.x, n.y, n.z])).to.deep.equal(wasm.path.map(n => [n.x, n.y, n.z]))
+      if (wasm.engine === 'wasm') expect(js.visitedNodes).to.equal(wasm.visitedNodes)
     } finally {
       await host.terminate()
     }

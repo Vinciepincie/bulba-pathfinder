@@ -6,9 +6,9 @@
 import { expect } from 'chai'
 import { createRequire } from 'node:module'
 import { Vec3 } from 'vec3'
-import { mcData, Block, AIR, STONE } from './helpers/voxelWorld.js'
+import { mcData, Block, AIR, STONE, WATER } from './helpers/voxelWorld.js'
 import { buildLut } from '../src/lut.js'
-import { PlayerSim, simTables, newBody } from '../src/playerSim.js'
+import { PlayerSim, simTables, newBody, setVanillaJump, isVanillaJump } from '../src/playerSim.js'
 import type { SimControl } from '../src/playerSim.js'
 
 const require = createRequire(import.meta.url)
@@ -24,6 +24,24 @@ function rng (seed: number): () => number {
     t ^= t + Math.imul(t ^ (t >>> 7), t | 61)
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296
   }
+}
+
+/**
+ * The installed prismarine-physics' jump rule (physics.ts probeVanillaJump):
+ * grounded, rising at 1.0, jump held over nothing - vanilla keeps the rise
+ * (scripts/patchPhysics.mjs), stock sets the jump's 0.42.
+ */
+function installedVanillaJump (): boolean {
+  const none = { getBlock: () => null }
+  const physics = Physics(mcData, none)
+  const fake = {
+    version: mcData.version.minecraftVersion,
+    entity: { position: new Vec3(0.5, 1000.5, 0.5), velocity: new Vec3(0, 1, 0), onGround: true, isInWater: false, isInLava: false, isInWeb: false, isCollidedHorizontally: false, isCollidedVertically: false, elytraFlying: false, attributes: {}, effects: {}, yaw: 0, pitch: 0 },
+    jumpTicks: 0, jumpQueued: false, fireworkRocketDuration: 0, inventory: { slots: [] }
+  }
+  const ps = new PlayerState(fake, { forward: false, back: false, left: false, right: false, jump: true, sprint: false, sneak: false })
+  physics.simulatePlayer(ps, none)
+  return ps.vel.y > 0.6
 }
 
 function statesOf (name: string, pred: (p: Record<string, unknown>) => boolean = () => true): number[] {
@@ -92,6 +110,40 @@ describe('PlayerSim vs prismarine-physics', function () {
   const tables = simTables(lut, mcData.blocksArray as never, s => {
     const p = (Block.fromStateId(s, 0) as { getProperties: () => Record<string, unknown> }).getProperties()
     return p.waterlogged === true || p.waterlogged === 'true'
+  })
+  // (the kernel follows the installed physics' jump rule, as the plugin's probe sets it)
+  before(() => setVanillaJump(installedVanillaJump()))
+  after(() => setVanillaJump(false))
+
+  it('keeps a slime rebound on a jump held after it under the vanilla rule, and the jump\'s rise under the stock one', () => {
+    // a 5x5 slime pad, a body let fall 8 blocks onto it, jump held on the
+    // first grounded tick of the rebound: vanilla's jumpFromGround keeps
+    // max(jumpPower, vy), prismarine's stock rule sets 0.42
+    const pad = mcData.blocksByName.slime_block.minStateId as number
+    const stateAt = (x: number, y: number, z: number): number => (y === 0 && Math.abs(x) <= 2 && Math.abs(z) <= 2) ? pad : AIR
+    const sim = new PlayerSim({ ...tables, stateAt }, 0.30001, 1.80001)
+    const ctl: SimControl = { forward: false, back: false, left: false, right: false, jump: false, sprint: false, sneak: false, hx: 0, hz: 1 }
+    const riseAfterJump = (vanilla: boolean): { rebound: number, after: number } => {
+      const was = isVanillaJump()
+      setVanillaJump(vanilla)
+      try {
+        const b = newBody(0.5, 9, 0.5)
+        ctl.jump = false
+        for (let t = 0; t < 200 && !(b.onGround && b.vy > 0.42); t++) sim.step(b, ctl)
+        expect(b.onGround && b.vy > 0.42, 'rebounding off the pad').to.equal(true)
+        const rebound = b.vy
+        ctl.jump = true
+        sim.step(b, ctl)
+        return { rebound, after: b.vy }
+      } finally {
+        setVanillaJump(was)
+      }
+    }
+    const v = riseAfterJump(true)
+    const s = riseAfterJump(false)
+    expect(v.rebound).to.equal(s.rebound)
+    expect(v.after, 'vanilla: the rebound, less a tick of gravity').to.be.closeTo((v.rebound - 0.08) * 0.98, 1e-6)
+    expect(s.after, 'stock: the jump\'s 0.42').to.be.closeTo((0.42 - 0.08) * 0.98, 1e-6)
   })
 
   it('matches every tick on random worlds and controls', () => {
@@ -178,5 +230,92 @@ describe('PlayerSim vs prismarine-physics', function () {
       }
     }
     expect(ticks).to.be.greaterThan(20000)
+  })
+
+  it('reads a grid as it reads the world: a static grid by its bricks, a lazy window by its stamps, kept gathers', () => {
+    // sparse towers over open air (falls through empty bricks), water pockets
+    // (wet bricks), a grid whose bricks overhang its faces, and a lazy window
+    // smaller than the world, forgotten every 13 ticks as cells round the body
+    // change (a static grid is a solve's: built anew): every reader steps,
+    // probes and gathers (box order included) as the plain world does
+    let ticks = 0
+    let wet = 0
+    for (let seed = 1; seed <= 40; seed++) {
+      const r = rng(seed * 104729)
+      const cells = new Map<string, number>()
+      for (let x = -6; x <= 6; x++) {
+        for (let z = -6; z <= 6; z++) {
+          cells.set(`${x},0,${z}`, r() < 0.7 ? STONE : AIR)
+          for (let y = 1; y <= 20; y++) {
+            const p = r()
+            if (p < 0.045) {
+              const group = PALETTE[Math.floor(r() * PALETTE.length)]
+              cells.set(`${x},${y},${z}`, group[Math.floor(r() * group.length)])
+            } else if (p < 0.055) cells.set(`${x},${y},${z}`, WATER)
+          }
+        }
+      }
+      const get = (x: number, y: number, z: number): number => (x < -8 || x > 8 || z < -8 || z > 8 || y < -2 || y > 24) ? -1 : (cells.get(`${x},${y},${z}`) ?? AIR)
+      const fixedSim = (): PlayerSim => {
+        const fixed = { states: new Int32Array(17 * 27 * 17), x0: -8, y0: -2, z0: -8, w: 17, h: 27, l: 17 }
+        for (let y = 0; y < fixed.h; y++) for (let z = 0; z < fixed.l; z++) for (let x = 0; x < fixed.w; x++) fixed.states[(y * fixed.l + z) * fixed.w + x] = get(x + fixed.x0, y + fixed.y0, z + fixed.z0)
+        return new PlayerSim({ ...tables, stateAt: get, grid: fixed }, 0.30001, 1.80001)
+      }
+      const lazy = { states: new Int32Array(11 * 18 * 13), stamps: new Int32Array(11 * 18 * 13).fill(-1), serial: 1, x0: -5, y0: 0, z0: -6, w: 11, h: 18, l: 13 }
+      const sims = [
+        new PlayerSim({ ...tables, stateAt: get }, 0.30001, 1.80001),
+        fixedSim(),
+        new PlayerSim({ ...tables, stateAt: get, grid: lazy }, 0.30001, 1.80001)
+      ]
+      const rr = rng(seed * 31337)
+      for (let body = 0; body < 8; body++) {
+        const x0 = -4 + rr() * 8
+        const z0 = -4 + rr() * 8
+        const y0 = 1 + Math.floor(rr() * 20) + 0.2
+        const bodies = sims.map(() => newBody(x0, y0, z0))
+        let yaw = rr() * Math.PI * 2
+        const ctl: SimControl = { forward: false, back: false, left: false, right: false, jump: false, sprint: false, sneak: false, hx: 0, hz: 0 }
+        for (let t = 0; t < 150; t++) {
+          if (t % 7 === 0) {
+            ctl.forward = rr() < 0.75
+            ctl.back = !ctl.forward && rr() < 0.3
+            ctl.left = rr() < 0.15
+            ctl.right = !ctl.left && rr() < 0.15
+            ctl.jump = rr() < 0.4
+            ctl.sprint = ctl.forward && rr() < 0.7
+            ctl.sneak = rr() < 0.12
+          }
+          if (rr() < 0.2) yaw += (rr() - 0.5) * 1.2
+          ctl.hx = -Math.sin(Math.PI - yaw)
+          ctl.hz = Math.cos(Math.PI - yaw)
+          if (t % 13 === 12) {
+            for (let k = 0; k < 4; k++) {
+              const cx = Math.floor(bodies[0].x) + Math.floor(rr() * 3) - 1
+              const cy = Math.floor(bodies[0].y) + Math.floor(rr() * 4) - 2
+              const cz = Math.floor(bodies[0].z) + Math.floor(rr() * 3) - 1
+              const group = PALETTE[Math.floor(rr() * PALETTE.length)]
+              cells.set(`${cx},${cy},${cz}`, rr() < 0.5 ? AIR : group[Math.floor(rr() * group.length)])
+            }
+            lazy.serial++
+            sims[1] = fixedSim()
+          }
+          const where = `seed ${seed} body ${body} t ${t}`
+          for (let i = 0; i < sims.length; i++) sims[i].step(bodies[i], ctl)
+          const b = bodies[0]
+          const reach = rr() * 1.5
+          const probes = sims.map((sim, i) => {
+            const n = sim.boxesIn(b.x - 0.3 - reach, b.y - 2.5, b.z - 0.3 - reach, b.x + 0.3 + reach, b.y + 1.8, b.z + 0.3 + reach)
+            return { body: bodies[i], boxes: Array.from(sim.scratchBoxes.subarray(0, n * 6)), collides: sim.collides(b), carried: sim.carried(b), hits: sim.boxHits(b.x, b.y - 0.5, b.z, 0.1, 0.01) }
+          })
+          expect(probes[1], `static grid ${where}`).to.deep.equal(probes[0])
+          expect(probes[2], `lazy window ${where}`).to.deep.equal(probes[0])
+          ticks++
+          if (b.inLiquid) wet++
+          if (b.inLiquid || b.y < -1) break
+        }
+      }
+    }
+    expect(ticks).to.be.greaterThan(10000)
+    expect(wet, 'bodies that ran into water').to.be.greaterThan(10)
   })
 })

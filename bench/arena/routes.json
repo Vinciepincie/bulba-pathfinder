@@ -694,7 +694,8 @@
         301,
         -596
       ],
-      "notes": "defined by in-world !PF signs"
+      "notes": "defined by in-world !PF signs; the end sign stands over carpet, so the arrival gets a block of tolerance (agreed 2026-10-11)",
+      "tolerance": 1
     },
     {
       "id": "tenways-headhitters",
@@ -903,6 +904,70 @@
         -49
       ],
       "notes": "Optimizing Parkour (Heppe) stage 9, \"golden piglin head\": from the stage's spawn to its finish platform; the map's required time is 79 ticks from leaving the start box to entering the finish"
+    },
+    {
+      "id": "opk2-1",
+      "name": "opk2-1",
+      "scenario": "parkour-advanced",
+      "start": [
+        973,
+        242,
+        -392
+      ],
+      "end": [
+        968,
+        244,
+        -391
+      ],
+      "notes": "Optimizing Parkour 2 (Heppe) stage 1, \"head destroyer\": from the stage's spawn to its finish platform; the map's required time is 71 ticks over the course columns (TAS time 1)"
+    },
+    {
+      "id": "opk2-2",
+      "name": "opk2-2",
+      "scenario": "parkour-advanced",
+      "start": [
+        970,
+        244,
+        -379
+      ],
+      "end": [
+        928,
+        209,
+        -378
+      ],
+      "notes": "Optimizing Parkour 2 (Heppe) stage 2, \"bouncy castle\": from the stage's spawn to its finish platform; the map's required time is 150 ticks over the course columns (TAS time 121)"
+    },
+    {
+      "id": "opk2-3",
+      "name": "opk2-3",
+      "scenario": "parkour-advanced",
+      "start": [
+        917,
+        209,
+        -378
+      ],
+      "end": [
+        864,
+        220,
+        -382
+      ],
+      "notes": "Optimizing Parkour 2 (Heppe) stage 3, \"Rek's plan\": from the stage's spawn to its finish platform; the map's required time is 170 ticks over the course columns (TAS time 158)"
+    },
+    {
+      "id": "opk2-5",
+      "name": "opk2-5",
+      "scenario": "parkour-advanced",
+      "start": [
+        823,
+        231,
+        -395
+      ],
+      "end": [
+        776,
+        230,
+        -395
+      ],
+      "notes": "Optimizing Parkour 2 (Heppe) stage 5, \"slippery one\": from the stage's spawn to its finish platform; the map's required time is 124 ticks over the course columns (TAS time 118)"
     }
   ]
 }

@@ -7,10 +7,11 @@ import type { SimControl } from 'prismarine-physics'
 import type { Bot } from 'mineflayer'
 import { Vec3 } from 'vec3'
 import { carryCode, CARRY_W_NONE, CARRY_S_NONE } from './shapes.js'
-import { PlayerSim, SIM, newBody, simTablesFromLut } from './playerSim.js'
+import { PlayerSim, SIM, newBody, simTablesFromLut, setVanillaJump } from './playerSim.js'
 import type { SimBody, SimGrid, SimWorld } from './playerSim.js'
-import { gaitSearch, kWalkable, GRAZE_YAW, HOP_MAX_DIP } from './gaitSearch.js'
-import type { GaitGoal, GaitNode } from './gaitSearch.js'
+import { gaitSearch, kWalkable, GRAZE_YAW, HOP_MAX_DIP, EASE_NEVER, GAIT_CATCH } from './gaitSearch.js'
+import type { GaitNode, GaitPick } from './gaitSearch.js'
+import type { GaitDrive } from './types.js'
 import type { BlockLut } from './lut.js'
 import { HopOracle } from './hopOracle.js'
 import type { HopProgram } from './hopOracle.js'
@@ -19,6 +20,9 @@ import type { HopProgram } from './hopOracle.js'
 const SPRINTING_UUID = '662a6b8d-da3e-4c1c-8813-96ea6097278d'
 
 type Controller = (state: PlayerState, tick: number) => void
+
+/** Ticks holdsOn coasts a body to rest: 0.546^20 of a speed is left on ordinary ground, a tenth of it on ice. */
+const HOLD_COAST_TICKS = 20
 type Refusal = (state: PlayerState) => boolean
 
 /**
@@ -133,11 +137,26 @@ const STRAIGHT_MAX_DIP = 0.6
  */
 const HOP_LOOK = Math.max(2, Number(process.env.PF_HOP_LOOK ?? 6) || 6)
 
-/** Path nodes the gait scans for the jump it flies the approach into (gaitVerdict). */
-const HOP_JUMP_LOOK = 12
-/** Path nodes the gait over ground that takes no jump is flown to (gaitVerdict, gaitSearch). */
-const GAIT_LOOK = 9
+/** As far down the path as the gait's schedules are flown (gaitDrive): blocks of path, and nodes. */
+const GAIT_REACH = 10
+const GAIT_NODES = 12
+/** Ticks the gait leaves a take-off alone once the kernel found no way from it (gaitDrive). */
+const GAIT_REST = 3
+/** Blocks above a catch node its column's climb nodes stay in the catch window (gaitDrive): a catch higher up the ladder is a shorter climb. */
+const CATCH_CLIMB = 2
 
+
+/**
+ * A live take-off search's budget is its work (HopOracle.tickLimit), in
+ * kernel ticks; the clock is only a safety cap, at the slowest rate a loaded
+ * main thread flies. By the clock the verdict followed the host: on a busy
+ * machine (2026-10-10 sweep, 300-900 kernel ticks a ms) tenways-slime-way's
+ * 6-tick program, found at 93.8k ticks, was cut at 90k (160 ms) and the bot
+ * ran back and waited. A long tick costs no ticks: mineflayer's physics
+ * timer catches the backlog up (four ticks a callback), decision for decision.
+ */
+const LIVE_FLOOR_TICKS_PER_MS = 300
+const NO_DRIVE: GaitDrive = { kind: 'none', flight: null, strafe: false, ease: EASE_NEVER, yaw: 0, sprint: false }
 
 export class PhysicsSim {
   private readonly bot: Bot
@@ -261,6 +280,8 @@ export class PhysicsSim {
     const ph = this.bot.physics as unknown as { playerHalfWidth?: number, playerHeight?: number }
     if (this.kernel === null) {
       this.kernel = new PlayerSim({ ...this.kTables, stateAt: (x, y, z) => this.kStateAt(x, y, z), grid: this.kGrid })
+      // (the bot's own jump rule, before the kernel flies anything)
+      this.probeVanillaJump()
     }
     // (out of a tick — tests, callers between ticks — nothing may be kept)
     if (this.tickSerial === 0) this.kGridRefresh()
@@ -312,6 +333,37 @@ export class PhysicsSim {
       this.blockCache.set(key, b)
     }
     return b
+  }
+
+  private vanillaProbed: boolean | null = null
+
+  /**
+   * Does the bot's prismarine-physics keep the faster rise on a jump (vanilla
+   * jumpFromGround: max(jumpPower, vy); scripts/patchPhysics.mjs)? One tick of
+   * its own simulation, grounded and rising at 1.0 with jump held over
+   * nothing: vanilla keeps ~0.90 past gravity, stock drops to 0.33. Sets the
+   * kernel's rule (setVanillaJump) and returns it; probed once.
+   */
+  probeVanillaJump (): boolean {
+    if (this.vanillaProbed !== null) return this.vanillaProbed
+    let on: boolean
+    try {
+      const st = new PlayerState(this.bot, { forward: false, back: false, left: false, right: false, jump: true, sprint: false, sneak: false })
+      st.pos = new Vec3(0.5, 1000.5, 0.5)
+      st.vel = new Vec3(0, 1, 0)
+      st.onGround = true
+      // (the rule, not the body: no effects, no cobweb, no liquid - jump boost
+      // III reads stock as vanilla, a cobweb vanilla as stock)
+      Object.assign(st, { jumpTicks: 0, jumpBoost: 0, levitation: 0, slowFalling: 0, dolphinsGrace: 0, isInWeb: false, isInWater: false, isInLava: false, elytraFlying: false, fireworkRocketDuration: 0 })
+      const simulatePlayer = (this.bot.physics as unknown as { simulatePlayer: (s: PlayerState, w: unknown) => void }).simulatePlayer
+      simulatePlayer.call(this.bot.physics, st, { getBlock: () => null })
+      on = st.vel.y > 0.6
+    } catch {
+      return false // (not memoized: asked again once the bot is ready)
+    }
+    this.vanillaProbed = on
+    setVanillaJump(on)
+    return on
   }
 
   /**
@@ -831,6 +883,17 @@ export class PhysicsSim {
 
   private readonly carryProbe = newBody(0, 0, 0)
 
+  /**
+   * The latched tick (HopProgram.jumpOnLeave): the body on the ground with
+   * nothing under its box — the Y move ran first, against the edge it is
+   * leaving. Null without a kernel to ask.
+   */
+  latchedNow (): boolean | null {
+    const e = this.bot.entity as { onGround?: boolean, position: { x: number, y: number, z: number } }
+    if (this.getKernel() === null) return null
+    return e.onGround === true && !this.carriedAt(e.position)
+  }
+
   /** Is a body standing at `pos` carried by a block (PlayerSim.carried)? True without a kernel to ask. */
   private carriedAt (pos: { x: number, y: number, z: number }): boolean {
     const k = this.getKernel()
@@ -871,19 +934,15 @@ export class PhysicsSim {
    * decision can be acted on), so the cost is one pair of short rollouts per
    * take-off, not per tick.
    *
-   * With `kernel` the verdict is the exact kernel's (gaitVerdict), and the
-   * guards below — which exist because these rollouts are two fixed policies
-   * a fixed horizon out — are its search's to answer.
+   * (Without the kernel. With it the gait is gaitDrive's, and these guards —
+   * which exist because the rollouts are two fixed policies a fixed horizon
+   * out — are its search's to answer.)
    */
   sprintHopBetter (
     path: Array<{ x: number, y: number, z: number }>,
     lowCeilingHop = false,
-    horizon = 16,
-    kernel = false
+    horizon = 16
   ): boolean {
-    this.hopFlight = null
-    const k = kernel ? this.getKernel() : null
-    if (k !== null) return this.gaitVerdict(k, path)
     // The whole horizon has to be backed by real path. A hop covers ~5.6
     // blocks before it lands, so with less than that ahead the rollout scores
     // a flight off the end of the plan — and near the goal that is an
@@ -984,93 +1043,169 @@ export class PhysicsSim {
 
   // ── gait (gaitSearch.ts) ──────────────────────────────────────────────
   //
-  // Hop now, or keep the feet down? Asked of the kernel, over the schedules
-  // of hops the body could fly from here (gaitSearch.ts), to a goal that is
-  // the ground's own: the landing of the first jump ahead — the rollouts'
-  // guards refuse the gait whenever a jump or a rise is within their
-  // look-ahead, which left every approach on a course sprinted, 5.6 b/s
-  // against 7.07 hopping — or a node further on, or the path's end.
+  // Jump now, or keep the feet down? Asked of the kernel, over the schedules
+  // of jumps the body could fly from here to a node some ten blocks on
+  // (gaitSearch.ts), and answered with the tick itself: the jump as flown, or
+  // the tick on the ground as run. The legacy rollouts' guards refused the
+  // gait whenever a jump or a rise was within their look-ahead, which left
+  // every approach on a course sprinted (5.6 b/s against 7.07 hopping), and
+  // their gates took each jump on the first tick it was possible.
   /** Why the last gait search decided as it did (trace diagnostics). */
   hopJumpNote = ''
 
-  /** The hop the last gait search chose, as it flew it: a yaw a tick, take-off to touchdown (GaitResult.flight); null when it chose none. */
-  hopFlight: number[] | null = null
-
-  /** The node the executor retired last, and the server's fall rule (GaitGoal.from, .wholeFall): the executor's to set. */
+  /** The node the executor retired last, the server's fall rule, the strafe and the landing retirement (GaitGoal): the executor's to set. */
   gaitFrom: { x: number, z: number } | null = null
   wholeFall = true
-  /** The gait with the 45° strafe (Movements.allowStrafe): the executor's to set; and whether the hop chosen flies with it. */
   gaitStrafe = false
-  hopStrafe = false
+  gaitLandRetire = true
 
-  /** Is a schedule that hops NOW the soonest to the goal (gaitSearch)? */
-  private gaitHop (k: PlayerSim, path: ReadonlyArray<GaitNode>, goal: GaitGoal): boolean {
-    let floor = this.bot.entity.position.y
-    for (let i = 0; i < Math.min(path.length, goal.jump ? goal.index : goal.index + 1); i++) floor = Math.min(floor, path[i].y)
-    goal.from = this.gaitFrom
-    goal.wholeFall = this.wholeFall
-    goal.strafe = this.gaitStrafe
-    const r = gaitSearch(k, this.kBodyNow(), path, goal, floor)
-    const take = r.hop !== Infinity && r.run === Infinity && !r.spent
-    this.hopFlight = take ? r.flight : null
-    this.hopStrafe = take && r.strafe
-    const f = (v: number): string => v === Infinity ? '-' : Number.isInteger(v) ? String(v) : v.toFixed(2)
-    this.hopJumpNote = `${take ? 'hop' : 'run'} h${f(r.hop)} r${f(r.run)} w${r.work}${r.spent ? ' spent' : ''}`
-    return take
-  }
+  /** The take-off the kernel last found no way from, and the ticks it is left alone for (GAIT_REST). */
+  /** The gait's ground policy last taken (gaitSearch.ts GaitPick): sticky, per bot. */
+  private readonly gaitPick: GaitPick = { round: false }
+  private gaitDead: object | null = null
+  private gaitRest = 0
 
   /**
-   * The gait's verdict from the kernel, for a body on the ground: is a
-   * schedule that hops NOW the soonest to the goal? The goal is the landing
-   * of the first jump ahead (jumpAhead); over ground that takes none, a node
-   * GAIT_LOOK on, or the path's last where it ends sooner. What is flown is
-   * exact — a roof that drops mid-arc, a landing short of the plan's end, a
-   * pool overhead are the search's to find — so the guards left are the two
-   * the kernel cannot answer: a world not loaded yet, and the edge panels
-   * (an open trapdoor's 3/16 ledge, a ladder's top: shapes.ts carryCode 1-4)
-   * a landing has no centimetres on.
+   * The tick, from the kernel: the jump to take now (with its flight), the
+   * tick on the ground to take (as the kernel ran it), or nothing — the
+   * kernel has no schedule from here, and the tick is the gates'. Grounded
+   * bodies only.
+   *
+   * The schedules run to the node GAIT_REACH blocks down the path, or the
+   * path's last, or the one before a node the search has no business with:
+   * a planned program or chain (the oracle's flight, not a hop), a neo (a
+   * line round a pillar the take-off search flies, never a hop), a world not
+   * loaded yet. A narrow landing — a post, a pane, a panel's 3/16 ledge — is
+   * a landing like any other to a flight that is replayed as flown and holds
+   * from a hair either side.
    */
-  private gaitVerdict (k: PlayerSim, path: ReadonlyArray<GaitNode>): boolean {
+  gaitDrive (path: ReadonlyArray<GaitNode>): GaitDrive {
     this.hopRefusal = ''
     this.hopJumpNote = ''
-    if (path.length === 0 || (this.bot.entity as { onGround?: boolean }).onGround !== true) { this.hopRefusal = 'airborne'; return false }
-    const jump = this.jumpAhead(k, path)
-    const end = jump >= 0 ? jump : Math.min(path.length, GAIT_LOOK) - 1
-    for (let i = 0; i <= end; i++) {
-      const n = path[i]
-      const nx = Math.floor(n.x)
-      const ny = Math.floor(n.y + 0.001)
-      const nz = Math.floor(n.z)
-      for (let dy = 2; dy <= 3; dy++) {
-        if (this.bot.blockAt(new Vec3(nx, ny + dy, nz), false) === null) { this.hopRefusal = 'unloaded'; return false }
-      }
-      if (i === jump) break
-      const sup = this.bot.blockAt(new Vec3(nx, Math.floor(n.y - 0.5), nz), false) as { shapes?: number[][] } | null
-      const carry = sup !== null && sup.shapes !== undefined && sup.shapes.length > 0 ? carryCode(sup.shapes) : 0
-      if (carry >= CARRY_W_NONE && carry <= CARRY_S_NONE) { this.hopRefusal = 'narrow-ahead'; return false }
+    const k = this.getKernel()
+    if (k === null || path.length === 0 || (this.bot.entity as { onGround?: boolean }).onGround !== true) return NO_DRIVE
+    if (this.gaitDead === path[0] && this.gaitRest > 0) {
+      this.gaitRest--
+      this.hopRefusal = 'rest'
+      return NO_DRIVE
     }
-    const goal: GaitGoal = jump >= 0
-      ? { index: jump, jump: true, last: false }
-      : { index: end, jump: false, last: end === path.length - 1 }
-    if (this.gaitHop(k, path, goal)) return true
-    this.hopRefusal = jump >= 0 ? 'jump-ahead' : 'no-gain'
-    return false
+    const nodes: GaitNode[] = []
+    let px = this.bot.entity.position.x
+    let pz = this.bot.entity.position.z
+    let reach = 0
+    for (let i = 0; i < Math.min(path.length, GAIT_NODES); i++) {
+      const n = path[i] as GaitNode & { program?: unknown, chain?: boolean, via?: unknown, wOff?: number }
+      if ((n.program !== null && n.program !== undefined) || n.chain === true || (n.via !== null && n.via !== undefined)) break
+      // (a neo past the head: the gait flew at it straight and came back
+      // 'none' or spent, 10-30k work a tick on arena opk-2 and mcc-8-1; the
+      // neo branch takes off from the stood node as it always did)
+      if (i > 0 && n.wOff !== undefined && n.wOff !== 0) break
+      const nx = Math.floor(n.x)
+      const nz = Math.floor(n.z)
+      if (this.bot.blockAt(new Vec3(nx, Math.floor(n.y - 0.01), nz), false) === null || this.bot.blockAt(new Vec3(nx, Math.floor(n.y + 0.001) + 2, nz), false) === null) break
+      nodes.push(n.parkour === true && this.walkedJump(k, path, i) ? { x: n.x, y: n.y, z: n.z, parkour: true, walked: true } : n)
+      reach += Math.hypot(n.x - px, n.z - pz)
+      px = n.x
+      pz = n.z
+      if (reach >= GAIT_REACH) break
+    }
+    if (nodes.length === 0) { this.hopRefusal = 'hard-ahead'; return NO_DRIVE }
+    // The node before a planned program, a chain or a via is stood on: the
+    // program takes off from a body at rest there. Flown over in the air it
+    // was retired at the first tick of a hop thrown at it, the program's
+    // line-up took the keys mid-flight, and the body came down past the
+    // one-wide block and fell (arena mcc-6-3). The path's end is the same.
+    const stoodAt = (m: number): boolean => {
+      const next = path[m] as (GaitNode & { program?: unknown, chain?: boolean, via?: unknown, wOff?: number }) | undefined
+      return next !== undefined && ((next.program !== null && next.program !== undefined) || next.chain === true || (next.via !== null && next.via !== undefined) ||
+        (next.wOff !== undefined && next.wOff !== 0))
+    }
+    const round = this.gaitPick.round
+    let r = gaitSearch(k, this.kBodyNow(), nodes, {
+      index: nodes.length - 1,
+      last: nodes.length === path.length || stoodAt(nodes.length),
+      from: this.gaitFrom,
+      wholeFall: this.wholeFall,
+      strafe: this.gaitStrafe,
+      landRetire: this.gaitLandRetire
+    }, this.gaitPick)
+    // A jump onto a ladder or vine (at the node's feet or under them) is
+    // caught there: where the plain window has no schedule, the schedules
+    // end up the climb instead, at the catch node or a climb node above it in
+    // its column — a fallback only, never a refusal of a verdict (a rule that
+    // refused gate jumps broke arena mcc-4-1/5-2/7-3). The legacy gate caught
+    // mcc-4-1's ladders on the first tick it could, 0.44 above their foot;
+    // the kernel's catches are 1.9-2.6 above it (driveSim: -40 ticks).
+    if (GAIT_CATCH && r.hop === Infinity && r.run === Infinity) {
+      const c = this.catchWindow(nodes)
+      if (c !== null) {
+        const w0 = r.work
+        const cut = nodes.slice(0, c.cut)
+        this.gaitPick.round = round
+        r = gaitSearch(k, this.kBodyNow(), cut, {
+          index: cut.length - 1,
+          catchAt: c.catchAt,
+          // (the climb ends the schedule: no stop on a hanging body)
+          last: stoodAt(cut.length),
+          from: this.gaitFrom,
+          wholeFall: this.wholeFall,
+          strafe: this.gaitStrafe,
+          landRetire: this.gaitLandRetire
+        }, this.gaitPick)
+        // (a schedule landing ON the catch node is a verdict too: refused, arena
+        // tenways-ladder's last ladder top had no other way to its goal - stuck
+        // seven give-ups - though on mcc-5-3 it costs 3 ticks against the gates)
+        r = { ...r, work: r.work + w0 }
+      }
+    }
+    const hop = r.hop !== Infinity && r.run === Infinity
+    const step = r.run !== Infinity ? r.step : null
+    const run = step !== null
+    const f = (v: number): string => v === Infinity ? '-' : Number.isInteger(v) ? String(v) : v.toFixed(2)
+    this.hopJumpNote = `${hop ? 'hop' : run ? 'run' : 'none'} h${f(r.hop)} r${f(r.run)} n${nodes.length} w${r.work}${r.spent ? ' spent' : ''}`
+    if (hop) return { kind: 'hop', flight: r.flight, strafe: r.strafe, ease: r.ease, yaw: r.flight[0], sprint: true }
+    if (step !== null) return { kind: 'run', flight: null, strafe: step.strafe, ease: EASE_NEVER, yaw: step.yaw, sprint: step.sprint }
+    // no way there from here: not asked again for a few ticks (near a jump
+    // only the oracle flies, that is every tick)
+    this.gaitDead = path[0]
+    this.gaitRest = GAIT_REST
+    return NO_DRIVE
   }
 
   /**
-   * The first node within HOP_JUMP_LOOK that takes a jump: a parkour node
-   * that is one (not ground the plan jumps: walkedJump), or a rise too high
-   * to step. -1 when there is none.
+   * The catch window (gaitSearch GaitGoal.catchAt): the first node of the
+   * window a jump catches a ladder or vine for, and the window cut
+   * CATCH_CLIMB up that column's climb nodes. Scaffolding is no catch:
+   * vanilla lets a sneaking body slide down it.
    */
-  private jumpAhead (k: PlayerSim, path: ReadonlyArray<GaitNode>): number {
-    let y = this.bot.entity.position.y
-    for (let i = 0; i < Math.min(path.length, HOP_JUMP_LOOK); i++) {
-      const n = path[i]
-      if (n.y > y + SIM.stepHeight) return i
-      if (n.parkour === true && !this.walkedJump(k, path, i)) return i
-      y = n.y
+  private catchWindow (nodes: GaitNode[]): { catchAt: number, cut: number } | null {
+    let py = this.bot.entity.position.y
+    for (let j = 0; j < nodes.length; j++) {
+      const n = nodes[j]
+      const jump = (n.parkour === true && n.walked !== true) || n.y > py + SIM.stepHeight
+      py = n.y
+      if (!jump || (!this.ladderOrVine(n.x, n.y + 0.001, n.z) && !this.ladderOrVine(n.x, n.y - 0.999, n.z))) continue
+      let m = j + 1
+      while (m < nodes.length && Math.floor(nodes[m].x) === Math.floor(n.x) && Math.floor(nodes[m].z) === Math.floor(n.z) &&
+        nodes[m].y > nodes[m - 1].y && nodes[m].y <= n.y + CATCH_CLIMB) m++
+      return { catchAt: j, cut: m }
     }
-    return -1
+    return null
+  }
+
+  private ladderOrVine (x: number, y: number, z: number): boolean {
+    const b = this.bot.blockAt(new Vec3(Math.floor(x), Math.floor(y), Math.floor(z)), false) as { name?: string } | null
+    return b !== null && /ladder|vine/.test(b.name ?? '')
+  }
+
+  /**
+   * Does the kernel walk from the body, as it stands, to `node` — on its
+   * feet, level ground all the way (kWalkable)? The executor's test of "the
+   * node's own platform" for a landing that came down well past it.
+   */
+  walksTo (node: { x: number, y: number, z: number }): boolean {
+    const k = this.getKernel()
+    return k !== null && kWalkable(k, this.bot.entity.position, node)
   }
 
   /** Parkour nodes the kernel has walked to from the node before (kWalkable), by node. */
@@ -1151,12 +1286,15 @@ export class PhysicsSim {
    * now (HopOracle.hopFrom: every family, walking jumps too, the quickest
    * robust one), or null. Grounded bodies only.
    */
-  hopFrom (cell: readonly [number, number, number], budgetMs: number): HopProgram | null {
+  hopFrom (cell: readonly [number, number, number], budgetTicks: number, land?: { x: number, y: number, z: number }, next?: readonly [number, number, number]): HopProgram | null {
     const t0 = performance.now()
     const o = this.liveOracle()
     if (o === null) { this.hopNote = 'n/a'; return null }
-    const found = o.hopFrom(this.kBodyNow(), [cell[0], cell[1], cell[2]], t0 + budgetMs, this.bot.entity.yaw)
-    this.hopNote = `from ${found !== null ? `${found.family} ${found.ticks}t` : 'none'} ${(performance.now() - t0).toFixed(0)}ms`
+    o.tickLimit = budgetTicks
+    // (a region program's live search lands in its place: HopProgram.land)
+    // (and the node after: the landing that leaves the quickest next leg, HopOracle.nextLegPick)
+    const found = o.hopFrom(this.kBodyNow(), [cell[0], cell[1], cell[2]], t0 + budgetTicks / LIVE_FLOOR_TICKS_PER_MS, this.bot.entity.yaw, land, next !== undefined ? [next[0], next[1], next[2]] : undefined)
+    this.hopNote = `from ${found !== null ? `${found.family} ${found.ticks}t` : 'none'} ${(performance.now() - t0).toFixed(0)}ms ${Math.round(o.ticksFlown / 1000)}k`
     return found
   }
 
@@ -1174,11 +1312,37 @@ export class PhysicsSim {
   }
 
   /**
+   * A deep bounce's live check (HopOracle.deepVerdict): from the body as it
+   * is, at the replay's counters, does the rest of `prog` arrive, and does
+   * its basin abort still come down in the pool? Null without the kernel.
+   */
+  deepVerdict (prog: HopProgram, t: number, fired: boolean, air: number, rebounds: number): { arrives: boolean, abortable: boolean } | null {
+    const o = this.liveOracle()
+    if (o === null) return null
+    return o.deepVerdict(prog, this.kBodyNow(), t, fired, air, rebounds, this.bot.entity.yaw)
+  }
+
+  /**
+   * The exact line-up for precision program `prog` from the body at rest
+   * (HopOracle.lineUp): the yaws of one or two sneaking presses whose coasted
+   * rest re-anchors it, and the program from that rest, or null.
+   */
+  hopLineUp (prog: HopProgram, budgetTicks: number): { yaws: number[], prog: HopProgram } | null {
+    const t0 = performance.now()
+    const o = this.liveOracle()
+    if (o === null) { this.hopNote = 'n/a'; return null }
+    o.tickLimit = budgetTicks
+    const found = o.lineUp(prog, this.kBodyNow(), this.bot.entity.yaw, t0 + budgetTicks / LIVE_FLOOR_TICKS_PER_MS)
+    this.hopNote = `lineup ${found !== null ? `${found.yaws.length} press` : 'none'} ${(performance.now() - t0).toFixed(0)}ms ${Math.round(o.ticksFlown / 1000)}k`
+    return found
+  }
+
+  /**
    * A program to planner node `cell` from rest at a stand point of the
    * node the body is on (HopOracle.hop, every family) — the executor lines
    * the body up on it first — or null.
    */
-  hopLinedUp (cell: readonly [number, number, number], budgetMs: number): HopProgram | null {
+  hopLinedUp (cell: readonly [number, number, number], budgetTicks: number): HopProgram | null {
     const t0 = performance.now()
     const p = this.bot.entity.position
     const o = this.liveOracle()
@@ -1188,14 +1352,16 @@ export class PhysicsSim {
     // let the air-turn that flies it (18 ms) be tried
     const from = this.standCell(o, p)
     const to: [number, number, number] = [cell[0], cell[1], cell[2]]
-    let found = o.hop(from, to, t0 + budgetMs, 'simple', true)
+    const deadline = t0 + budgetTicks / LIVE_FLOOR_TICKS_PER_MS
+    o.tickLimit = budgetTicks
+    let found = o.hop(from, to, deadline, 'simple', true)
     let ran = !o.noVerdict
-    if (found === null) { found = o.hop(from, to, t0 + budgetMs, 'yaw', true); ran = ran && !o.noVerdict }
+    if (found === null) { found = o.hop(from, to, deadline, 'yaw', true); ran = ran && !o.noVerdict }
     // every family run to the end and nothing lands: the executor's verdict
     // on a table jump (the beam, for what no family flies, may run out of time)
     this.hopExhausted = found === null && ran
-    if (found === null) found = o.hop(from, to, t0 + budgetMs, 'beam')
-    this.hopNote = `lined ${found !== null ? `${found.family} ${found.ticks}t` : this.hopExhausted ? 'none-exhausted' : 'none'} ${(performance.now() - t0).toFixed(0)}ms`
+    if (found === null) found = o.hop(from, to, deadline, 'beam')
+    this.hopNote = `lined ${found !== null ? `${found.family} ${found.ticks}t` : this.hopExhausted ? 'none-exhausted' : 'none'} ${(performance.now() - t0).toFixed(0)}ms ${Math.round(o.ticksFlown / 1000)}k`
     return found
   }
 
@@ -1359,6 +1525,31 @@ export class PhysicsSim {
   }
 
   /** Can the bot step BACK without walking off what it is standing on? */
+  /**
+   * Does the body stay on what carries it with `keys` held one tick (null:
+   * the controls as the executor set them) and none after, coasting to rest?
+   * On the ground at the end, no more than a step lower. Sneak stays as set
+   * unless `keys` says otherwise: prismarine's edge guard is part of the
+   * answer where it works (a full block's lip) and no part of it where it
+   * does not - moveEntity asks only whether the moved box's CELLS hold a
+   * block, so over an open trapdoor's cell a body coasts off its 3/16 panel
+   * sneaking (arena mcc-8-2 P3).
+   */
+  holdsOn (keys: { forward?: boolean, back?: boolean, sneak?: boolean } | null, ticks = HOLD_COAST_TICKS): boolean {
+    const y0 = this.bot.entity.position.y
+    const state = this.simulateUntil(() => false, (s: PlayerState, i: number) => {
+      if (keys === null && i === 0) return
+      s.control.forward = i === 0 && keys?.forward === true
+      s.control.back = i === 0 && keys?.back === true
+      s.control.left = false
+      s.control.right = false
+      s.control.jump = false
+      s.control.sprint = false
+      if (i === 0 && keys?.sneak !== undefined) s.control.sneak = keys.sneak
+    }, ticks)
+    return state.onGround === true && state.pos.y >= y0 - 0.6
+  }
+
   canBackOff (ticks = 5): boolean {
     return this.canNudge({ back: true }, ticks)
   }

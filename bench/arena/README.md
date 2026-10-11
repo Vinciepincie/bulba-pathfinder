@@ -10,9 +10,11 @@ One bot per engine, one OS process each, one start block, released together.
 You can join and watch.
 
 Four engines are available (`--engines` picks a subset): `upstream`, `bulba`
-(the JavaScript solver on the main thread), `bulba-wasm` (the Rust core in a
-worker — what production runs) and `bulba-nohop`, which is `bulba` with the
-sprint-hop gait switched off. Racing a feature against its own twin on the
+(the JavaScript reference core in the worker), `bulba-wasm` (the Rust core in
+the same worker — what production runs) and `bulba-nohop`, which is `bulba`
+with the sprint-hop gait switched off (and with it the kernel-driven executor:
+it walks the legacy gates). Every bulba engine plans with the physics-hop
+pipeline, which lives in the worker. Racing a feature against its own twin on the
 same terrain in the same tick is the only way to price it honestly; on the
 route book that gait is worth ~0.6 s on a flat 54-block run and roughly
 nothing on a staircase.
@@ -393,6 +395,31 @@ Thirty routes above y 266 over the arena's south-east quadrant (nothing of
 | `tenways-headhitters` | same map, level 4 | a zig-zag climb where every landing has a block three above |
 | `tenways-slime` | same map, level 6 | slime blocks and ladders |
 
+#### Speedrun stages: Optimizing Parkour 1 and 2 (Heppe)
+
+The stages of two maps built for speedrunners, each with the time the map
+demands (its command blocks or datapack time the run in ticks). The
+courses are at arena x 690–732 (the first map, z −410…−30) and x 770–986
+(the second, z −412…−350), y 180–270.
+
+| routes | source | required time (ticks) |
+| --- | --- | --- |
+| `opk-1` … `opk-9` (no `opk-5`: its blocks move) | Optimizing Parkour (part 1), timed from leaving the start box to entering the finish | 85, 67, 109, 147, 139, 126, 68, 79 |
+| `opk2-1`, `opk2-2`, `opk2-3`, `opk2-5` | Optimizing Parkour 2, the four stages of plain movement (stages 4 and 6 need a fishing rod and a trident); timed by the datapack's rule, a tick for every tick over a course column (green terracotta at y −64 under the source), reset over the start columns | 71, 150, 170, 124 |
+
+Stage 1 of the second map is header jumps under a two-high roof, cave vines
+and a 2+1 neo onto the finish; stage 2 a sixty-block drop onto slime and
+the bounce up; stage 3 a slope of logs, fences and soul sand; stage 5
+copper trapdoors (headers), grates, chains and dripleaves. The timers are
+scripts beside the trace tools (`opkTimes.cjs`, `opk2Times.cjs`), from a
+`PF_EXEC_TRACE`.
+
+`PF_DUMP_NOPATH=<dir>` makes every bulba engine write each terminal no-path
+solve to `<dir>/pf-nopath-<engine>.jsonl` — the exact snapshot, start, goal
+and config the solver saw, in the bot's own dump format — for
+`npx tsx scripts/replayNoPath.ts <file>`: the way to tell a world the bot
+had not received from a move the planner lacks.
+
 These maps were built for 1.12–1.16, so each world is first upgraded to
 1.21.11 by Paper's own DataFixer (`--forceUpgrade` in a separate world
 container). That is what computes legacy block ids, fence and pane
@@ -427,7 +454,7 @@ translation layer.
 | --- | --- | --- |
 | `--edit` | off | author routes in-world with signs instead of racing |
 | `--signs` | off | race the `!PF` signs in the world, not `routes.json` |
-| `--engines upstream,bulba-wasm` | all four | pick which engines race: `upstream`, `bulba` (JS solver), `bulba-wasm` (Rust core in the worker — production), `bulba-nohop` (`bulba` with the sprint-hop gait off, the A/B for it) |
+| `--engines upstream,bulba-wasm` | all four | pick which engines race: `upstream`, `bulba` (JS core in the worker), `bulba-wasm` (Rust core in the worker — production), `bulba-nohop` (`bulba` with the sprint-hop gait off, the A/B for it) |
 | `--from x,y,z --to x,y,z` | — | race one ad-hoc route, no route book needed |
 | `--save-route <id>` | — | also append that ad-hoc route to `routes.json` |
 | `--routes r01,r02` | all | pick routes by id |

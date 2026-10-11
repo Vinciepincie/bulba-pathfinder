@@ -279,3 +279,24 @@ export function getShapeFaceCenters (shapes: number[][], direction: Vec3, half: 
   }
   return faces
 }
+
+/**
+ * LID byte (lid model): a FULL-footprint block whose every collision box
+ * starts k/16 above its cell floor — a top slab (8), a closed top trapdoor
+ * (13), a big dripleaf (11), a hopper or piston (4). Packed in the thin
+ * table (no new snapshot array): high nibble 15, which no footprint class
+ * uses, low nibble k. 0 for anything else (a partial footprint keeps its
+ * footprint byte and counts as reaching its cell floor).
+ */
+export const LID_TAG = 0xF0
+export function lidByte (shapes: readonly number[][]): number {
+  if (shapes.length === 0 || thinFootprint(shapes) !== 0) return 0
+  let bot = 1
+  for (const s of shapes) if (s[1] < bot) bot = s[1]
+  const k = Math.floor(bot * 16 + 1e-9)
+  return k >= 1 ? LID_TAG | Math.min(k, 15) : 0
+}
+/** True for a lid byte (not a footprint): thin consumers treat it as 0. */
+export function isLidByte (b: number): boolean {
+  return (b & 0xF0) === 0xF0
+}

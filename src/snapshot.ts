@@ -9,6 +9,14 @@ import type { BlockLut } from './lut.js'
 import type { Movements } from './movements.js'
 import type { SnapshotMeta } from './types.js'
 
+/**
+ * An entity weight that makes a cell impassable to both cores (each refuses a
+ * cell weighing over 100): a banned landing - a take-off the executor could
+ * not fly (plugin.ts banTakeoff), a planner jump no rest on its take-off
+ * flies (hopPipeline.ts verifiedFollowUp).
+ */
+export const BAN_WEIGHT = 200
+
 export interface Box {
   x0: number
   y0: number
@@ -96,6 +104,8 @@ export function nextSnapshotGeneration (): number {
  * Compute the snapshot box for a solve. `targets` are the goal's known
  * coordinates (empty for goals without any); `slack` is the searchRadius
  * cost-slack (-1 = unbounded → generous default, bounded by growth+cap).
+ * `floorY`, when given, is a floor the box reaches down to at least (a deep
+ * slime pool under it: slimeUnderBox).
  */
 export function computeBox (
   bot: Bot,
@@ -103,7 +113,8 @@ export function computeBox (
   targets: Array<{ x: number, y?: number, z: number }>,
   slack: number,
   growFactor: number,
-  maxCells: number
+  maxCells: number,
+  floorY?: number
 ): Box {
   let minX = start.x
   let maxX = start.x
@@ -144,7 +155,7 @@ export function computeBox (
 
   const box: Box = {
     x0: Math.floor(minX - margin),
-    y0: Math.max(worldMinY, Math.floor(minY - vMargin)),
+    y0: Math.max(worldMinY, Math.min(Math.floor(minY - vMargin), floorY ?? Infinity)),
     z0: Math.floor(minZ - margin),
     x1: Math.ceil(maxX + margin),
     y1: Math.min(worldMinY + worldHeight - 1, Math.ceil(maxY + vMargin)),
@@ -199,8 +210,75 @@ interface ColumnLike {
     data?: {
       get?: (idx: number) => number
       value?: number
+      palette?: unknown
     }
   } | null>
+}
+
+/**
+ * The DEEP slime under box `box` (arena opk2-2: the pool a bounce off the
+ * arch comes down on is 61 below it, 8 under the box a solve plans in, and
+ * the hop pipeline - HopOracle.deepSlimeTops - flies only what the box
+ * holds): the slime blocks, within `depth` under the box's floor, that are
+ * the first collision box going down their column from `openTo` (a drop
+ * from the course's height reaches them). Live reads; a chunk whose
+ * sections in that band have no slime in their palette is skipped whole, so
+ * where there is none the probe costs next to nothing.
+ */
+export function slimeUnderBox (bot: Bot, lut: BlockLut, box: Box, depth: number, openTo: number): Array<[number, number, number]> {
+  const slime = (bot.registry as unknown as { blocksByName?: Record<string, { minStateId?: number }> }).blocksByName?.slime_block?.minStateId
+  if (slime === undefined) return []
+  const worldMinY = (bot.game as { minY?: number }).minY ?? 0
+  const lo = Math.max(worldMinY, box.y0 - depth)
+  const hi = box.y0 - 1
+  if (hi < lo) return []
+  const world = bot.world as unknown as WorldLike
+  const probe = { x: 0, y: 0, z: 0 }
+  const collides = (st: number): boolean => st > 0 && st <= lut.maxStateId && lut.shapeStarts[st] >= 0 && lut.shapeCounts[st] > 0
+  const out: Array<[number, number, number]> = []
+  for (let cx = box.x0 >> 4; cx <= box.x1 >> 4; cx++) {
+    for (let cz = box.z0 >> 4; cz <= box.z1 >> 4; cz++) {
+      let column: ColumnLike | null | undefined
+      try { column = world.getColumn(cx, cz) } catch { column = null }
+      if (!column) continue
+      const sections = column.sections
+      const colMinY = column.minY
+      if (Array.isArray(sections) && typeof colMinY === 'number' && (colMinY & 15) === 0) {
+        let any = false
+        for (let sy = (lo - colMinY) >> 4; sy <= (hi - colMinY) >> 4 && !any; sy++) {
+          const d = sections[sy]?.data
+          if (d === undefined) continue
+          if (typeof d.value === 'number') any = d.value === slime
+          else if (Array.isArray(d.palette)) any = d.palette.includes(slime)
+          else any = true // (a direct container: no palette to ask)
+        }
+        if (!any) continue
+      }
+      for (let x = Math.max(box.x0, cx << 4); x <= Math.min(box.x1, (cx << 4) + 15); x++) {
+        for (let z = Math.max(box.z0, cz << 4); z <= Math.min(box.z1, (cz << 4) + 15); z++) {
+          probe.x = x & 15
+          probe.z = z & 15
+          let top = -Infinity
+          for (let y = hi; y >= lo; y--) {
+            probe.y = y
+            const st = column.getBlockStateId(probe)
+            if (!collides(st)) continue
+            if (st === slime) top = y
+            break
+          }
+          if (top === -Infinity) continue
+          // open above it, through the box, up to the course
+          let open = true
+          for (let y = box.y0; y <= openTo && open; y++) {
+            probe.y = y
+            if (collides(column.getBlockStateId(probe))) open = false
+          }
+          if (open) out.push([x, top, z])
+        }
+      }
+    }
+  }
+  return out
 }
 
 interface WorldLike {

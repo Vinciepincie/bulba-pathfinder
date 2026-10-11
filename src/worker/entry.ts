@@ -13,8 +13,11 @@ import { fastEvaluator } from '../fastEvaluator.js'
 import { WasmSolver, wasmSupportsGoal } from '../wasm/wasmSolver.js'
 import { MAX_DIG_TABLES } from './digProtocol.js'
 import { HopOracle } from '../hopOracle.js'
-import { stitchHops } from '../hopPipeline.js'
-import { simTablesFromLut } from '../playerSim.js'
+import { MoveGen, MOM_NONE } from '../moveGen.js'
+import { LutFlags } from '../types.js'
+import { stitchHops, streamablePrefix } from '../hopPipeline.js'
+import { BAN_WEIGHT } from '../snapshot.js'
+import { simTablesFromLut, setVanillaJump } from '../playerSim.js'
 import type { SimWorld } from '../playerSim.js'
 import type { RawSolveResult } from '../solver.js'
 import type { GoalDescriptor, MovementsConfig, SnapshotMeta } from '../types.js'
@@ -64,6 +67,12 @@ interface SolveMessage {
   body?: { halfWidth: number, height: number, speed: number }
   /** Run the hop pipeline on a boundary-limited failure too (WorkerSolveRequest.hopsOnBoundary). */
   hopsOnBoundary?: boolean
+  /** Solve on the JavaScript reference core instead of the wasm core (PathfinderOptions.core). */
+  core?: 'wasm' | 'js'
+  /** The body's exact feet position when on the ground (hopPipeline.ts startRest). */
+  startPos?: { x: number, y: number, z: number }
+  /** The bot's physics keeps the faster rise on a jump (vanilla): this thread's kernel follows (playerSim.ts setVanillaJump). */
+  vanillaJump?: boolean
 }
 
 /** Prewarm: size the wasm arena for a box of this many cells now. */
@@ -101,6 +110,14 @@ if (process.env.PF_NO_WASM !== '1') {
     wasmSolver = ws
     if (ws && pendingReserve > 0) ws.reserve(pendingReserve)
   }, () => {})
+}
+
+/** `a` with `v` appended (a snapshot's entity arrays, a pipeline ban). */
+function appended (a: Int32Array, v: number): Int32Array {
+  const out = new Int32Array(a.length + 1)
+  out.set(a)
+  out[a.length] = v
+  return out
 }
 
 /** Kernel tables built from the current LUT, cached per fingerprint. */
@@ -155,7 +172,10 @@ function hopPipeline (
   first: RawSolveResult,
   cancelFlag: Int32Array,
   solveFrom: (start: { x: number, y: number, z: number }, timeoutMs: number, goal?: GoalDescriptor) => RawSolveResult,
-  reached: (x: number, y: number, z: number) => boolean
+  reached: (x: number, y: number, z: number) => boolean,
+  postPartial: (partial: RawSolveResult) => void,
+  snap: ConstructorParameters<typeof MoveGen>[0],
+  ban: (idx: number) => void
 ): RawSolveResult | null {
   if (first.status !== 'noPath' && first.status !== 'timeout') return null
   const oracle = makeOracle(msg)
@@ -179,6 +199,18 @@ function hopPipeline (
   const goalCell = typeof g.x === 'number' && typeof g.y === 'number' && typeof g.z === 'number'
     ? { x: Math.floor(g.x), y: Math.floor(g.y), z: Math.floor(g.z) }
     : null
+  // (the failed search's own partial, while the pipeline runs: hopPipeline.ts streamablePrefix)
+  const prefix = streamablePrefix(first, msg.start, oracle, reached, goalCell)
+  if (prefix.length > 0) postPartial({ ...first, status: 'partial', path: prefix })
+  let moveGen: MoveGen | null = null
+  const m = msg.meta
+  const flagAt = (x: number, y: number, z: number): number => {
+    const lx = x - m.x0
+    const ly = y - m.y0
+    const lz = z - m.z0
+    if (lx < 0 || lx >= m.w || ly < 0 || ly >= m.h || lz < 0 || lz >= m.l) return 0
+    return snap.flags[(ly * m.l + lz) * m.w + lx]
+  }
   const stitched = stitchHops(first, msg.start, {
     oracle,
     heuristic: (x, y, z) => evaluator.heuristic(x, y, z),
@@ -192,7 +224,27 @@ function hopPipeline (
     },
     reached,
     goal: goalCell,
-    deadline: performance.now() + msg.timeout
+    deadline: performance.now() + msg.timeout,
+    startRest: msg.startPos ?? null,
+    // (the cell planner's own edges, for the goal side: hopPipeline.ts goalSide)
+    edgesFrom: (x, y, z, out) => {
+      const mg = moveGen ?? (moveGen = new MoveGen(snap, msg.cfg))
+      mg.generate(x, y, z, MOM_NONE)
+      for (let i = 0; i < mg.outCount; i++) out.push(mg.outX[i], mg.outY[i], mg.outZ[i])
+    },
+    // (a planner jump no rest flies: banned for the solves after, hopPipeline.ts verifiedFollowUp)
+    ban: (x, y, z) => {
+      const lx = x - m.x0
+      const ly = y - m.y0
+      const lz = z - m.z0
+      if (lx >= 0 && lx < m.w && ly >= 0 && ly < m.h && lz >= 0 && lz < m.l) ban((ly * m.l + lz) * m.w + lx)
+    },
+    nodeLike: (x, y, z) => {
+      const f0 = flagAt(x, y, z)
+      const fd = flagAt(x, y - 1, z)
+      return (f0 & LutFlags.SAFE) !== 0 && (flagAt(x, y + 1, z) & LutFlags.SAFE) !== 0 &&
+        ((fd & LutFlags.SAFE) === 0 || (fd & (LutFlags.PHYSICAL | LutFlags.CLIMBABLE)) !== 0 || (f0 & (LutFlags.CLIMBABLE | LutFlags.LIQUID)) !== 0)
+    }
   })
   if (Atomics.load(cancelFlag, 0) !== 0) return null
   return stitched
@@ -237,6 +289,8 @@ port.on('message', (msg: InMessage) => {
     }
 
     if (msg.t === 'solve') {
+      // (the bot's own jump rule: this thread's kernel follows it)
+      setVanillaJump(msg.vanillaJump === true)
       const snap = {
         meta: msg.meta,
         flags: new Uint8Array(msg.flagsBuf),
@@ -271,7 +325,7 @@ port.on('message', (msg: InMessage) => {
       }
 
       // ── wasm fast path: coordinate goals on the Rust core ──────────────
-      if (wasmSolver && wasmSupportsGoal(msg.goal)) {
+      if (wasmSolver && msg.core !== 'js' && wasmSupportsGoal(msg.goal)) {
         try {
           const result = wasmSolver.solve(
             {
@@ -310,7 +364,9 @@ port.on('message', (msg: InMessage) => {
             (start, timeoutMs, goal) => ws.solve(wasmSnap, msg.cfg, goal ?? msg.goal, start, dig ? dig.data : null, {
               timeout: timeoutMs, searchRadius: msg.searchRadius, sliceMs: 1e9, cancelFlag, onPartial: () => {}
             }),
-            (x, y, z) => ws.reached(x, y, z))
+            (x, y, z) => ws.reached(x, y, z),
+            (partial) => port.postMessage({ t: 'partial', id: msg.id, result: partial }), snap,
+            (idx) => { wasmSnap.entityIdx = appended(wasmSnap.entityIdx, idx); wasmSnap.entityWeight = appended(wasmSnap.entityWeight, BAN_WEIGHT) })
           if (hops !== null) { hops.engine = 'wasm'; hops.hops = hops.path.filter(n => n.program !== undefined).length }
           port.postMessage({ t: 'done', id: msg.id, result: hops ?? result })
           return
@@ -351,7 +407,9 @@ port.on('message', (msg: InMessage) => {
             lastSolver = s2
             return r
           },
-          (x, y, z) => lastSolver.reached(x, y, z))
+          (x, y, z) => lastSolver.reached(x, y, z),
+          (partial) => port.postMessage({ t: 'partial', id: msg.id, result: partial }), snap,
+          (idx) => { snap.entityIdx = appended(snap.entityIdx, idx); snap.entityWeight = appended(snap.entityWeight, BAN_WEIGHT) })
         if (hops !== null) { hops.engine = 'js'; hops.hops = hops.path.filter(n => n.program !== undefined).length }
         port.postMessage({ t: 'done', id: msg.id, result: hops ?? result })
         return

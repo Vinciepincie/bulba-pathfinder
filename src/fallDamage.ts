@@ -18,10 +18,15 @@ export const SAFE_FALL = 3
  * the landing tick's descent is never counted and any excess is rounded UP.
  */
 export function landingHurts (fall: number, last: number, kind: number, sneaking: boolean, whole: boolean): boolean {
+  return fallDamagePoints(fall, last, kind, sneaking, whole) >= 1
+}
+
+/** The damage (health points) of that landing: landingHurts' arithmetic, 0 where it does not hurt. */
+export function fallDamagePoints (fall: number, last: number, kind: number, sneaking: boolean, whole: boolean): number {
   // (slime spares a body that bounces; sneaking is what refuses the bounce)
-  if ((kind & SIM_SLIME) !== 0 && !sneaking) return false
+  if ((kind & SIM_SLIME) !== 0 && !sneaking) return 0
   const reach = (kind & SIM_BED) !== 0 ? 0.5 : 1
   const kept = (kind & SIM_CUSHION) !== 0 ? 0.2 : 1
-  if (whole) return Math.floor((fall * reach + 1e-6 - SAFE_FALL) * kept) >= 1
-  return Math.ceil(((fall - last) * reach - SAFE_FALL) * kept) >= 1
+  if (whole) return Math.max(0, Math.floor((fall * reach + 1e-6 - SAFE_FALL) * kept))
+  return Math.max(0, Math.ceil(((fall - last) * reach - SAFE_FALL) * kept))
 }

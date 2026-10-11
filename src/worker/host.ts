@@ -31,6 +31,12 @@ export interface WorkerSolveRequest {
   body?: { halfWidth: number, height: number, speed: number }
   /** Run the hop pipeline on a boundary-limited failure too (the first box of a solve: small enough to search in). */
   hopsOnBoundary?: boolean
+  /** The core to solve on (PathfinderOptions.core); the wasm core when absent. */
+  core?: 'wasm' | 'js'
+  /** The body's exact feet position, when on the ground (hopPipeline.ts startRest). */
+  startPos?: { x: number, y: number, z: number }
+  /** The bot's physics keeps the faster rise on a jump (vanilla; physics.ts probeVanillaJump): the worker's kernel follows. */
+  vanillaJump?: boolean
   onPartial: (result: RawSolveResult) => void
 }
 
@@ -257,7 +263,10 @@ export class SolverWorkerHost {
       cancelBuf,
       digFingerprint: req.dig ? req.dig.fingerprint : null,
       body: req.body,
-      hopsOnBoundary: req.hopsOnBoundary
+      hopsOnBoundary: req.hopsOnBoundary,
+      core: req.core,
+      startPos: req.startPos,
+      vanillaJump: req.vanillaJump
     })
 
     return {

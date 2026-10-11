@@ -5,13 +5,15 @@
 // its node, and do so from nudged starts; and the headings it aims at a
 // landing must come down in the landing's column.
 import { expect } from 'chai'
-import { mcData, Block, AIR, STONE, SLIME } from './helpers/voxelWorld.js'
+import { mcData, Block, AIR, STONE, SLIME, OAK_FENCE_DRY } from './helpers/voxelWorld.js'
 import { buildLut } from '../src/lut.js'
 import { simTables, newBody } from '../src/playerSim.js'
 import type { SimWorld } from '../src/playerSim.js'
-import { HopOracle, ROBUST_NUDGE, LIVE_NUDGE, LAND_OVERLAP, sneakLanding } from '../src/hopOracle.js'
+import { HopOracle, ROBUST_NUDGE, LIVE_NUDGE, LAND_OVERLAP, LOOK_STEP, sneakLanding } from '../src/hopOracle.js'
 import type { HopProgram } from '../src/hopOracle.js'
-import { vantages } from '../src/hopPipeline.js'
+import { vantages, dropTakeoffs, frontierSources, streamablePrefix } from '../src/hopPipeline.js'
+import type { RawPathNode } from '../src/types.js'
+import type { RawSolveResult } from '../src/solver.js'
 
 const lut = buildLut({ registry: mcData, version: mcData.version.minecraftVersion } as never, {
   lutFingerprint: () => 'oracle', climbables: new Set(), carpets: new Set(), blocksToAvoid: new Set(),
@@ -42,6 +44,21 @@ const TRAPDOOR_LEDGE = ((): number => {
   }
   throw new Error('no west-plate open trapdoor')
 })()
+
+/** The first dry state of block `name` with the given properties. */
+function stateOf (name: string, want: Record<string, string>): number {
+  const b = mcData.blocksByName[name]
+  for (let st = b.minStateId as number; st <= (b.maxStateId as number); st++) {
+    const p = (Block.fromStateId(st, 0) as { getProperties: () => Record<string, unknown> }).getProperties()
+    if (Object.entries(want).every(([k, v]) => String(p[k]) === v)) return st
+  }
+  throw new Error(`no ${name}`)
+}
+
+/** A glass pane joined east and west: a 1/8-thick rail along x through the cell's middle. */
+const PANE_EW = stateOf('glass_pane', { east: 'true', west: 'true', north: 'false', south: 'false', waterlogged: 'false' })
+/** A closed bottom-half oak trapdoor: a 3/16 slab over the whole cell. */
+const TRAPDOOR_LOW = stateOf('oak_trapdoor', { half: 'bottom', open: 'false', waterlogged: 'false', powered: 'false' })
 
 /** An oracle over the stone cells `solid` (air elsewhere inside the box, unloaded outside), plus `extra` cells of given states. */
 function oracleOver (solid: Array<[number, number, number]>, grid: boolean, extra: Array<[number, number, number, number]> = []): HopOracle {
@@ -129,6 +146,28 @@ describe('HopOracle', function () {
     expectFlies(o, q)
   })
 
+  it('ranks a live take-off by its landing and the next leg from it, within a tick of the quickest (hopFrom next)', () => {
+    const o = oracleOver(gap, true)
+    const mk = (): ReturnType<typeof newBody> => {
+      const b = newBody(0.5, 1, -2.5)
+      b.vz = 0.18
+      b.onGround = true
+      return b
+    }
+    const quick = o.hopFrom(mk(), [0, 1, 5], performance.now() + 20000) as HopProgram
+    const ranked = o.hopFrom(mk(), [0, 1, 5], performance.now() + 20000, NaN, undefined, [0, 1, 8]) as HopProgram
+    expect(ranked).to.not.equal(null)
+    expect(ranked.ticks).to.be.at.most(quick.ticks + 1)
+    expectFlies(o, ranked)
+    // its landing leaves a next leg no slower than the quickest's did
+    const ox = o as unknown as { touchdownOf: (p: HopProgram) => ReturnType<typeof newBody> | null, nextLegTicks: (b: ReturnType<typeof newBody>, t: [number, number, number], d: number) => number }
+    const legOf = (p: HopProgram): number => { const td = ox.touchdownOf(p); return td === null ? Infinity : ox.nextLegTicks(td, [0, 1, 8], performance.now() + 20000) }
+    const lq = legOf(quick)
+    const lr = legOf(ranked)
+    expect(lr).to.be.at.least(0)
+    expect(ranked.ticks + lr).to.be.at.most(quick.ticks + (lq < 0 ? Infinity : lq))
+  })
+
   it('bounces off a slime pad below onto a ladder no plain jump reaches', () => {
     // a ledge at y 8, a slime pad eight below and three out, and a ladder
     // column ten blocks from the ledge: too far for any jump off it, and the
@@ -201,6 +240,135 @@ describe('HopOracle', function () {
     expectFlies(o, p as HopProgram)
   })
 
+  it('stands beside a fence post on its strip, over the strip\'s edge (the cell\'s free corners)', () => {
+    // A 1-deep strip with an oak fence post in its middle cell: the grid's
+    // every point is inside the post or the fence over it; the body stands
+    // beside the post, hanging over the strip's edge (arena opk-1). Fences are
+    // not PHYSICAL in the planner's tables (the node is the post's own cell),
+    // so this oracle reads them as the plugin's LUT does.
+    const fenceLut = buildLut({ registry: mcData, version: mcData.version.minecraftVersion } as never, {
+      lutFingerprint: () => 'oracle-fence', climbables: new Set(), carpets: new Set(), blocksToAvoid: new Set(),
+      liquids: new Set(), fences: new Set([mcData.blocksByName.oak_fence.id]), openable: new Set(), doors: new Set(), useBubbleColumns: false, allowParkourExtended: false
+    } as never)
+    const x0 = -8; const y0 = -4; const z0 = -8; const w = 17; const hh = 12; const l = 20
+    const states = new Int32Array(w * hh * l).fill(AIR)
+    const set = (x: number, y: number, z: number, st: number): void => { states[((y - y0) * l + (z - z0)) * w + (x - x0)] = st }
+    for (const [x, y, z] of floor([-2, 2], [-4, 1])) set(x, y, z, STONE)
+    for (let x = -1; x <= 1; x++) set(x, 0, 4, STONE) // the strip
+    set(0, 1, 4, OAK_FENCE_DRY) // the post on it
+    const stateAt = (x: number, y: number, z: number): number => {
+      const lx = x - x0; const ly = y - y0; const lz = z - z0
+      if (lx < 0 || lx >= w || ly < 0 || ly >= hh || lz < 0 || lz >= l) return -1
+      return states[(ly * l + lz) * w + lx]
+    }
+    const world: SimWorld = { ...tables, stateAt, grid: { states, x0, y0, z0, w, h: hh, l } }
+    const o = new HopOracle(world, (x, y, z) => { const s = stateAt(x, y, z); return s < 0 ? 0 : fenceLut.flags[s] }, 0.30001, 1.80001)
+    const st = o.stands(0, 1, 4)
+    expect(st.length, 'stands beside the post').to.be.greaterThan(0)
+    // (the post spans x 0.375..0.625: a body beside it has its centre within 0.075 of a face)
+    for (const s of st) expect(s.x < 0.0751 || s.x > 0.9249, 'clear of the post').to.equal(true)
+  })
+
+  it('files a pane rail\'s node as three places: its top and the floor either side, no straight walk between them', () => {
+    // a 1-wide stone beam along x with a pane rail on it (arena mcc-6-1's
+    // hoops): the planner's node over the rail is its top; beside the rail,
+    // on the beam, the body rests a block lower in the same column
+    const beam: Array<[number, number, number, number]> = []
+    for (let x = -3; x <= 3; x++) beam.push([x, 1, 0, PANE_EW])
+    const o = oracleOver([[-3, 0, 0], [-2, 0, 0], [-1, 0, 0], [0, 0, 0], [1, 0, 0], [2, 0, 0], [3, 0, 0], [0, 0, 4]], true, [...beam, [0, 1, 4, TRAPDOOR_LOW]])
+    const regs = o.regions(0, 2, 0)
+    expect(regs.map(r => r.under), 'the top, then the two sides').to.deep.equal([false, true, true])
+    const north = regs[1].stands[0].z < 0.5 ? regs[1] : regs[2]
+    const south = north === regs[1] ? regs[2] : regs[1]
+    for (const st of north.stands) expect(st.z < 0.4375 - 0.3 + 1e-3 && st.y === 1, 'north of the rail, on the beam').to.equal(true)
+    for (const st of south.stands) expect(st.z > 0.5625 + 0.3 - 1e-3 && st.y === 1, 'south of the rail, on the beam').to.equal(true)
+    const n = north.stands[0]
+    expect(o.besideRest([0, 2, 0], n), 'beside the rail').to.equal(true)
+    expect(o.besideRest([0, 2, 0], regs[0].stands[0]), 'on its top').to.equal(false)
+    expect(o.walkLink(n, south.stands[0].x, south.stands[0].z), 'through the pane').to.equal(false)
+    const own = o.regionOf([0, 2, 0], n)
+    expect(own.some(st => st.z > 0.5), 'the north rest\'s place holds nothing south of the rail').to.equal(false)
+    // a bottom trapdoor's top is the planner's own place: no under place
+    expect(o.underStands(0, 2, 4)).to.deep.equal([])
+    expect(o.regions(0, 2, 4).map(r => r.under)).to.deep.equal([false])
+    expect(o.besideRest([0, 2, 4], o.stands(0, 2, 4)[0])).to.equal(false)
+  })
+
+  it('hops from beside a rail onto its top and over it, each held to its landing place (HopProgram.land)', () => {
+    const beam: Array<[number, number, number, number]> = []
+    for (let x = -3; x <= 3; x++) beam.push([x, 1, 0, PANE_EW])
+    const o = oracleOver([[-3, 0, 0], [-2, 0, 0], [-1, 0, 0], [0, 0, 0], [1, 0, 0], [2, 0, 0], [3, 0, 0]], true, beam)
+    const regs = o.regions(0, 2, 0)
+    const n = regs.find(r => r.under && r.stands[0].z < 0.5)!.stands[0]
+    // only the rest's own node in range: its other two places
+    const edges = o.discoverFromRest({ x: 0, y: 2, z: 0 }, n, (x, y, z) => (x === 0 && y === 2 && z === 0 ? 0 : 50), 5000, null)
+    const places = new Set<string>()
+    for (const e of edges) {
+      const p = e.program
+      expect(p.land, 'held to a place').to.not.equal(undefined)
+      expectFlies(o, p)
+      const rest = o.restOf(p)
+      expect(rest, 'comes to rest').to.not.equal(null)
+      expect(Math.abs(rest!.y - p.land!.y), 'at its place\'s level').to.be.lessThan(1e-3)
+      expect(o.regionOf([p.tx, p.ty, p.tz], p.land!).some(st => o.walkLink(st, rest!.x, rest!.z)), 'in its place').to.equal(true)
+      places.add(o.besideRest([0, 2, 0], rest!) ? (rest!.z > 0.5 ? 'south' : 'north') : 'top')
+    }
+    expect([...places].sort(), 'onto the top and over the rail').to.deep.equal(['south', 'top'])
+  })
+
+  it('offers the ledges over slime the search reached as drop take-offs, nearest the slime first', () => {
+    // a stalled tail on a high platform; past a wall the platform goes on to a
+    // ledge over a pit with slime at its bottom — reached, off the tail
+    const solid: Array<[number, number, number]> = [...floor([-6, -2], [-6, 2])]
+    for (let z = -6; z <= 2; z++) solid.push([-1, 1, z], [-1, 2, z]) // a wall the tail stands behind
+    for (const [x, z] of [[-6, 3], [-5, 3], [-4, 3], [-3, 3], [-2, 3], [-1, 3], [0, 3]]) solid.push([x, 0, z]) // the way round, reached
+    const o = oracleOver(solid, true, [[2, -3, 4, SLIME], [3, -3, 4, SLIME]])
+    const tail = [{ x: -3, y: 1, z: 0 }, { x: -2, y: 1, z: 0 }]
+    const reached = (x: number, y: number, z: number): boolean => y === 1 && ((x >= -6 && x <= -2 && z >= -6 && z <= 2) || (z === 3 && x >= -6 && x <= 0))
+    const drops = dropTakeoffs(o, reached, tail)
+    expect(drops.length, 'a ledge over the slime').to.be.greaterThan(0)
+    expect(drops[0], 'the end of the way round, beside the pit').to.deep.equal({ x: 0, y: 1, z: 3 })
+    // none of the tail's own cells, and none without a drop beside it
+    for (const d of drops) expect(tail.some(t => t.x === d.x && t.z === d.z)).to.equal(false)
+  })
+
+  it('offers reached take-offs off the tail that look out on unreached ground as frontier sources', () => {
+    // reached: a floor (stand y 1) at x -6..0, z -6..0; the tail ran along its
+    // far edge; a platform 3 blocks off its near corner is unreached
+    const solid = [...floor([-6, 0], [-6, 0]), ...floor([3, 6], [3, 6])]
+    const o = oracleOver(solid, true)
+    const h = (x: number, y: number, z: number): number => Math.hypot(x - 5, y - 1, z - 5)
+    const tail = [{ x: -6, y: 1, z: -6 }, { x: -5, y: 1, z: -6 }]
+    const onA = (x: number, y: number, z: number): boolean => y === 1 && x >= -6 && x <= 0 && z >= -6 && z <= 0
+    const front = frontierSources(o, onA, h, tail)
+    expect(front[0], 'the corner nearest the platform').to.deep.equal({ x: 0, y: 1, z: 0 })
+    // apart from the tail and from each other
+    for (const f of front) expect(tail.some(t => Math.max(Math.abs(t.x - f.x), Math.abs(t.z - f.z)) <= 1)).to.equal(false)
+    for (let i = 0; i < front.length; i++) for (let j = i + 1; j < front.length; j++) expect(Math.max(Math.abs(front[i].x - front[j].x), Math.abs(front[i].z - front[j].z))).to.be.greaterThan(1)
+    // with the platform reached too, nothing looks out on new ground
+    const onAB = (x: number, y: number, z: number): boolean => onA(x, y, z) || (y === 1 && x >= 3 && x <= 6 && z >= 3 && z <= 6)
+    expect(frontierSources(o, onAB, h, tail)).to.deep.equal([])
+  })
+
+  it('streams the failed search\'s partial only up to the node nearest an off-path take-off', () => {
+    // the drop-take-off scene: the partial runs along the platform behind
+    // the wall; the ledge over the slime pit (0,1,3) is the pipeline's take-off
+    const solid: Array<[number, number, number]> = [...floor([-6, -2], [-6, 2])]
+    for (let z = -6; z <= 2; z++) solid.push([-1, 1, z], [-1, 2, z])
+    for (const [x, z] of [[-6, 3], [-5, 3], [-4, 3], [-3, 3], [-2, 3], [-1, 3], [0, 3]]) solid.push([x, 0, z])
+    const o = oracleOver(solid, true, [[2, -3, 4, SLIME], [3, -3, 4, SLIME]])
+    const reached = (x: number, y: number, z: number): boolean => y === 1 && ((x >= -6 && x <= -2 && z >= -6 && z <= 2) || (z === 3 && x >= -6 && x <= 0))
+    const node = (x: number, z: number): RawPathNode => ({ x, y: 1, z, cost: 1, parkour: false, useOne: null })
+    const first = { status: 'noPath', path: [node(-5, 0), node(-4, 0), node(-3, 0), node(-2, 0)] } as unknown as RawSolveResult
+    const prefix = streamablePrefix(first, { x: -6, y: 1, z: 0 }, o, reached, null)
+    // every cell of the z=3 row is a drop edge: the partial node nearest any
+    // of them, (-3,1,0) to (-3,1,3), and all after it stay for the pipeline
+    expect(prefix.map(n => n.x)).to.deep.equal([-5, -4])
+    // no off-path take-off anywhere: the whole partial
+    const bare = oracleOver(solid, true)
+    expect(streamablePrefix(first, { x: -6, y: 1, z: 0 }, bare, (x, y, z) => y === 1 && x >= -6 && x <= -2 && z >= -6 && z <= 2, null)).to.have.length(4)
+  })
+
   it('sneaks onto a slime top on the touchdown tick, and on no other', () => {
     const p = { slimeLand: true, tx: 0, ty: 5, tz: 0 } as HopProgram
     const hw = 0.30001
@@ -237,6 +405,52 @@ describe('HopOracle', function () {
     const q = p as HopProgram
     expect(q.climb).to.equal(true)
     expectFlies(o, q)
+  })
+
+  it('flies a deep bounce off a 40-block drop, gated on its pool, and re-checks it live (deepVerdict)', () => {
+    // a ledge 40 over a 9x9 slime pool and a landing 12 up beyond it: only
+    // the rebound off the pool carries there (HopProgram.deep; at 10 up the
+    // fall off the rebound's apex is a landing that hurts, FALL_VETO)
+    const x0 = -8
+    const y0 = -4
+    const z0 = -8
+    const w = 17
+    const h = 52
+    const l = 30
+    const states = new Int32Array(w * h * l).fill(AIR)
+    const put = (x: number, y: number, z: number, s: number): void => { states[((y - y0) * l + (z - z0)) * w + (x - x0)] = s }
+    for (const [x, , z] of floor([-2, 2], [-2, 1])) put(x, 40, z, STONE)
+    for (let x = -4; x <= 4; x++) for (let z = 4; z <= 12; z++) put(x, 0, z, SLIME)
+    for (const [x, , z] of floor([-2, 2], [14, 16])) put(x, 12, z, STONE)
+    const stateAt = (x: number, y: number, z: number): number => {
+      const lx = x - x0
+      const ly = y - y0
+      const lz = z - z0
+      if (lx < 0 || lx >= w || ly < 0 || ly >= h || lz < 0 || lz >= l) return -1
+      return states[(ly * l + lz) * w + lx]
+    }
+    const o = new HopOracle({ ...tables, stateAt, grid: { states, x0, y0, z0, w, h, l } },
+      (x, y, z) => { const s = stateAt(x, y, z); return s < 0 ? 0 : lut.flags[s] }, 0.30001, 1.80001)
+    expect(o.slimeTops(0, 41, 0), 'too deep for the shallow scan').to.deep.equal([])
+    const p = o.hop([0, 41, 0], [0, 13, 15], performance.now() + 30000, 'bounce')
+    expect(p).to.not.equal(null)
+    const q = p as HopProgram
+    expect(q.deep).to.equal(true)
+    expectFlies(o, q)
+    // the abort's targets: the pool's inside, a block and a half in, never its rim
+    expect(q.basin?.length).to.equal(36)
+    for (const [x, , z] of q.basin ?? []) expect(Math.abs(x) < 4 && z > 4 && z < 12, `inside: ${x},${z}`).to.equal(true)
+    // live: on plan from its start it arrives; a body falling over the pool's
+    // middle still aborts into it, one beside the pool can do neither
+    expect(o.deepVerdict(q, newBody(q.sx, q.sy, q.sz), 0, false, 0, 0, NaN).arrives).to.equal(true)
+    const over = newBody(0.5, 25, 8.5)
+    over.vy = -1
+    expect(o.deepVerdict(q, over, 40, true, 30, 0, NaN).abortable).to.equal(true)
+    const beside = newBody(7.5, 25, 8.5)
+    beside.vy = -1
+    expect(o.deepVerdict(q, beside, 40, true, 30, 0, NaN)).to.deep.equal({ arrives: false, abortable: false })
+    // and nothing lands on the pool itself: sneaking onto slime takes the whole 40-block fall (FALL_VETO)
+    expect(o.hop([0, 41, 0], [0, 1, 8], performance.now() + 30000, 'simple')).to.equal(null)
   })
 
   it('bounces a chain of slime pads to a landing far past the first', () => {
@@ -302,6 +516,47 @@ describe('HopOracle', function () {
     far.onGround = true
     far.vy = -0.0784
     expect(o.anchored(p, far)).to.equal(null)
+  })
+
+  it('places a body at rest onto a precision program\'s start by one or two sneaking presses (the exact line-up)', () => {
+    const o = oracleOver(gap, true)
+    const p = o.hop([0, 1, 0], [0, 1, 5], performance.now() + 20000) as HopProgram
+    expect(p).to.not.equal(null)
+    for (const [ox, oz] of [[0.05, 0], [-0.04, 0.03], [0.07, -0.05]]) {
+      const b = newBody(p.sx + ox, p.sy, p.sz + oz)
+      b.onGround = true
+      b.vy = -0.0784
+      const yaw0 = 0.3
+      const lu = o.lineUp(p, b, yaw0, performance.now() + 5000)
+      expect(lu, `from ${ox},${oz}`).to.not.equal(null)
+      const { yaws, rest, prog } = lu as NonNullable<typeof lu>
+      expect(yaws.length).to.be.within(1, 2)
+      // each press turns in whole LOOK_STEPs, as bot.look does
+      for (const y of yaws) {
+        const m = (y - yaw0) / LOOK_STEP
+        expect(Math.abs(m - Math.round(m)), 'whole look steps').to.be.lessThan(1e-6)
+      }
+      expect(Math.hypot(rest.x - p.sx, rest.z - p.sz), 'rest on the start').to.be.lessThan(0.01)
+      expect(rest.y).to.equal(p.sy)
+      expect(prog.start, 'a live program from that rest').to.not.equal(undefined)
+      expect(o.fly(prog)).to.equal(prog.ticks)
+    }
+    // two presses move a body ~0.12 at most: a half-block miss is no line-up
+    const far = newBody(p.sx + 0.5, p.sy, p.sz)
+    far.onGround = true
+    far.vy = -0.0784
+    expect(o.lineUp(p, far, 0, performance.now() + 5000)).to.equal(null)
+  })
+
+  it('starts a carry chain at the last firm node before a path\'s icy end', () => {
+    const ICE = mcData.blocksByName.ice.minStateId as number
+    const ice: Array<[number, number, number, number]> = [[2, 0, 0, ICE], [3, 0, 0, ICE], [4, 0, 0, ICE]]
+    const o = oracleOver([[0, 0, 0], [1, 0, 0], [5, 0, 0]], true, ice)
+    const n = (x: number): { x: number, y: number, z: number } => ({ x, y: 1, z: 0 })
+    expect(o.chainStart([n(0), n(1), n(2), n(3)]), 'ends on ice').to.equal(1)
+    expect(o.chainStart([n(0), n(1), n(2), n(3), n(4)])).to.equal(1)
+    expect(o.chainStart([n(1), n(2), n(5)]), 'ends on stone').to.equal(-1)
+    expect(o.chainStart([n(2), n(3), n(4)]), 'no firm node behind').to.equal(-1)
   })
 
   it('aims headings that bring an unobstructed flight down in the landing column', () => {

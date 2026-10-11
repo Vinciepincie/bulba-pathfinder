@@ -14,7 +14,7 @@
 // arena by the momentum count.
 import { performance } from 'node:perf_hooks'
 import { MinHeap } from './heap.js'
-import { MoveGen, META_PARKOUR, META_USEONE, META_BOUNCE, META_CHAIN, META_RUN, META_AIM, MOM_NONE } from './moveGen.js'
+import { MoveGen, META_PARKOUR, META_USEONE, META_BOUNCE, META_CHAIN, META_RUN, META_AIM, META_DEEP, MOM_NONE } from './moveGen.js'
 import type { SnapshotView, StepExclusionFn, DigContext } from './moveGen.js'
 import type { MovementsConfig, RawPathNode, SolveStatus } from './types.js'
 
@@ -508,7 +508,8 @@ export class Solver {
 
         gAll[nIdx] = g2
         parentAll[nIdx] = idx
-        metaAll[nIdx] = outMeta[i]
+        // (past a drop the body cannot climb back from, every node is: META_DEEP)
+        metaAll[nIdx] = outMeta[i] | (metaAll[idx] & META_DEEP)
         const br = outBreaks[i]
         if (br !== null) {
           (this.breaks ??= new Map()).set(nIdx, br)
@@ -527,7 +528,7 @@ export class Solver {
         } else if (this.aims !== null) {
           this.aims.delete(nIdx)
         }
-        if (h < this.bestH) {
+        if (h < this.bestH && (metaAll[nIdx] & META_DEEP) === 0) {
           this.bestH = h
           this.bestIdx = nIdx
         }

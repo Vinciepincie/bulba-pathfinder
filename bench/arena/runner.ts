@@ -5,7 +5,8 @@
 // from `src/`, so the benchmark exercises what production runs — worker
 // thread, wasm core and all. Running the TypeScript sources directly would
 // silently fall back to main-thread solving and flatter the result.
-import { appendFileSync } from 'node:fs'
+import { appendFileSync, mkdirSync } from 'node:fs'
+import { join } from 'node:path'
 import { createRequire } from 'node:module'
 import { performance } from 'node:perf_hooks'
 import type { Bot } from 'mineflayer'
@@ -49,11 +50,13 @@ function readProperties (b: BlockLike | null): Record<string, unknown> {
 }
 
 /**
- * `bulba` runs the reference JavaScript solver on the main thread;
- * `bulba-wasm` runs the production path — the Rust core in a worker thread.
+ * `bulba` runs the reference JavaScript solver core in the worker thread;
+ * `bulba-wasm` runs the production path — the Rust core in the same worker.
  * Both are the same algorithm and are pinned bit-identical by the package's
  * differential suite, so racing them apart measures the engine room, not the
- * search.
+ * search. (Both run the physics-hop pipeline, which lives in the worker: a
+ * main-thread `bulba` could not plan the hop routes — mcc-3-2, mcc-6-2, the
+ * Ten Ways slime room — and raced as if it lacked the capability.)
  *
  * `bulba-nohop` is `bulba` with `allowSprintHop` off and nothing else. The
  * sprint-hop gait is worth ~25% of ground speed in isolation but costs
@@ -194,6 +197,47 @@ interface PathUpdate {
 }
 
 /** Load a pathfinder plugin + goals for one implementation. */
+interface NoPathDump {
+  meta: unknown
+  flags: Uint8Array
+  heights: Uint8Array
+  start: unknown
+  goal: unknown
+  cfg: unknown
+  visitedNodes: number
+}
+
+/**
+ * PF_DUMP_NOPATH=<dir>: every terminal no-path solve of a bulba engine is
+ * written to <dir>/pf-nopath-<impl>.jsonl in the bot's own dump format, for
+ * `scripts/replayNoPath.ts` — the exact snapshot, start, goal and config the
+ * solver saw, which is the only way to tell a world the bot had not received
+ * from a move the planner lacks (arena mcc-6-3: no-path after a route that
+ * ended in the pool, a path after one that did not).
+ */
+function noPathDumper (impl: Impl): ((d: NoPathDump) => void) | undefined {
+  const dir = process.env.PF_DUMP_NOPATH
+  if (!dir) return undefined
+  return (d) => {
+    try {
+      mkdirSync(dir, { recursive: true })
+      appendFileSync(join(dir, `pf-nopath-${impl}.jsonl`), JSON.stringify({
+        ts: Date.now(),
+        meta: d.meta,
+        flags: Buffer.from(d.flags).toString('base64'),
+        heights: Buffer.from(d.heights).toString('base64'),
+        start: d.start,
+        goal: d.goal,
+        cfg: d.cfg,
+        visitedNodes: d.visitedNodes
+      }) + '\n')
+      console.log(`   [${impl}] no-path dump written (${d.visitedNodes} nodes visited)`)
+    } catch (error) {
+      console.warn(`   [${impl}] no-path dump failed: ${(error as Error).message}`)
+    }
+  }
+}
+
 export async function loadImpl (impl: Impl): Promise<{
   plugin: (bot: Bot) => void
   Movements: new (bot: Bot) => Record<string, unknown>
@@ -211,11 +255,11 @@ export async function loadImpl (impl: Impl): Promise<{
       `could not load the built @bulba/pathfinder — run "npm run build" first (${(error as Error).message})`
     )
   }
-  // The worker carries the wasm core; without it the plugin solves on the
-  // main thread with the JavaScript reference implementation.
-  const createPathfinder = mod.createPathfinder as (o: { useWorkerThreads: boolean }) => (bot: Bot) => void
+  // Both cores run in the worker (the hop pipeline lives there); `core`
+  // picks the Rust core or the JavaScript reference implementation.
+  const createPathfinder = mod.createPathfinder as (o: { useWorkerThreads: boolean, core: 'wasm' | 'js', onNoPath?: (d: NoPathDump) => void }) => (bot: Bot) => void
   return {
-    plugin: createPathfinder({ useWorkerThreads: impl === 'bulba-wasm' }),
+    plugin: createPathfinder({ useWorkerThreads: true, core: impl === 'bulba-wasm' ? 'wasm' : 'js', onNoPath: noPathDumper(impl) }),
     Movements: mod.Movements,
     goals: mod.goals
   } as never

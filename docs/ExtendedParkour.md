@@ -138,6 +138,34 @@ real players. The executor needs no change: it holds jump and the per-tick
 rollout simulates the bonk against the real world. Neos remain out of scope
 — the executor only holds jump+sprint+forward; momentum chains are below.
 
+**Graded lids** (the lid model: `lidWalk`, `J_LID8_RUN` / `J_LID13_RUN` /
+`J_LID3_RUN`, `FLIGHT_ROW`). A lid caps the arc at ITS bonk height, not
+always +0.2: a top slab at head+1 at 0.7, a closed top trapdoor at 1.0125, a
+full block a cell higher (3-high headroom) at 1.2. A full-footprint block
+whose boxes all start k/16 up its cell carries a LID byte in the thin table
+(0xF0 | k: slabs, top trapdoors, dripleaf, hoppers, pistons); every thin
+consumer reads it as no footprint (`thinShapeAt`). The rows come from the
+J_RUN generator with the ceiling a parameter (envelope.test.ts re-derives
+them). Then:
+- the take-off's own lid: a thin footprint the body has left by the jump
+  point (a shelf's back, a panel behind; the running point for a running
+  row, `TAKEOFF_RUN`) caps nothing (`thinSpan`); nor does a latched one;
+- a graded lid the body meets only past the take-off window is not a cap: the
+  arc is walked tick by tick (`lidWalk`: the y move at the previous tick's xz,
+  a lid over the body caps it, entering a lid's span above its bonk height is
+  a side collision) over the take-off window (s0 ±0.14), and side-on the jump
+  falls back to the old 0.2 class. The take-off's own lid enters that walk
+  over the take-off cell's head span only (an arc that leaves it before
+  rising to it rises past it, into the lids further on), the corridor's
+  uniform cap over the whole path; the reach rows stay bounded by both;
+- an overhang at flight level over a DROP landing (F2) is walked too, the
+  default row first and a slower take-off whose arc passes under after; on
+  the centre line only (an aimed line under one is a slot dive the walk does
+  not model: arena opk-6, over a 138-block fall).
+Arena opk2-5 becomes a plain A* success (23 nodes; the shelf and top-trapdoor
+jumps, 143 ticks in the kernel gait against 159 through six pipeline
+programs). No momentum chain under any lid.
+
 ## Run length, not "standing" vs "running" (`J_RUN`)
 
 The envelope's first model had two takeoff classes: a jam from rest at the
@@ -282,7 +310,7 @@ run-up and jump gates then work from there. Not covered: lines that are not
 parallel (take-off and landing shifted differently) and mid-air turns — the
 arena's Tuning Forks and the later Lateral Leaps need those.
 
-## Ladders: entry, catch, transfer — never the top edge
+## Ladders: entry, catch, transfer, and the top edge
 
 A ladder cell is entered cardinally from an adjacent stand (`moveForward`
 with no floor under the target — the ladder catches), caught by a jump at
@@ -303,6 +331,23 @@ edges of two ladders priced like a block hop — and a plan the executor
 cannot fly. Climbing over the lip at the top of a ladder (`moveUp` to the
 cell above, then off it) is unchanged.
 
+A ladder's TOP EDGE is a take-off (`parkourExtTarget`, `ladderTop`; the
+veto that stood here predated `carryCode`, which now prices the 3/16 strip
+per side). Modelled as what it is, a standing jump from the strip against
+the wall: no run cell behind and no back credit (`run = front`), no momentum
+lip, no rise (a +1 from the strip was never shown to fly), a diagonal
+credited per axis — the full run along the strip, nothing across it — not
+the panel rule's nothing on both, and `LADDER_TOP_COST` 2 for the climb-out
+and the settle on the strip (8-12 ticks measured between catch and
+standing). A cardinal catch jump from it gives back the catch over-credit
+(`LADDER_CATCH_OVERCREDIT` 0.3: climbability is tested at the body centre,
+so a catch needs the centre inside the cell, 0.5 from its middle, not
+LAND_HALF's 0.8), and the TIGHT pass returns it: a frame-perfect catch is
+offered at TIGHT_COST only where nothing else gets through. Ladder-hop
+courses are nothing but these: the Ten Ways ladder room (17 cells, its last
+hop 10 in 15k take-offs) and mcc-5-3's six single-block ladders over a void,
+which plan ladder by ladder (the 13% legs, not a 0.4% skip of one).
+
 A ladder that starts at HEAD height (no rung in the feet cell) is entered by
 a jump straight up into it (`moveUp`, extended repertoire only; the executor's
 `jumpinto` branch faces the ladder's wall and jumps). Along a ladder WALL
@@ -312,6 +357,62 @@ and an into-wall part (`climbWall` reads the wall side from the ladder's
 shape), the body moves sideways only where it fits and has a rung to hang
 from, presses only while below the node, and lets go to descend. A final
 node on a ladder is held until the body is within `CLIMB_FINISH_DY` of it.
+
+**A ladder one above the take-off** (`extTarget`'s +1 catch,
+`UP_CATCH_CREDIT`). A ladder hung one cell above the take-off's feet over
+open air is caught by a +1 jump through its open face: an extra candidate
+beside the column's own landing, credited 0.45 at the cell face (the body's
+CENTRE must be in the ladder's cell - climbability is tested at
+floor(position) - not LAND_HALF's 0.8, which made a catch the physics never
+lands on parkouradv1). The plain creep/run envelope only: no lip take-off,
+no chain, no tight pass; never across the plank's own side; and only over a
+planner landing in the column (the net a missed catch falls onto, the same
+landing the ordinary drop into that column uses). Arena opk2-1's moss pillar
+to the one-cell ladder over the next (the oracle flies it straight 5t); over
+the 60 routes it emits one other edge (a weeping vine on paradise3-l49, an
+equal-cost permutation).
+
+## Lava beside a landing (`lavaFlanked`)
+
+No airborne landing (`parkourExtTarget`, `moveParkourForward`) has lava in
+any of the 8 cells round it at feet or head height. A jump comes down within
+LAND_HALF of its node — 0.3 past the cell's edge — so a 1-wide ledge between
+two lava cells is a landing the body survives only from a 0.4-wide window:
+arena opk-9 killed the bot on it whenever it came down 0.1 off centre. Lava
+is LIQUID without SAFE (water is SAFE); out-of-box cells are no hazard; walks
+are untouched. Both cores, bit for bit.
+
+## A lid inside the take-off strip (`lidInStrip`, `leavesLid`)
+
+A trapdoor ladder (arena mcc-8-3: open birch trapdoors in a period-3 spiral
+up a shaft) puts the same plate three up over every plate: a lid 0.2 over
+the head of a body standing on the strip, and every jump from it is the
+head-hitter class (`lowTakeoff`, J_LOW_RUN rows, no +1 landing) - the shaft
+was never planned. But the tick the body's box comes off the strip, the
+ground flag still holds (the Y move runs first, against the strip it is
+leaving: vanilla collideWithShapes, prismarine and the kernel alike), and a
+jump pressed then rises 1.2-1.25 unclipped. So where the lid's thin
+footprint lies inside the support panel's (an edge panel, carry 1-4), a jump
+whose step leaves the strip - across its open side, or off its end into no
+level support - flies the full arc (`low` relaxed), and a jump-up across
+the open side waives the head cell (META_PARKOUR: the executor's live
+take-off search runs). A chain's landing-tick re-jump is still bonked (it
+is always on the strip). The window is one tick: the oracle's `leave`
+family jumps on the event, not a tick count (PhysicsHops.md). A whole-world
+scan of the arena finds 36 such nodes, all in that shaft.
+
+## Floors that are none (`lut.ts`, this profile only)
+
+Upstream classifies by the block TYPE's bounding box, and three kinds of
+block it calls a floor or air are not: a big dripleaf tilts under a body
+standing on it and drops it (fully tilted it has no box at all) - never a
+support, so the planner never walks onto a leaf over a pit; a state with no
+collision box (an open fence gate of a wood the openable set does not list,
+an age-0 pitcher crop) carries nothing; and powder snow, "empty", sinks and
+freezes a body - never walked through. Upstream mode keeps its exact
+classification. Not yet: snow layers 2-8 ("empty" to upstream, steps of
+0.125-0.875 to the body), whose node height the planner cannot express as a
+thin floor.
 
 ## Momentum chains (`META_CHAIN`, `via`)
 

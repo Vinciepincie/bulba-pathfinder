@@ -667,6 +667,7 @@ See [bench/arena/README.md](bench/arena/README.md).
 import { createPathfinder } from '@bulba/pathfinder'
 bot.loadPlugin(createPathfinder({
   useWorkerThreads: true,   // default; false = always main-thread sliced
+  core: 'wasm',             // default; 'js' = the reference core in the same worker
   maxSnapshotCells: 8_000_000, // snapshot memory cap (× 2 bytes)
   hitboxPrecisionFix: true, // default; see the 1.21.x note above
 }))
@@ -746,6 +747,14 @@ What is **not** modelled, and the executor only survives rather than solves:
 
 - No breath budget and no flowing-water direction in the search, so it can
   still ask for a swim the bot has to abandon part-way.
+- **A drop into liquid deeper than `maxDropDown` is a move the body cannot
+  come back from**, and a failed search never cuts its partial path back to
+  one (`META_DEEP`, inherited by every node past the drop, in both cores).
+  Before this, a course the planner could not plan ended with the bot walking
+  off it into the pool below — the cell nearest the goal — and swimming at a
+  goal thirty blocks above it (arena mcc-4-2, 5-3, 6-1, 7-1). A whole path
+  through such a drop is still found and walked; only the best-effort tail of
+  a failure stops short of it.
 - **No fall-risk model, and it cannot live in the executor.** Nothing anywhere
   consults `bot.health`: `maxDropDown` bounds a drop the planner *chose*, not
   the void a jump crosses. Refusing a fatal-miss take-off was tried and

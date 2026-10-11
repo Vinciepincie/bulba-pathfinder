@@ -9,7 +9,7 @@
 import type { Bot } from 'mineflayer'
 import prismarineBlockLoader from 'prismarine-block'
 import { LutFlags, LutSpecial } from './types.js'
-import { topCatchClass, carryCode, thinFootprint, CARRY_SHIFT } from './shapes.js'
+import { topCatchClass, carryCode, thinFootprint, lidByte, CARRY_SHIFT } from './shapes.js'
 import { simSlipOf, simKindOf } from './playerSim.js'
 import type { Movements } from './movements.js'
 
@@ -146,6 +146,22 @@ export function buildLut (bot: Bot, movements: Movements): BlockLut {
         const open = props.open === true || props.open === 'true'
         stateFlags |= open ? LutFlags.DOOR_OPEN : LutFlags.DOOR_CLOSED
       }
+      // Improvement (the extended profile; upstream mode stays exact): what
+      // upstream's type-level boundingBox calls a floor but is none.
+      if (slimeMark) {
+        if (blockType.name === 'big_dripleaf') {
+          // a big dripleaf tilts under a body standing on it and drops it, in
+          // every tilt (fully tilted it has no box at all): never a support -
+          // planned as one, the walk onto a leaf over a pit is a fall
+          stateFlags &= ~LutFlags.PHYSICAL
+        } else if (shapes.length === 0 && !gate && !door && !carpet) {
+          // a state with no collision box carries nothing (an open fence gate
+          // of a wood the openable set does not list, an age-0 pitcher crop)
+          stateFlags &= ~LutFlags.PHYSICAL
+        }
+        // powder snow sinks a body into it and freezes it: never walked through
+        if (blockType.name === 'powder_snow') stateFlags &= ~LutFlags.SAFE
+      }
       flags[stateId] = stateFlags
       const wl = (block as { isWaterlogged?: unknown }).isWaterlogged
       if (wl === true || wl === 'true') waterlogged[stateId] = 1
@@ -188,7 +204,7 @@ export function buildLut (bot: Bot, movements: Movements): BlockLut {
         if (s[4] > top) top = s[4]
       }
       heights[stateId] = Math.min(63, Math.round(top * 32)) | (topCatchClass(shapes) << 6)
-      if (thin !== null) thin[stateId] = thinFootprint(shapes)
+      if (thin !== null) thin[stateId] = thinFootprint(shapes) || lidByte(shapes)
 
       if (shapes.length > 0) {
         const key = JSON.stringify(shapes)

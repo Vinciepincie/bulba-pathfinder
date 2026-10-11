@@ -7,8 +7,7 @@
 import {
   MAX_OFFSET_MAJOR, J_RUNNING, FLIGHT_STANDING, FLIGHT_RUNNING,
   FLIGHT_LOW_STANDING, FLIGHT_LOW_RUNNING, feetAt,
-  flightNeeded, takeoffStand, takeoffRun, TAKEOFF_STAND, TAKEOFF_RUN, LAND_HALF, LIP_STRIDE
-} from './parkourEnvelope.js'
+  flightNeeded, takeoffStand, takeoffRun, TAKEOFF_STAND, TAKEOFF_RUN, LAND_HALF, LIP_STRIDE, J_LID8_RUN, J_LID13_RUN, J_LID3_RUN, FLIGHT_ROW } from './parkourEnvelope.js'
 
 export interface ParkourExtEntry {
   /** Landing offset, in multiples of the direction signs (sx, sz). */
@@ -92,6 +91,38 @@ export interface ParkourExtEntry {
    * on a variant. The planner tries them only where the centred line is
    * refused by a corridor pass. */
   variants: ParkourExtEntry[]
+  /**
+   * LID model (moveGen.ts lidWalk): every cell the FULL hitbox (HEAD_HALF, no
+   * corner-nick allowance: the y move resolves first, so a head that overlaps
+   * a lid box by any amount bonks) overlaps along the path: the TAKE-OFF cell
+   * first, then path order, the LANDING cell last. (ax, az) pairs.
+   */
+  headCells: number[]
+  /** Per head cell: path distance (blocks along pts from the take-off point) where the hitbox starts / stops overlapping it. */
+  headIn: number[]
+  headOut: number[]
+}
+
+/** Hitbox half-width for the head-cell sweep: the 0.3 box less a centimetre of grace (moveGen.ts THIN_BODY_HALF). */
+const HEAD_HALF = 0.29
+/**
+ * Max feet height over arc parameter [a, b] (distance from the jump point),
+ * tick-step model: tick i's y move happens at the xz the previous tick left
+ * (d_{i-1}, the jump point for i = 0) and the body then moves horizontally at
+ * the new height, so over [d_{i-1}, d_i] the feet are at y_i. Before the jump
+ * (a < 0) the feet are on the ground (0).
+ */
+export function maxFeetStep (curve: readonly number[], a: number, b: number): number {
+  let m = a < 0 ? 0 : -Infinity
+  let prev = 0
+  for (let i = 0; i < curve.length; i += 2) {
+    const d = curve[i]
+    if (d >= a && prev <= b && curve[i + 1] > m) m = curve[i + 1]
+    prev = d
+    if (prev > b) break
+  }
+  if (m === -Infinity) m = curve[curve.length - 1]
+  return m
 }
 
 /**
@@ -288,6 +319,29 @@ function buildEntry (a: number, b: number, pOff = 0, qOff = 0, aimIndex = 0, wOf
     mfLip.push(Math.min(mfRun[mfRun.length - 1], feetAt(FLIGHT_RUNNING, c.tIn * dist - sLipFar), feetAt(FLIGHT_RUNNING, c.tOut * dist - sLipNear)))
     mfLowLip.push(Math.min(mfLowRun[mfLowRun.length - 1], feetAt(FLIGHT_LOW_RUNNING, c.tIn * dist - sLipFar), feetAt(FLIGHT_LOW_RUNNING, c.tOut * dist - sLipNear)))
   }
+  // Head cells (lid model): the full hitbox's sweep, landing included, start excluded.
+  const headCells: number[] = []
+  const headIn: number[] = []
+  const headOut: number[] = []
+  {
+    const hc: Array<[number, number, number, number]> = []
+    for (let i = Math.min(0, a) - reach; i <= Math.max(0, a) + reach; i++) {
+      for (let j = Math.min(0, b) - reach; j <= Math.max(0, b) + reach; j++) {
+        const hit = sweep(i, i + 1, j, j + 1, HEAD_HALF)
+        if (hit === null) continue
+        hc.push([i, j, hit[0] * dist, hit[1] * dist])
+      }
+    }
+    // landing last, the rest in path order
+    const rank = (c: [number, number, number, number]): number => c[0] === 0 && c[1] === 0 ? 0 : c[0] === a && c[1] === b ? 2 : 1
+    hc.sort((p, q) => rank(p) - rank(q) || p[2] - q[2])
+    // running take-off window: the run point (TAKEOFF_RUN) to the creep point the reach is credited at
+    for (const [i, j, sIn, sOut] of hc) {
+      headCells.push(i, j)
+      headIn.push(sIn)
+      headOut.push(sOut)
+    }
+  }
   const variants = centred ? AIM_VARIANTS.map(([vp, vq, vw, vf], k) => buildEntry(a, b, vp, vq, k + 1, vw, vf)) : []
   /** Bit v set where variant v does NOT have cell (ax, az) among its first `upTo(v)` cells. */
   const avoiders = (ax: number, az: number, upTo: (v: ParkourExtEntry) => number): number => {
@@ -378,7 +432,10 @@ function buildEntry (a: number, b: number, pOff = 0, qOff = 0, aimIndex = 0, wOf
     pts: pts.flat(),
     avoid,
     lineAvoid: new Array<number>(cells.length / 2).fill(0),
-    variants
+    variants,
+    headCells,
+    headIn,
+    headOut
   }
 }
 
@@ -438,7 +495,11 @@ export function serializeParkourTable (
   const cellsLen = entries.reduce((n, e) => n + e.cells.length, 0)
   const intCount = 5 + entries.length * 8 + cellsLen + cellsLen
   const f64Off = Math.ceil((intCount * 4) / 8) * 8
-  const buf = new ArrayBuffer(f64Off + 8 * (150 + entries.length * 13 + cellsLen * 3))
+  // (the lid model's tail, all f64: J_LID8/13/3 rows, FLIGHT_ROW's curves
+  // with their lengths, each entry's head cells with their path spans)
+  const flightLen = FLIGHT_ROW.reduce((n, c) => n + c.length, 0)
+  const headLen = entries.reduce((n, e) => n + 1 + (e.headCells.length / 2) * 4, 0)
+  const buf = new ArrayBuffer(f64Off + 8 * (150 + entries.length * 13 + cellsLen * 3 + 210 + FLIGHT_ROW.length + flightLen + headLen))
   const view = new DataView(buf)
   let o = 0
   const i32 = (v: number): void => { view.setInt32(o, v, true); o += 4 }
@@ -467,5 +528,12 @@ export function serializeParkourTable (
   for (const e of entries) for (const v of e.mfLowRun) f64(v)
   for (const e of entries) for (const v of e.mfLip) f64(v)
   for (const e of entries) for (const v of e.mfLowLip) f64(v)
+  for (const rows of [J_LID8_RUN, J_LID13_RUN, J_LID3_RUN]) for (const row of rows) for (const v of row) f64(v)
+  for (const c of FLIGHT_ROW) f64(c.length)
+  for (const c of FLIGHT_ROW) for (const v of c) f64(v)
+  for (const e of entries) {
+    f64(e.headCells.length / 2)
+    for (let h = 0; h * 2 < e.headCells.length; h++) { f64(e.headCells[h * 2]); f64(e.headCells[h * 2 + 1]); f64(e.headIn[h]); f64(e.headOut[h]) }
+  }
   return buf
 }

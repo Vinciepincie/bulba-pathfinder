@@ -1,12 +1,15 @@
 // Guards the pasted physics constants in src/parkourEnvelope.ts and the
 // generated offset table in src/parkourTable.ts.
 import { expect } from 'chai'
+import { runTakeoffLid, runCurveLid, TOP_SLAB as LID_TOP_SLAB, TOP_TRAPDOOR as LID_TOP_TRAPDOOR, STONE } from './helpers/lidEnvelope.js'
+import type { Lid } from './helpers/lidEnvelope.js'
 import { deriveJumpEnvelope, measureFlightCurve, measureSlimeBounce, measureChainTakeoff, measureRunTakeoff, BOUNCE_MAX_DROP as HELPER_BOUNCE_MAX, RUN_LENGTHS as HELPER_RUN_LENGTHS } from './helpers/jumpEnvelope.js'
 import {
   J_STANDING, J_RUNNING, J_LOW_STANDING, J_LOW_RUNNING, J_CHAIN, J_RUN, J_LOW_RUN, RUN_LENGTHS, runRow, reachBucket, ENVELOPE_BUCKETS,
   FLIGHT_STANDING, FLIGHT_RUNNING, FLIGHT_LOW_STANDING, FLIGHT_LOW_RUNNING,
   feetAt, flightNeeded, takeoffStand, takeoffRun,
-  BOUNCE_APEX, BOUNCE_MAX_DROP, TAKEOFF_STAND, TAKEOFF_NARROW_MARGIN, LAND_HALF, LAND_NARROW_MARGIN
+  BOUNCE_APEX, BOUNCE_MAX_DROP, TAKEOFF_STAND, TAKEOFF_NARROW_MARGIN, LAND_HALF, LAND_NARROW_MARGIN,
+  J_LID8_RUN, J_LID13_RUN, J_LID3_RUN, FLIGHT_ROW, FREE_APEX
 } from '../src/parkourEnvelope.js'
 import { CATCH_HALF, topCatchClass, carryCode, carrySide, carryTouch, CARRY_WIDE, CARRY_W_NONE, CARRY_E_NONE, CARRY_N_NONE, CARRY_S_NONE, CARRY_LINE_X, CARRY_LINE_Z } from '../src/shapes.js'
 import { Block, mcData } from './helpers/voxelWorld.js'
@@ -36,6 +39,25 @@ describe('parkour reach envelope', function () {
     // +1 landings are impossible under a 2-high lid (sentinel row ≤ 0).
     expect(J_LOW_STANDING[reachBucket(1)]).to.be.at.most(0)
     expect(J_LOW_RUNNING[reachBucket(1)]).to.be.at.most(0)
+  })
+
+  it('lid rows (top slab, top trapdoor, a 3-high roof) and the free flights match a fresh prismarine derivation', () => {
+    // the lid model's generator: measureRunTakeoff with the ceiling a parameter
+    for (let r = 0; r < RUN_LENGTHS.length; r++) {
+      const rows: Array<[ReadonlyArray<readonly number[]>, Lid | null, string]> = [
+        [J_RUN, null, 'free'], [J_LOW_RUN, { y: 3, state: STONE }, 'stone'],
+        [J_LID8_RUN, { y: 3, state: LID_TOP_SLAB }, 'top slab'], [J_LID13_RUN, { y: 3, state: LID_TOP_TRAPDOOR }, 'top trapdoor'],
+        [J_LID3_RUN, { y: 4, state: STONE }, '3-high']
+      ]
+      for (const [table, lid, label] of rows) {
+        const row = runTakeoffLid(RUN_LENGTHS[r], lid)
+        for (let i = 0; i < ENVELOPE_BUCKETS; i++) expect(table[r][i]).to.be.closeTo(row[i], 1e-12, `${label} run ${RUN_LENGTHS[r]} bucket ${i}`)
+      }
+      const curve = runCurveLid(RUN_LENGTHS[r], null)
+      expect(FLIGHT_ROW[r].length).to.equal(curve.length)
+      for (let k = 0; k < curve.length; k++) expect(FLIGHT_ROW[r][k]).to.be.closeTo(curve[k], 1e-12, `flight row ${r} [${k}]`)
+    }
+    expect(FREE_APEX).to.equal(Math.max(...FLIGHT_ROW[0].filter((_, k) => k % 2 === 1)))
   })
 
   it('run-length rows match a fresh prismarine-physics derivation exactly', () => {
