@@ -11,9 +11,8 @@ import type { SnapshotMeta } from './types.js'
 
 /**
  * An entity weight that makes a cell impassable to both cores (each refuses a
- * cell weighing over 100): a banned landing - a take-off the executor could
- * not fly (plugin.ts banTakeoff), a planner jump no rest on its take-off
- * flies (hopPipeline.ts verifiedFollowUp).
+ * cell weighing over 100): a banned landing, a take-off the executor could
+ * not fly (plugin.ts banTakeoff).
  */
 export const BAN_WEIGHT = 200
 

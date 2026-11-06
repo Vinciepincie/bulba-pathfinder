@@ -16,7 +16,6 @@ import { HopOracle } from '../hopOracle.js'
 import { MoveGen, MOM_NONE } from '../moveGen.js'
 import { LutFlags } from '../types.js'
 import { stitchHops, streamablePrefix } from '../hopPipeline.js'
-import { BAN_WEIGHT } from '../snapshot.js'
 import { simTablesFromLut, setVanillaJump } from '../playerSim.js'
 import type { SimWorld } from '../playerSim.js'
 import type { RawSolveResult } from '../solver.js'
@@ -112,11 +111,13 @@ if (process.env.PF_NO_WASM !== '1') {
   }, () => {})
 }
 
-/** `a` with `v` appended (a snapshot's entity arrays, a pipeline ban). */
-function appended (a: Int32Array, v: number): Int32Array {
-  const out = new Int32Array(a.length + 1)
-  out.set(a)
-  out[a.length] = v
+/** Banned move pairs `a` with (from, to) appended (SnapshotView.bannedEdges: a pipeline ban). */
+function withEdge (a: Int32Array | null | undefined, from: number, to: number): Int32Array {
+  const n = a != null ? a.length : 0
+  const out = new Int32Array(n + 2)
+  if (a != null) out.set(a)
+  out[n] = from
+  out[n + 1] = to
   return out
 }
 
@@ -175,11 +176,32 @@ function hopPipeline (
   reached: (x: number, y: number, z: number) => boolean,
   postPartial: (partial: RawSolveResult) => void,
   snap: ConstructorParameters<typeof MoveGen>[0],
-  ban: (idx: number) => void
+  banEdge: (from: number, to: number) => void
 ): RawSolveResult | null {
-  if (first.status !== 'noPath' && first.status !== 'timeout') return null
+  const r = hopPipelineRun(msg, first, cancelFlag, solveFrom, reached, postPartial, snap, banEdge)
+  // (nothing stitched: the first search as the pipeline verified it, its bans kept - hopPipeline.ts verifiedPath)
+  return r.stitched ?? r.verifiedFirst
+}
+
+function hopPipelineRun (
+  msg: SolveMessage,
+  first: RawSolveResult,
+  cancelFlag: Int32Array,
+  solveFrom: (start: { x: number, y: number, z: number }, timeoutMs: number, goal?: GoalDescriptor) => RawSolveResult,
+  reached: (x: number, y: number, z: number) => boolean,
+  postPartial: (partial: RawSolveResult) => void,
+  snap: ConstructorParameters<typeof MoveGen>[0],
+  banEdge: (from: number, to: number) => void
+): { stitched: RawSolveResult | null, verifiedFirst: RawSolveResult | null } {
+  let verifiedFirst: RawSolveResult | null = null
+  const none = { stitched: null, verifiedFirst: null }
+  if (first.status !== 'noPath' && first.status !== 'timeout') return none
   const oracle = makeOracle(msg)
-  if (oracle === null) return null
+  if (oracle === null) return none
+  // (a cancelled solve's pipeline gives up at once: its result would be dropped,
+  // and the next solve waits behind it in this thread - PF_PIPE_ABORT=0 for A/B)
+  const abortOn = process.env.PF_PIPE_ABORT !== '0'
+  if (abortOn) oracle.abort = () => Atomics.load(cancelFlag, 0) !== 0
   // A partial path that ends against the box's own faces was stopped by the
   // box, not the terrain: growth first, or the discovery spends its share of
   // the budget from the edge of a box that is simply too small (climb1's
@@ -192,9 +214,9 @@ function hopPipeline (
   if (process.env.PF_HOP_DEBUG === '1') {
     console.warn(`[hops] ${first.status} from ${msg.start.x},${msg.start.y},${msg.start.z} visited ${first.visitedNodes}: ${skip === '' ? 'pipeline' : 'skipped (' + skip + ')'}`)
   }
-  if (skip !== '') return null
+  if (skip !== '') return none
   const evaluator = fastEvaluator(msg.goal)
-  if (evaluator === null) return null
+  if (evaluator === null) return none
   const g = msg.goal as { x?: unknown, y?: unknown, z?: unknown }
   const goalCell = typeof g.x === 'number' && typeof g.y === 'number' && typeof g.z === 'number'
     ? { x: Math.floor(g.x), y: Math.floor(g.y), z: Math.floor(g.z) }
@@ -225,6 +247,12 @@ function hopPipeline (
     reached,
     goal: goalCell,
     deadline: performance.now() + msg.timeout,
+    onVerifiedFirst: (r) => { verifiedFirst = r },
+    ...(abortOn ? { cancelled: () => Atomics.load(cancelFlag, 0) !== 0 } : {}),
+    // (the bot goes on along the verified legs while the pipeline runs: plugin.ts STREAM_STITCH)
+    ...(process.env.PF_STREAM_STITCH !== '0'
+      ? { onStitched: (path: typeof first.path) => { if (Atomics.load(cancelFlag, 0) === 0) postPartial({ ...first, status: 'partial', path }) } }
+      : {}),
     startRest: msg.startPos ?? null,
     // (the cell planner's own edges, for the goal side: hopPipeline.ts goalSide)
     edgesFrom: (x, y, z, out) => {
@@ -232,12 +260,17 @@ function hopPipeline (
       mg.generate(x, y, z, MOM_NONE)
       for (let i = 0; i < mg.outCount; i++) out.push(mg.outX[i], mg.outY[i], mg.outZ[i])
     },
-    // (a planner jump no rest flies: banned for the solves after, hopPipeline.ts verifiedFollowUp)
-    ban: (x, y, z) => {
-      const lx = x - m.x0
-      const ly = y - m.y0
-      const lz = z - m.z0
-      if (lx >= 0 && lx < m.w && ly >= 0 && ly < m.h && lz >= 0 && lz < m.l) ban((ly * m.l + lz) * m.w + lx)
+    // (a planner jump no flight lands: banned for the solves after, hopPipeline.ts verifiedPath)
+    banEdge: (a, b) => {
+      const at = (c: { x: number, y: number, z: number }): number => {
+        const lx = c.x - m.x0
+        const ly = c.y - m.y0
+        const lz = c.z - m.z0
+        return lx >= 0 && lx < m.w && ly >= 0 && ly < m.h && lz >= 0 && lz < m.l ? (ly * m.l + lz) * m.w + lx : -1
+      }
+      const ia = at(a)
+      const ib = at(b)
+      if (ia >= 0 && ib >= 0) banEdge(ia, ib)
     },
     nodeLike: (x, y, z) => {
       const f0 = flagAt(x, y, z)
@@ -246,8 +279,8 @@ function hopPipeline (
         ((fd & LutFlags.SAFE) === 0 || (fd & (LutFlags.PHYSICAL | LutFlags.CLIMBABLE)) !== 0 || (f0 & (LutFlags.CLIMBABLE | LutFlags.LIQUID)) !== 0)
     }
   })
-  if (Atomics.load(cancelFlag, 0) !== 0) return null
-  return stitched
+  if (Atomics.load(cancelFlag, 0) !== 0) return none
+  return { stitched, verifiedFirst }
 }
 
 port.on('message', (msg: InMessage) => {
@@ -298,7 +331,8 @@ port.on('message', (msg: InMessage) => {
         special: msg.specialBuf ? new Uint8Array(msg.specialBuf) : null,
         thin: msg.thinBuf ? new Uint8Array(msg.thinBuf) : null,
         entityIdx: msg.entityIdx,
-        entityWeight: msg.entityWeight
+        entityWeight: msg.entityWeight,
+        bannedEdges: null as Int32Array | null
       }
       const cancelFlag = new Int32Array(msg.cancelBuf)
 
@@ -358,7 +392,8 @@ port.on('message', (msg: InMessage) => {
           const wasmSnap = {
             meta: msg.meta, flags: snap.flags, heights: snap.heights,
             states: msg.statesBuf ? new Uint16Array(msg.statesBuf) : null,
-            special: snap.special, thin: snap.thin, entityIdx: msg.entityIdx, entityWeight: msg.entityWeight
+            special: snap.special, thin: snap.thin, entityIdx: msg.entityIdx, entityWeight: msg.entityWeight,
+            bannedEdges: null as Int32Array | null
           }
           const hops = hopPipeline(msg, result, cancelFlag,
             (start, timeoutMs, goal) => ws.solve(wasmSnap, msg.cfg, goal ?? msg.goal, start, dig ? dig.data : null, {
@@ -366,7 +401,7 @@ port.on('message', (msg: InMessage) => {
             }),
             (x, y, z) => ws.reached(x, y, z),
             (partial) => port.postMessage({ t: 'partial', id: msg.id, result: partial }), snap,
-            (idx) => { wasmSnap.entityIdx = appended(wasmSnap.entityIdx, idx); wasmSnap.entityWeight = appended(wasmSnap.entityWeight, BAN_WEIGHT) })
+            (a, b) => { wasmSnap.bannedEdges = snap.bannedEdges = withEdge(wasmSnap.bannedEdges, a, b) })
           if (hops !== null) { hops.engine = 'wasm'; hops.hops = hops.path.filter(n => n.program !== undefined).length }
           port.postMessage({ t: 'done', id: msg.id, result: hops ?? result })
           return
@@ -409,7 +444,7 @@ port.on('message', (msg: InMessage) => {
           },
           (x, y, z) => lastSolver.reached(x, y, z),
           (partial) => port.postMessage({ t: 'partial', id: msg.id, result: partial }), snap,
-          (idx) => { snap.entityIdx = appended(snap.entityIdx, idx); snap.entityWeight = appended(snap.entityWeight, BAN_WEIGHT) })
+          (a, b) => { snap.bannedEdges = withEdge(snap.bannedEdges, a, b) })
         if (hops !== null) { hops.engine = 'js'; hops.hops = hops.path.filter(n => n.program !== undefined).length }
         port.postMessage({ t: 'done', id: msg.id, result: hops ?? result })
         return

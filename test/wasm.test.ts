@@ -217,7 +217,8 @@ describe('wasm ↔ JS solver differential', function () {
     }
   })
 
-  function solveBoth (world: VoxelWorld, goal: Goal, opts: { canDig?: boolean, doors?: boolean, searchRadius?: number, parkourExtended?: boolean, momentum?: boolean } = {}, start: { x: number, y: number, z: number } = { x: 1, y: 1, z: 1 }): Pair {
+  type Cell = { x: number, y: number, z: number }
+  function solveBoth (world: VoxelWorld, goal: Goal, opts: { canDig?: boolean, doors?: boolean, searchRadius?: number, parkourExtended?: boolean, momentum?: boolean, banned?: Array<[Cell, Cell]> } = {}, start: { x: number, y: number, z: number } = { x: 1, y: 1, z: 1 }): Pair {
     const bot = makeFakeBot(world)
     const overrides: Record<string, unknown> = {}
     if (opts.canDig) overrides.canDig = true
@@ -232,6 +233,8 @@ describe('wasm ↔ JS solver differential', function () {
     const lut = lutFor(bot, movements)
     const needStates = Boolean(opts.canDig)
     const snap = snapshotFromWorld(world, lut, needStates)
+    const bannedEdges = opts.banned !== undefined ? Int32Array.from(opts.banned.flatMap(([a, b]) => [snap.index(a.x, a.y, a.z), snap.index(b.x, b.y, b.z)])) : null
+    ;(snap as { bannedEdges?: Int32Array | null }).bannedEdges = bannedEdges
     const digData = opts.canDig ? computeDigData(bot as never, movements, lut) : null
     const digCtx = opts.canDig
       ? { data: digData!, states: snap.allocStates(), breakExclusion: null }
@@ -257,7 +260,8 @@ describe('wasm ↔ JS solver differential', function () {
         special: snap.special,
         thin: snap.thin,
         entityIdx: snap.entityIdx,
-        entityWeight: snap.entityWeight
+        entityWeight: snap.entityWeight,
+        bannedEdges
       },
       movements.toConfig(),
       descriptor!,
@@ -325,6 +329,97 @@ describe('wasm ↔ JS solver differential', function () {
     assertIdentical(solveBoth(world, new GoalBlock(9, 2, 8), { momentum: true }), 'ext course momentum')
     // Flag off: both must agree it is unreachable.
     assertIdentical(solveBoth(world, new GoalBlock(9, 2, 8)), 'ext course flag off')
+  })
+
+  it('banned edges: a banned move is never taken, its cells stay open, the same in both engines', () => {
+    const world = new VoxelWorld({ x0: 0, y0: -2, z0: 0, x1: 12, y1: 8, z1: 12 })
+    world.set(1, 0, 1, STONE)
+    world.set(3, 0, 2, STONE)
+    world.set(5, 0, 4, STONE)
+    world.set(7, 1, 5, STONE)
+    world.set(9, 0, 6, STONE)
+    world.set(9, 1, 8, LADDER)
+    world.set(9, 2, 8, LADDER)
+    world.fill(9, 1, 9, 9, 2, 9, STONE)
+    const goal = new GoalBlock(9, 2, 8)
+    const free = solveBoth(world, goal, { parkourExtended: true })
+    expect(free.js.status).to.equal('success')
+    // the path's first jump, banned
+    const at = free.js.path.findIndex(n => n.parkour === true)
+    expect(at).to.be.at.least(0)
+    const from: Cell = at === 0 ? { x: 1, y: 1, z: 1 } : free.js.path[at - 1]
+    const to: Cell = free.js.path[at]
+    const pair = solveBoth(world, goal, { parkourExtended: true, banned: [[from, to]] })
+    assertIdentical(pair, 'banned jump')
+    const steps = (r: RawSolveResult): string[] => {
+      const out: string[] = []
+      let p: Cell = { x: 1, y: 1, z: 1 }
+      for (const n of r.path) { out.push(`${p.x},${p.y},${p.z}>${n.x},${n.y},${n.z}`); p = n }
+      return out
+    }
+    const key = `${from.x},${from.y},${from.z}>${to.x},${to.y},${to.z}`
+    expect(steps(pair.js)).to.not.include(key)
+    expect(pathKey(pair.js)).to.not.equal(pathKey(free.js))
+    // the landing cell itself is still a goal the planner can reach (only the move is gone)
+    const toCell = solveBoth(world, new GoalBlock(to.x, to.y, to.z), { parkourExtended: true, banned: [[from, to]] })
+    assertIdentical(toCell, 'banned jump, its landing as goal')
+    // random worlds: the first move of each path banned, both engines alike
+    for (let i = 0; i < 12; i++) {
+      const seed = 9100 + i
+      const w = genWorld(seed)
+      const rand = mulberry32(seed * 3 + 7)
+      const gx = 4 + Math.floor(rand() * 18)
+      const gz = 4 + Math.floor(rand() * 18)
+      w.set(gx, 0, gz, STONE)
+      w.fill(gx, 1, gz, gx, 2, gz, AIR)
+      const g = new GoalBlock(gx, 1, gz)
+      const open = solveBoth(w, g, { parkourExtended: true })
+      if (open.js.path.length === 0) continue
+      const ban: [Cell, Cell] = [{ x: 1, y: 1, z: 1 }, open.js.path[0]]
+      const banned = solveBoth(w, g, { parkourExtended: true, banned: [ban] })
+      assertIdentical(banned, `seed ${seed} banned first move`)
+      expect(steps(banned.js)[0] ?? '').to.not.equal(`1,1,1>${ban[1].x},${ban[1].y},${ban[1].z}`)
+    }
+  })
+
+  it('a diagonal past a fire\'s corner is not taken in the extended profile, past a fence post it is, the same in both engines', () => {
+    const FIRE = mcData.blocksByName.fire.minStateId as number
+    const corner = (st: number): VoxelWorld => {
+      const w = new VoxelWorld({ x0: 0, y0: -2, z0: 0, x1: 5, y1: 5, z1: 5 })
+      w.fill(1, 0, 1, 3, 0, 3, STONE)
+      w.set(1, 1, 2, st)
+      return w
+    }
+    const firstStep = (r: RawSolveResult): string => r.path.length > 0 ? `${r.path[0].x},${r.path[0].y},${r.path[0].z}` : ''
+    const goal = new GoalBlock(2, 1, 2)
+    // upstream mode stays exact: the diagonal past the fire, as upstream takes it
+    const upstream = solveBoth(corner(FIRE), goal)
+    assertIdentical(upstream, 'fire corner, upstream')
+    expect(firstStep(upstream.js)).to.equal('2,1,2')
+    // extended: round the fire's corner, not through it
+    const ext = solveBoth(corner(FIRE), goal, { parkourExtended: true })
+    assertIdentical(ext, 'fire corner, extended')
+    expect(ext.js.status).to.equal('success')
+    expect(firstStep(ext.js)).to.equal('2,1,1')
+    // a fence post's box turns the body off it: the diagonal stands
+    const fence = solveBoth(corner(OAK_FENCE_DRY), goal, { parkourExtended: true })
+    assertIdentical(fence, 'fence corner, extended')
+    expect(firstStep(fence.js)).to.equal('2,1,2')
+  })
+
+  it('of two lines that cost the same, the extended planner takes the one off a fire, the same in both engines', () => {
+    const FIRE = mcData.blocksByName.fire.minStateId as number
+    // a two-wide lane (x 1..2), a fire beside its x=1 side at z 3; start on x=1, goal on x=2:
+    // where the one diagonal step goes is a tie, but cells beside the fire are dearer
+    const w = new VoxelWorld({ x0: -2, y0: -2, z0: -2, x1: 5, y1: 5, z1: 9 })
+    w.fill(0, 0, 0, 3, 0, 7, STONE)
+    w.set(0, 1, 3, FIRE)
+    const goal = new GoalBlock(2, 1, 7)
+    const ext = solveBoth(w, goal, { parkourExtended: true }, { x: 1, y: 1, z: 0 })
+    assertIdentical(ext, 'fire beside the lane, extended')
+    expect(ext.js.status).to.equal('success')
+    const beside = ext.js.path.filter(n => n.x === 1 && n.z >= 2 && n.z <= 4)
+    expect(beside.map(n => `${n.x},${n.z}`), 'no cell beside the fire').to.deep.equal([])
   })
 
   it('ladder-top take-offs and lava-flanked landings identical', () => {

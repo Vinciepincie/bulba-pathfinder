@@ -9,11 +9,11 @@ import { Vec3 } from 'vec3'
 import { carryCode, CARRY_W_NONE, CARRY_S_NONE } from './shapes.js'
 import { PlayerSim, SIM, newBody, simTablesFromLut, setVanillaJump } from './playerSim.js'
 import type { SimBody, SimGrid, SimWorld } from './playerSim.js'
-import { gaitSearch, kWalkable, GRAZE_YAW, HOP_MAX_DIP, EASE_NEVER, GAIT_CATCH } from './gaitSearch.js'
+import { gaitSearch, kWalkable, GRAZE_YAW, HOP_MAX_DIP, EASE_NEVER, GAIT_CATCH, HURT_TICKS } from './gaitSearch.js'
 import type { GaitNode, GaitPick } from './gaitSearch.js'
 import type { GaitDrive } from './types.js'
 import type { BlockLut } from './lut.js'
-import { HopOracle } from './hopOracle.js'
+import { HopOracle, ONE_FLIGHT_REACH, LANE_KICK_TICKS } from './hopOracle.js'
 import type { HopProgram } from './hopOracle.js'
 
 /** prismarine-physics' sprinting modifier id (index.js physics.sprintingUUID). */
@@ -156,6 +156,131 @@ const CATCH_CLIMB = 2
  * timer catches the backlog up (four ticks a callback), decision for decision.
  */
 const LIVE_FLOOR_TICKS_PER_MS = 300
+/** Kernel work the beam gets of its own in the lined search at a stuck take-off (linedVerdict). */
+const LINED_BEAM_TICKS = process.env.PF_LINED_GIVEUP === '0' ? 0 : 150_000
+/**
+ * A live search's seed family (the plan's kick or pivot: no family of the live
+ * set) gets this much kernel work of its own (HopOracle.hopFrom `seed`). Offline
+ * at the traced states: a pivot 13t at 96k (arena mcc-7-1), 23t at 53k
+ * (mcc-8-2), a kick 17t at 78k (mcc-8-2) and 44k (mcc-6-2).
+ */
+const SEED_FAMILY_TICKS = 150_000
+/** PF_SEED_FAMILY=0: no seed family at all (live searches, skip-ahead: A/B). */
+export const SEED_FAMILY = process.env.PF_SEED_FAMILY !== '0'
+/** A kick or pivot plan's seed families for a live search to its node: its own first, then the other; none for any other plan. */
+export function seedFamilies (p: HopProgram): Array<'kick' | 'pivot'> | undefined {
+  if (p.seq !== undefined) return undefined
+  if (p.family === 'kick') return ['kick', 'pivot']
+  if (p.family === 'pivot') return ['pivot', 'kick']
+  return undefined
+}
+/** PF_SKIP_PLAN_LEG=0: the skip-ahead prices the plan's leg by the floor alone, not its program's ticks (A/B). */
+const SKIP_PLAN_LEG = process.env.PF_SKIP_PLAN_LEG !== '0'
+/**
+ * The skip-ahead (PhysicsSim.skipAhead, plugin.ts SKIP_AHEAD): past at most
+ * SKIP_NODES nodes to the one a program leaves for, within SKIP_RISE above
+ * and SKIP_DROP below the body; the search on SKIP_TICKS of kernel work, a
+ * program of SKIP_MAX_TICKS at the most, taken when SKIP_MARGIN ticks or more
+ * under the plan. The leg floor (legFloor) counts SKIP_REACH_FREE blocks of a
+ * flight as free and the rest at SKIP_SPEED_MAX a tick.
+ */
+const SKIP_NODES = 2
+const SKIP_RISE = 1.25
+const SKIP_DROP = 6
+const SKIP_TICKS = 100_000
+const SKIP_MAX_TICKS = 30
+const SKIP_MARGIN = 1
+const SKIP_REACH_FREE = 1.8
+const SKIP_SPEED_MAX = 0.5
+/**
+ * ...and at a neo (PhysicsSim.skipNeo, plugin.ts SKIP_NEO): the beam too, on
+ * SKIP_NEO_TICKS of work on the arrival, SKIP_NEO_REST_TICKS from the braked
+ * rest. Arena opk-2's flight round both panes: 375-417k ticks from the
+ * arrival (17 ticks), 597k from the rest (18); a long tick costs no ticks.
+ */
+const SKIP_NEO_TICKS = 500_000
+const SKIP_NEO_REST_TICKS = 800_000
+/**
+ * ...and over walk nodes (PhysicsSim.skipWalk, plugin.ts SKIP_WALK): to the
+ * first jump at most SKIP_WALK_NODES nodes on, where the walk there is at
+ * least SKIP_WALK_DETOUR blocks longer than the straight line (a path that
+ * walks aside to jump: on a straight one the gait's own hops are the flight).
+ */
+const SKIP_WALK_NODES = 3
+const SKIP_WALK_DETOUR = 0.5
+const f2 = (v: number): string => Number.isInteger(v) ? String(v) : v.toFixed(2)
+
+/**
+ * The least a flight from `from` to node `to` can take, in ticks: the rise
+ * or fall between their levels (a standing jump flown in the kernel at
+ * `from`, under whatever roof is there; a walk-off where `to` is lower, if
+ * sooner), and the ground between them at the most a tick a flight covers.
+ * A floor, not an estimate: the skip-ahead takes a program only when it
+ * beats the plan's leg flown at that floor (SKIP_AHEAD).
+ */
+export function legFloor (k: PlayerSim, from: { x: number, y: number, z: number }, to: { x: number, y: number, z: number }): number {
+  const d = Math.hypot(to.x - from.x, to.z - from.z)
+  const horizontal = Math.max(0, d - SKIP_REACH_FREE) / SKIP_SPEED_MAX
+  const dy = to.y - from.y
+  // the rise: a standing jump in the kernel (a roof cuts it short), to its
+  // apex - at `from` and at every half block of the way to `to`, the lowest
+  // apex soonest: a flight passes under each of those roofs, and one over the
+  // gap cuts its arc where the jump at `from` has open sky
+  const c = { forward: false, back: false, left: false, right: false, jump: true, sprint: false, sneak: false, hx: 0, hz: -1 }
+  // (where a body at `from`'s level fits at all: a point inside the riser the way climbs is no roof)
+  const hw = k.halfWidth
+  const fits = (x: number, z: number): boolean => {
+    const n = k.boxesIn(x - hw, from.y, z - hw, x + hw, from.y + k.height, z + hw)
+    const buf = k.scratchBoxes
+    for (let j = 0; j < n; j++) {
+      const o = j * 6
+      if (buf[o] < x + hw - 1e-7 && buf[o + 3] > x - hw + 1e-7 && buf[o + 2] < z + hw - 1e-7 && buf[o + 5] > z - hw + 1e-7 &&
+          buf[o + 1] < from.y + k.height - 1e-7 && buf[o + 4] > from.y + 1e-7) return false
+    }
+    return true
+  }
+  let apex = Infinity
+  let up = 0
+  const steps = Math.max(1, Math.ceil(d / 0.5))
+  for (let s = 0; s <= steps; s++) {
+    const f = s / steps
+    const bx = from.x + (to.x - from.x) * f
+    const bz = from.z + (to.z - from.z) * f
+    if (s > 0 && !fits(bx, bz)) continue
+    const b = newBody(bx, from.y, bz)
+    b.onGround = true
+    c.jump = true
+    let top = from.y
+    let at = 0
+    for (let t = 1; t <= 20; t++) {
+      k.step(b, c)
+      c.jump = false
+      if (b.inLiquid) break
+      if (b.y > top + 1e-9) { top = b.y; at = t }
+      if (b.vy <= 0) break
+    }
+    if (top < apex - 1e-9 || (Math.abs(top - apex) <= 1e-9 && at < up)) { apex = top; up = at }
+  }
+  // ...then down from it through free air to `to`'s level (none: higher than the jump reaches)
+  const fallTicks = (drop: number): number => {
+    if (drop < 0) return Infinity
+    let y = 0
+    let vy = 0
+    for (let t = 1; t <= 80; t++) {
+      vy = (vy - SIM.gravity) * SIM.airdrag
+      y += vy
+      if (y <= -drop) return t
+    }
+    return Infinity
+  }
+  const jump = up + fallTicks(apex - to.y)
+  // ...or walked off, where `to` is lower at all (a slab half a block down across a gap is run off)
+  const fall = dy < -1e-9 ? fallTicks(-dy) : Infinity
+  const vertical = Math.min(jump, fall)
+  if (!Number.isFinite(vertical)) return Infinity
+  return Math.ceil(Math.max(vertical, horizontal))
+}
+
 const NO_DRIVE: GaitDrive = { kind: 'none', flight: null, strafe: false, ease: EASE_NEVER, yaw: 0, sprint: false }
 
 export class PhysicsSim {
@@ -1136,9 +1261,11 @@ export class PhysicsSim {
     // refused gate jumps broke arena mcc-4-1/5-2/7-3). The legacy gate caught
     // mcc-4-1's ladders on the first tick it could, 0.44 above their foot;
     // the kernel's catches are 1.9-2.6 above it (driveSim: -40 ticks).
+    let caught = false
     if (GAIT_CATCH && r.hop === Infinity && r.run === Infinity) {
       const c = this.catchWindow(nodes)
       if (c !== null) {
+        caught = true
         const w0 = r.work
         const cut = nodes.slice(0, c.cut)
         this.gaitPick.round = round
@@ -1161,10 +1288,13 @@ export class PhysicsSim {
     const hop = r.hop !== Infinity && r.run === Infinity
     const step = r.run !== Infinity ? r.step : null
     const run = step !== null
+    // (what the search knew: the skip-ahead's comparison, plugin.ts SKIP_AHEAD)
+    const facts = { ticks: Math.min(r.hop, r.run), cut: !caught && nodes.length < path.length && stoodAt(nodes.length) ? nodes.length : -1, goal: r.goal, goalLast: r.goalLast, work: r.work }
     const f = (v: number): string => v === Infinity ? '-' : Number.isInteger(v) ? String(v) : v.toFixed(2)
-    this.hopJumpNote = `${hop ? 'hop' : run ? 'run' : 'none'} h${f(r.hop)} r${f(r.run)} n${nodes.length} w${r.work}${r.spent ? ' spent' : ''}`
-    if (hop) return { kind: 'hop', flight: r.flight, strafe: r.strafe, ease: r.ease, yaw: r.flight[0], sprint: true }
-    if (step !== null) return { kind: 'run', flight: null, strafe: step.strafe, ease: EASE_NEVER, yaw: step.yaw, sprint: step.sprint }
+    // (n: the window's nodes, 's' when its last is stood on; g: the goal the search ended at, 'L' when arrived at)
+    this.hopJumpNote = `${hop ? 'hop' : run ? 'run' : 'none'} h${f(r.hop)} r${f(r.run)} n${nodes.length}${stoodAt(nodes.length) ? 's' : ''} g${r.goal}${r.goalLast ? 'L' : ''} w${r.work}${r.spent ? ' spent' : ''}`
+    if (hop) return { kind: 'hop', flight: r.flight, strafe: r.strafe, ease: r.ease, yaw: r.flight[0], sprint: true, ...facts }
+    if (step !== null) return { kind: 'run', flight: null, strafe: step.strafe, ease: EASE_NEVER, yaw: step.yaw, sprint: step.sprint, ...facts }
     // no way there from here: not asked again for a few ticks (near a jump
     // only the oracle flies, that is every tick)
     this.gaitDead = path[0]
@@ -1286,17 +1416,213 @@ export class PhysicsSim {
    * now (HopOracle.hopFrom: every family, walking jumps too, the quickest
    * robust one), or null. Grounded bodies only.
    */
-  hopFrom (cell: readonly [number, number, number], budgetTicks: number, land?: { x: number, y: number, z: number }, next?: readonly [number, number, number]): HopProgram | null {
+  hopFrom (cell: readonly [number, number, number], budgetTicks: number, land?: { x: number, y: number, z: number }, next?: readonly [number, number, number], beam = true,
+    seed?: ReadonlyArray<'kick' | 'pivot'>, seedFirst = true, hint?: HopProgram): HopProgram | null {
     const t0 = performance.now()
     const o = this.liveOracle()
     if (o === null) { this.hopNote = 'n/a'; return null }
     o.tickLimit = budgetTicks
+    // (seed families on a budget of their own, the clock's cap grown with it: HopOracle.hopFrom, SEED_FAMILY_TICKS)
+    const seedTicks = seed !== undefined && seed.length > 0 ? SEED_FAMILY_TICKS : 0
+    const laneTicks = hint?.family === 'kick' ? LANE_KICK_TICKS : 0
     // (a region program's live search lands in its place: HopProgram.land)
     // (and the node after: the landing that leaves the quickest next leg, HopOracle.nextLegPick)
-    const found = o.hopFrom(this.kBodyNow(), [cell[0], cell[1], cell[2]], t0 + budgetTicks / LIVE_FLOOR_TICKS_PER_MS, this.bot.entity.yaw, land, next !== undefined ? [next[0], next[1], next[2]] : undefined)
-    this.hopNote = `from ${found !== null ? `${found.family} ${found.ticks}t` : 'none'} ${(performance.now() - t0).toFixed(0)}ms ${Math.round(o.ticksFlown / 1000)}k`
+    const found = o.hopFrom(this.kBodyNow(), [cell[0], cell[1], cell[2]], t0 + (budgetTicks + seedTicks + laneTicks) / LIVE_FLOOR_TICKS_PER_MS, this.bot.entity.yaw, land,
+      next !== undefined ? [next[0], next[1], next[2]] : undefined, beam, seed, seedTicks, seedFirst, hint)
+    this.hopNote = `from ${found !== null ? `${found.family} ${found.ticks}t` : 'none'}${seedTicks > 0 ? ` +${seed!.join('+')}` : ''} ${(performance.now() - t0).toFixed(0)}ms ${Math.round(o.ticksFlown / 1000)}k`
     return found
   }
+
+  /**
+   * A LIVE program onto stone `cell` from the body as it is, picked for the
+   * leg after it to `next` (HopOracle.hopChain: touch and go, the least total),
+   * or null when no touchdown has a next leg. `nextGo`: the plan goes straight
+   * on from `next` too. Grounded bodies only.
+   */
+  hopChain (cell: readonly [number, number, number], next: readonly [number, number, number], budgetTicks: number, nextGo = false): HopProgram | null {
+    const t0 = performance.now()
+    const o = this.liveOracle()
+    if (o === null) { this.hopNote = 'n/a'; return null }
+    o.tickLimit = budgetTicks
+    const found = o.hopChain(this.kBodyNow(), [cell[0], cell[1], cell[2]], [next[0], next[1], next[2]], t0 + budgetTicks / LIVE_FLOOR_TICKS_PER_MS, this.bot.entity.yaw, nextGo)
+    this.hopNote = `chain ${found !== null ? `${found.family} ${found.ticks}t` : 'none'} ${(performance.now() - t0).toFixed(0)}ms ${Math.round(o.ticksFlown / 1000)}k`
+    return found
+  }
+
+  /** Did the last skipAhead() fly a search (and so spend one of its node's tries)? */
+  skipSearched = false
+
+  /**
+   * Skip-ahead (plugin.ts SKIP_AHEAD): the gait's window stopped at node
+   * s = path[c - 1], because a planned program (or a neo) leaves from it for
+   * M = path[c]. A live program from the body as it is straight to M, when one
+   * flies quicker than the gait's way to s (`drive.ticks`) plus the least the
+   * plan's leg from s to M can take (legFloor) - one robust flight that comes
+   * down on M itself (HopOracle.singleFlight), families only, on SKIP_TICKS of
+   * kernel work. Arena opk2-1: from the moving body on the 969 post the oracle
+   * flies the cave moss in 9 ticks; the bot hopped to the 967 post, lined up 3
+   * ticks and flew the planned 12-tick program, about 7 ticks lost.
+   */
+  skipAhead (path: ReadonlyArray<GaitNode>, drive: GaitDrive): { program: HopProgram, cut: number } | null {
+    this.skipSearched = false
+    const c = drive.cut ?? -1
+    if (c < 1 || c > SKIP_NODES || c >= path.length || drive.goal !== c - 1 || drive.goalLast !== true) return null
+    const t0 = drive.ticks ?? Infinity
+    if (!Number.isFinite(t0)) return null
+    return this.skipTo(path, c, t0, path[c - 1], SKIP_TICKS, false)
+  }
+
+  /**
+   * Skip-ahead at a neo (plugin.ts SKIP_NEO): the body at the take-off of
+   * neo s = path[0], whose live program flies it there in `t0` ticks. A live
+   * program straight to M = path[1] instead, when one beats t0 plus the least
+   * the leg from s (its cell's centre: a neo's node hangs off it) to M can
+   * take - with the beam, whose detour field ranks the way round what the
+   * neos wrap (hopOracle.ts BEAM_DETOUR). Arena opk-2: two neos round two
+   * panes, 18 and 13 ticks with a landing between, where one flight round
+   * both comes down in 17.
+   */
+  skipNeo (path: ReadonlyArray<GaitNode>, t0: number, rest: boolean): { program: HopProgram, cut: number } | null {
+    this.skipSearched = false
+    if (path.length < 2 || !Number.isFinite(t0)) return null
+    const s = path[0] as GaitNode & { cell?: [number, number, number] }
+    const from = s.cell !== undefined ? { x: s.cell[0] + 0.5, y: s.y, z: s.cell[2] + 0.5 } : s
+    return this.skipTo(path, 1, t0, from, rest ? SKIP_NEO_REST_TICKS : SKIP_NEO_TICKS, true)
+  }
+
+  /**
+   * Skip-ahead over walk nodes (plugin.ts SKIP_WALK): path[0..c-1] walked (no
+   * jump asked for them), M = path[c] the first jump, the walk there a detour
+   * on the straight line. The gait's own way to M - its search with M the
+   * path's end, the body down in M's cell - against one live flight straight
+   * to M from the body as it is (families only, robust to M itself:
+   * HopOracle.singleFlight). `allowed`: whether M may be tried (the
+   * executor's tries). Arena opk2-1: from the ladder top the path walks a
+   * block aside to jump the +1 diagonal, 19 ticks to M; one flight takes 10.
+   */
+  skipWalk (path: ReadonlyArray<GaitNode>, allowed: (m: GaitNode) => boolean): { program: HopProgram, cut: number } | null {
+    this.skipSearched = false
+    const k = this.getKernel()
+    if (k === null || path.length < 2) return null
+    type Node = GaitNode & { program?: HopProgram | null, chain?: boolean, via?: unknown, wOff?: number, toBreak?: unknown[], toPlace?: unknown[], cell?: [number, number, number] }
+    const b = this.bot.entity.position
+    let c = -1
+    let walk = 0
+    let px = b.x
+    let pz = b.z
+    for (let i = 0; i < Math.min(path.length, SKIP_WALK_NODES + 1); i++) {
+      const n = path[i] as Node
+      if ((n.program !== null && n.program !== undefined) || n.chain === true || (n.via !== null && n.via !== undefined) || (n.wOff !== undefined && n.wOff !== 0)) return null
+      if ((n.toBreak?.length ?? 0) > 0 || (n.toPlace?.length ?? 0) > 0) return null
+      walk += Math.hypot(n.x - px, n.z - pz)
+      px = n.x
+      pz = n.z
+      if (n.parkour === true && !this.walkedJump(k, path, i)) { c = i; break }
+    }
+    if (c < 1) return null
+    const m = path[c] as Node
+    if ((path[c + 1] as Node | undefined)?.chain === true || this.climbableNode(m) || !allowed(m)) return null
+    const direct = Math.hypot(m.x - b.x, m.z - b.z)
+    if (walk - direct < SKIP_WALK_DETOUR || direct > ONE_FLIGHT_REACH || m.y - b.y > SKIP_RISE || b.y - m.y > SKIP_DROP) return null
+    // the gait's own way to M, down in its cell
+    const nodes: GaitNode[] = []
+    for (let i = 0; i <= c; i++) {
+      const n = path[i]
+      nodes.push(i < c && n.parkour === true ? { x: n.x, y: n.y, z: n.z, parkour: true, walked: true } : n)
+    }
+    const round = this.gaitPick.round
+    const r = gaitSearch(k, this.kBodyNow(), nodes, { index: c, last: true, best: true, from: this.gaitFrom, wholeFall: this.wholeFall, strafe: this.gaitStrafe, landRetire: this.gaitLandRetire }, this.gaitPick)
+    this.gaitPick.round = round
+    const t0 = Math.min(r.hop, r.run)
+    // (no flight from here could win: no search)
+    if (!Number.isFinite(t0) || legFloor(k, b, m) + SKIP_MARGIN > t0) return null
+    this.skipSearched = true
+    const cell: [number, number, number] = m.cell ?? [Math.floor(m.x), Math.floor(m.y + 0.001), Math.floor(m.z)]
+    const after = path[c + 1] as Node | undefined
+    const next = after !== undefined && after.parkour === true ? (after.cell ?? [Math.floor(after.x), Math.floor(after.y + 0.001), Math.floor(after.z)]) : undefined
+    const p = this.hopFrom(cell, SKIP_TICKS, undefined, next, false)
+    const note = this.hopNote
+    const o = p !== null ? this.liveOracle() : null
+    const hurt = o !== null && p !== null && o.landingHurts(p, this.wholeFall) ? HURT_TICKS : 0
+    if (p === null || o === null || p.deep === true || p.climb === true || p.precise === true || p.ticks > SKIP_MAX_TICKS || p.ticks + hurt + SKIP_MARGIN > t0) {
+      this.hopNote = `skip walk ${p !== null ? `${p.ticks}t${hurt > 0 ? ' hurt' : ''}` : 'none'} vs ${f2(t0)} (${note})`
+      return null
+    }
+    if (!o.singleFlight(p)) {
+      this.hopNote = `skip walk ${p.ticks}t not one flight (${note})`
+      return null
+    }
+    this.hopNote = `skip walk ${p.ticks}t vs ${f2(t0)} (${note})`
+    return { program: p, cut: c }
+  }
+
+  /** Is node `n` on or at a climbable (a ladder or vine in its cell or the one under it: catchWindow's test)? */
+  private climbableNode (n: { x: number, y: number, z: number }): boolean {
+    return this.ladderOrVine(n.x, n.y + 0.001, n.z) || this.ladderOrVine(n.x, n.y - 0.999, n.z)
+  }
+
+  /**
+   * The skip-ahead's search and verdict (skipAhead, skipNeo): past path[0..c-1]
+   * to M = path[c], from the body as it is, against `t0` ticks to s plus
+   * legFloor(s, M); on `ticks` of kernel work, with the beam or families only.
+   */
+  private skipTo (path: ReadonlyArray<GaitNode>, c: number, t0: number, s: { x: number, y: number, z: number }, ticks: number, beam: boolean): { program: HopProgram, cut: number } | null {
+    type Node = GaitNode & { program?: HopProgram | null, chain?: boolean, via?: unknown, toBreak?: unknown[], toPlace?: unknown[], cell?: [number, number, number] }
+    for (let i = 0; i <= c; i++) {
+      const n = path[i] as Node
+      if (n.chain === true || (n.via !== null && n.via !== undefined)) return null
+      if ((n.toBreak?.length ?? 0) > 0 || (n.toPlace?.length ?? 0) > 0) return null
+    }
+    const m = path[c] as Node
+    if (m.parkour !== true) return null
+    // (a ladder top or a catch: the gait's catch window flies those - a skip landed on a
+    // ladder's plate was retired in the air and the catch branch lost it, arena parkouradv1)
+    if (this.climbableNode(m)) return null
+    // (M a momentum chain's stepping stone: the re-jump on its landing tick is the chain's, set up from the plan's line)
+    if ((path[c + 1] as Node | undefined)?.chain === true) return null
+    const planned = m.program ?? null
+    // (a kick or pivot plan: searched in its own family, SEED_FAMILY - a pivot's
+    // exact line-up is what a skip saves most: arena mcc-7-1, down past the stone
+    // 1.07 from the pivot's start, walked back 4 ticks, lined up 10, pressed 4)
+    const seed = SEED_FAMILY && planned !== null ? seedFamilies(planned) : undefined
+    if (planned !== null && (planned.deep === true || planned.climb === true || (planned.precise === true && seed === undefined) || planned.seq !== undefined || planned.start !== undefined)) return null
+    const b = this.bot.entity.position
+    if (Math.hypot(m.x - b.x, m.z - b.z) > ONE_FLIGHT_REACH || m.y - b.y > SKIP_RISE || b.y - m.y > SKIP_DROP) return null
+    // (on s already: the planned take-off from there is the program branch's)
+    if (Math.floor(b.x) === Math.floor(s.x) && Math.floor(b.z) === Math.floor(s.z) && Math.abs(b.y - s.y) < 0.5) return null
+    const k = this.getKernel()
+    if (k === null) return null
+    // (a kick or pivot plan's leg from s: no quicker than its program, from rest at
+    // its start - the floor alone priced mcc-7-1's 18t pivot, flown after a 14-tick
+    // exact line-up, as a 4-block jump: SKIP_PLAN_LEG. Not for other plans, whose
+    // arrival at s may well find a live flight quicker than the planned one)
+    const leg = SKIP_PLAN_LEG && planned !== null && seed !== undefined ? Math.max(legFloor(k, s, m), planned.ticks) : legFloor(k, s, m)
+    // (no floor to the plan's leg - higher than a standing jump: no skip, it cannot be judged)
+    if (!Number.isFinite(leg)) return null
+    // (no flight from here could win: no search)
+    if (legFloor(k, b, m) + SKIP_MARGIN > t0 + leg) return null
+    this.skipSearched = true
+    const cell: [number, number, number] = m.cell ?? [Math.floor(m.x), Math.floor(m.y + 0.001), Math.floor(m.z)]
+    const after = path[c + 1] as Node | undefined
+    const next = after !== undefined && after.parkour === true ? (after.cell ?? [Math.floor(after.x), Math.floor(after.y + 0.001), Math.floor(after.z)]) : undefined
+    const p = this.hopFrom(cell, ticks, planned?.land, next, beam, seed)
+    const note = this.hopNote
+    const o = p !== null ? this.liveOracle() : null
+    // (a landing that hurts, charged as the gait charges one: HURT_TICKS)
+    const hurt = o !== null && p !== null && o.landingHurts(p, this.wholeFall) ? HURT_TICKS : 0
+    // (a live pivot is flown from the very state it was found from: no line-up to be exact about)
+    if (p === null || o === null || p.deep === true || p.climb === true || (p.precise === true && !SEED_FAMILY) || p.ticks > SKIP_MAX_TICKS || p.ticks + hurt + SKIP_MARGIN > t0 + leg) {
+      this.hopNote = `skip ${p !== null ? `${p.ticks}t${hurt > 0 ? ' hurt' : ''}` : 'none'} vs ${f2(t0)}+${leg} (${note})`
+      return null
+    }
+    if (!o.singleFlight(p)) {
+      this.hopNote = `skip ${p.ticks}t not one flight (${note})`
+      return null
+    }
+    this.hopNote = `skip ${p.ticks}t vs ${f2(t0)}+${leg} (${note})`
+    return { program: p, cut: c }
+  }
+
 
   /**
    * Planned program `prog` to planner node `cell`, re-anchored at the body as
@@ -1322,17 +1648,14 @@ export class PhysicsSim {
     return o.deepVerdict(prog, this.kBodyNow(), t, fired, air, rebounds, this.bot.entity.yaw)
   }
 
-  /**
-   * The exact line-up for precision program `prog` from the body at rest
-   * (HopOracle.lineUp): the yaws of one or two sneaking presses whose coasted
-   * rest re-anchors it, and the program from that rest, or null.
-   */
-  hopLineUp (prog: HopProgram, budgetTicks: number): { yaws: number[], prog: HopProgram } | null {
+  // mcc-7-2's moving line-up keeps the body's velocity; 'tried' distinguishes
+  // a distant or unsafe glide from the approach's one correction search.
+  hopLineUp (prog: HopProgram, budgetTicks: number, moving?: { reach: number, tried: boolean }): { yaws: number[], delay?: number, prog: HopProgram } | null {
     const t0 = performance.now()
     const o = this.liveOracle()
     if (o === null) { this.hopNote = 'n/a'; return null }
     o.tickLimit = budgetTicks
-    const found = o.lineUp(prog, this.kBodyNow(), this.bot.entity.yaw, t0 + budgetTicks / LIVE_FLOOR_TICKS_PER_MS)
+    const found = o.lineUp(prog, this.kBodyNow(), this.bot.entity.yaw, t0 + budgetTicks / LIVE_FLOOR_TICKS_PER_MS, moving)
     this.hopNote = `lineup ${found !== null ? `${found.yaws.length} press` : 'none'} ${(performance.now() - t0).toFixed(0)}ms ${Math.round(o.ticksFlown / 1000)}k`
     return found
   }
@@ -1343,30 +1666,64 @@ export class PhysicsSim {
    * the body up on it first — or null.
    */
   hopLinedUp (cell: readonly [number, number, number], budgetTicks: number): HopProgram | null {
-    const t0 = performance.now()
-    const p = this.bot.entity.position
     const o = this.liveOracle()
-    if (o === null) { this.hopNote = 'n/a'; return null }
+    if (o === null) { this.hopNote = 'n/a'; this.hopExhausted = false; this.hopNoStand = true; return null }
+    return this.linedVerdict(o, this.standCell(o, this.bot.entity.position), cell, budgetTicks, LINED_BEAM_TICKS)
+  }
+
+  /**
+   * The same verdict on planner node `to` from planner node `from`, before
+   * the body is there (plugin.ts NEO_AHEAD): from the take-off cell's own
+   * stands, as hopLinedUp; hopExhausted when every family flew to the end
+   * and none landed. Null without the kernel.
+   */
+  /** `beam`: the beam on its own budget, as at a stuck take-off (a verdict to give it up on, not the look-ahead's). */
+  hopFromCell (from: readonly [number, number, number], to: readonly [number, number, number], budgetTicks: number, beam = false): HopProgram | null {
+    const o = this.liveOracle()
+    if (o === null) { this.hopNote = 'n/a'; this.hopExhausted = false; this.hopNoStand = true; return null }
+    return this.linedVerdict(o, [from[0], from[1], from[2]], to, budgetTicks, beam ? LINED_BEAM_TICKS : 0)
+  }
+
+  /**
+   * `beamTicks`: kernel work the beam gets of its own once the families are
+   * out; 0 for what they left of the budget (the look ahead, where a beam's
+   * find is no cause to keep a plan). The last resort at a stuck take-off gets
+   * it: the shared budget left the beam a layer at most (2026-11-04: 30 of 88
+   * traced searches, none of them a find).
+   */
+  private linedVerdict (o: HopOracle, from: [number, number, number], cell: readonly [number, number, number], budgetTicks: number, beamTicks = 0): HopProgram | null {
+    const t0 = performance.now()
     // simplest first: the simple families cost a fifth of the yaw family,
     // which put first spent the whole budget on 6-2's third neo and never
     // let the air-turn that flies it (18 ms) be tried
-    const from = this.standCell(o, p)
     const to: [number, number, number] = [cell[0], cell[1], cell[2]]
-    const deadline = t0 + budgetTicks / LIVE_FLOOR_TICKS_PER_MS
+    this.linedFrom = from
+    let deadline = t0 + budgetTicks / LIVE_FLOOR_TICKS_PER_MS
     o.tickLimit = budgetTicks
     let found = o.hop(from, to, deadline, 'simple', true)
     let ran = !o.noVerdict
-    if (found === null) { found = o.hop(from, to, deadline, 'yaw', true); ran = ran && !o.noVerdict }
+    this.hopNoStand = found === null && o.noStand
+    if (found === null && !this.hopNoStand) { found = o.hop(from, to, deadline, 'yaw', true); ran = ran && !o.noVerdict }
     // every family run to the end and nothing lands: the executor's verdict
     // on a table jump (the beam, for what no family flies, may run out of time)
     this.hopExhausted = found === null && ran
-    if (found === null) found = o.hop(from, to, deadline, 'beam')
-    this.hopNote = `lined ${found !== null ? `${found.family} ${found.ticks}t` : this.hopExhausted ? 'none-exhausted' : 'none'} ${(performance.now() - t0).toFixed(0)}ms ${Math.round(o.ticksFlown / 1000)}k`
+    if (found === null && !this.hopNoStand) {
+      if (beamTicks > 0) {
+        o.tickLimit = o.ticksFlown + beamTicks
+        deadline = performance.now() + beamTicks / LIVE_FLOOR_TICKS_PER_MS
+      }
+      found = o.hop(from, to, deadline, 'beam')
+    }
+    this.hopNote = `lined ${found !== null ? `${found.family} ${found.ticks}t` : this.hopNoStand ? 'no-stand' : this.hopExhausted ? 'none-exhausted' : 'none'} ${(performance.now() - t0).toFixed(0)}ms ${Math.round(o.ticksFlown / 1000)}k`
     return found
   }
 
   /** Did the last hopLinedUp fly every program of every family from the take-off cell and land none? */
   hopExhausted = false
+  /** Had the last hopLinedUp no stand to fly from or to: the oracle blind there (no verdict on the jump itself)? */
+  hopNoStand = false
+  /** The cell the last lined verdict was flown from (hopLinedUp: the stand cell under the body, a lip's support cell too). */
+  linedFrom: readonly [number, number, number] | null = null
 
   /**
    * Blocks of headroom over a standing body at (x, y, z): the offset of the
@@ -1533,21 +1890,22 @@ export class PhysicsSim {
    * answer where it works (a full block's lip) and no part of it where it
    * does not - moveEntity asks only whether the moved box's CELLS hold a
    * block, so over an open trapdoor's cell a body coasts off its 3/16 panel
-   * sneaking (arena mcc-8-2 P3).
+   * sneaking (arena mcc-8-2 P3). `keyTicks`: the keys held that many ticks
+   * (a brake re-decided every tick holds as long as it is needed).
    */
-  holdsOn (keys: { forward?: boolean, back?: boolean, sneak?: boolean } | null, ticks = HOLD_COAST_TICKS): boolean {
+  holdsOn (keys: { forward?: boolean, back?: boolean, sneak?: boolean } | null, ticks = HOLD_COAST_TICKS, keyTicks = 1, maxDrop = 0.6): boolean {
     const y0 = this.bot.entity.position.y
     const state = this.simulateUntil(() => false, (s: PlayerState, i: number) => {
       if (keys === null && i === 0) return
-      s.control.forward = i === 0 && keys?.forward === true
-      s.control.back = i === 0 && keys?.back === true
+      s.control.forward = i < keyTicks && keys?.forward === true
+      s.control.back = i < keyTicks && keys?.back === true
       s.control.left = false
       s.control.right = false
       s.control.jump = false
       s.control.sprint = false
       if (i === 0 && keys?.sneak !== undefined) s.control.sneak = keys.sneak
     }, ticks)
-    return state.onGround === true && state.pos.y >= y0 - 0.6
+    return state.onGround === true && state.pos.y >= y0 - maxDrop
   }
 
   canBackOff (ticks = 5): boolean {

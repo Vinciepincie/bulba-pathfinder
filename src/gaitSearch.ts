@@ -33,7 +33,7 @@
 // - the horizon: as far as the hops a schedule holds reach, and a little
 //   (scout). Past them every schedule is the same run.
 
-import { SIM, SIM_SLIME, SIM_CLIMBABLE, copyBody, newBody } from './playerSim.js'
+import { SIM, SIM_SLIME, SIM_CLIMBABLE, SIM_HAZARD, copyBody, newBody } from './playerSim.js'
 import type { PlayerSim, SimBody, SimControl } from './playerSim.js'
 import { sideStandoff, wallSlide, againstWall, SPRINT_WALL_MARGIN, STEP_UP_MIN, WALK_STEP_REACH, PROBE_INSET } from './wallSteer.js'
 import type { Heading } from './wallSteer.js'
@@ -75,6 +75,12 @@ export interface GaitGoal {
    * or a climb node above it in the same column. Absent or -1: none.
    */
   catchAt?: number
+  /**
+   * The schedules' best time, not a choice (physics.ts skipWalk): the phase
+   * that keeps its feet searched for its quickest, not stopped at the first
+   * schedule that does as well as the jump.
+   */
+  best?: boolean
 }
 
 /** A tick on the ground, as the kernel ran it: where the body looks, and the keys beside forward. */
@@ -83,6 +89,9 @@ export interface GaitStep { yaw: number, sprint: boolean, strafe: boolean }
 export interface GaitResult {
   /** Ticks to the goal of the best schedule that jumps now; Infinity when none gets there. */
   hop: number
+  /** The goal the search ended at (an index into its path: GAIT_LIPS and the scout may end it short of GaitGoal.index), and whether that was the stop GaitGoal.last asked for. */
+  goal: number
+  goalLast: boolean
   /**
    * ...and of a schedule that keeps its feet this tick: one that does as well
    * (where a jump lies ahead) or a tick better (over open ground) when `hop`
@@ -121,18 +130,30 @@ export interface GaitResult {
 export const GRAZE_YAW = 0.02
 /**
  * Cosine of the largest angle between the body's velocity and the commanded
- * heading at which a jump the path asks for may take off (20°), and a hop of
- * the gait (45°). Into a turn a jump flies the OLD heading; the kernel flies
- * it exactly, so the angles are a cut on the search's work, not a model: a
- * flight thrown across the line is one more to refute, and past 45° a hop
- * is never the way to the next node (measured offline: 45° took 73 ticks off
- * 21 routes for a quarter more work; 90° and 180° took less off for more).
- * The 20° stays the executor's own gate on a legacy take-off, and holds a
- * jump the path asks for to a line the body has turned onto: those have one
- * landing to make. PF_HOP_TURN_DEG and PF_GAIT_TURN_DEG for A/B runs.
+ * heading at which a legacy take-off may go (20°), and a hop of the gait
+ * (45°; a jump the path asks for: ASKED_TURN_COS, below). Into a turn a jump
+ * flies the OLD heading; the kernel flies it exactly, so the angles are a cut
+ * on the search's work, not a model: a flight thrown across the line is one
+ * more to refute, and past 45° a hop is never the way to the next node
+ * (measured offline: 45° took 73 ticks off 21 routes for a quarter more work;
+ * 90° and 180° took less off for more). The 20° stays the executor's own gate
+ * on a legacy take-off. PF_HOP_TURN_DEG and PF_GAIT_TURN_DEG for A/B runs.
  */
 export const HOP_TURN_COS = Math.cos((Number((typeof process !== 'undefined' ? process.env.PF_HOP_TURN_DEG : undefined) ?? 20) || 20) * Math.PI / 180)
 export const GAIT_TURN_COS = Math.cos((Number((typeof process !== 'undefined' ? process.env.PF_GAIT_TURN_DEG : undefined) ?? 45) || 45) * Math.PI / 180)
+/**
+ * The cut on a jump the path asks for alone (Search.mayHop): 45°, as a hop of
+ * the gait's. At 20° the gait ran into a turn before every asked jump on a
+ * zig-zag of risers and lips; at 45° it takes them off the landing.
+ * Same-host A/B twice (2026-10-28, 31 routes): JS -3.92/-1.98 s, wasm
+ * -2.72/-1.16 - mcc-2-3 -0.73, opk2-3 -0.60, mcc-5-3 -0.30, opk-6 -0.21,
+ * spiral3-c -0.20 both times. Its one live loss before (mcc-8-3, +17 ticks)
+ * was the fire escape at the stair foot (playerSim.ts SIM_HAZARD), not the
+ * turn. PF_ASKED_TURN_DEG for A/B runs.
+ */
+const ASKED_TURN_COS = Math.cos((Number((typeof process !== 'undefined' ? process.env.PF_ASKED_TURN_DEG : undefined) ?? 45) || 45) * Math.PI / 180)
+/** The root's jump, cut by the angles above, flown after all where nothing else is left (Search.run). PF_GAIT_ROOT_UNCUT=0 for A/B. */
+const GAIT_ROOT_UNCUT = typeof process === 'undefined' || process.env.PF_GAIT_ROOT_UNCUT !== '0'
 /** How far below the path a jump may come down (the lower of the node behind and the node ahead). */
 export const HOP_MAX_DIP = 0.5
 /**
@@ -191,6 +212,8 @@ const HURT_REGAIN = 2
  * run came down slowly: half a heart for a tenth of a second.)
  */
 const HURT_COST = 6
+/** All a hurt landing is charged, in ticks (Search.end): the stand, the health, the speed (physics.ts skipTo compares a program with it). */
+export const HURT_TICKS = HURT_STAND + HURT_COST + HURT_REGAIN
 /** As far as any wall probe reaches from the body (SLIDE_PROBE), and a hair. */
 const WALL_REACH = 0.36
 /**
@@ -201,6 +224,19 @@ const WALL_REACH = 0.36
  * it has and a tick's push (RUN_PUSH: sprinting, on plain ground).
  */
 const GAIT_VMAX = 0.5
+/**
+ * ...but not where a slippery floor is in reach: hops tapped under a 2-high
+ * ceiling on ice hold 0.97 a tick, 1.33 under a 1.81 one (blue ice); open ice
+ * hopping 0.46 (bench speedTricks.ts). The bound is the optimism of the
+ * search's pruning, so it must not give up a gait faster than it. Measured on
+ * a 10-node window (bench gaitIce.ts): the fixed bound lost 0.5 of a tick on
+ * ice under a ceiling, and nothing on stone; lifting it for a fast body on
+ * stone only doubled the work. PF_GAIT_VMAX_SLIP=0: the fixed bound (A/B).
+ */
+const GAIT_VMAX_SLIP = 1.4
+const GAIT_VMAX_STATE = process.env.PF_GAIT_VMAX_SLIP !== '0'
+/** A floor this slippery or more (ice 0.98, blue ice 0.989, slime 0.8; stone's default reads 0) lifts the bound. */
+const SLIP_FAST = 0.6
 const RUN_PUSH = 1.3
 const RUN_SETTLE = 2.2326
 /**
@@ -247,6 +283,8 @@ const ROUND_CORRIDOR = 0.5
 /** How far ahead (blocks) the rounding policy looks for a box in the way, and the body band it looks in. */
 const ROUND_REACH = 2.5
 const ROUND_BAND = 0.61
+/** How far (blocks) from the body the rounding policy's hazard cells are gathered (Search.hazardCells). */
+const HAZARD_SCAN = 12
 /** PF_GAIT_ROUND=0 bisects the second policy. */
 const GAIT_ROUND = typeof process === 'undefined' || process.env.PF_GAIT_ROUND !== '0'
 /** The strafe fallback (gaitSearch): how many ticks sooner the search without the strafe must be; PF_STRAFE_FALLBACK=0 bisects. */
@@ -291,6 +329,31 @@ const DOM_LEVEL = 0.6
 const DOM_SAME = 1e-3
 const DOM_CLEAR = 5
 const DOM_LEAD = 11.2
+/**
+ * A jump the path asks for that scrapes a riser on its first RISER_TICKS
+ * rising (Search.hop) has the flight it took off from flown eased too, forward
+ * let go up to RISER_EASES ticks before its touchdown (Search.jump): a shorter,
+ * slower landing that leaves room to clear the riser. Arena opk-2: the hop
+ * onto the slab came down 0.17 short of the stair, the jump up bonked it (vz
+ * 0.27 to 0) and crawled on from 0.13; eased 6, the same hop leaves the jump
+ * room to clear it at 0.26 (offline: opk-2 -6 ticks, climb2 -20, mcc-2-3 -8,
+ * mcc-3-2 -7, opk2-3 -5, none slower). The eases are flown for jumps at depth
+ * RISER_DEPTH at most (the run phase's first jump is at depth 1; nested deeper
+ * they multiplied the work past the budget), on RISER_SHARE of the work left
+ * (extras: spent on them, opk2-1's run phase had no answer and hopped into a
+ * header), and their landings are not dominated by the un-eased flight's
+ * faster bodies ahead (riserEasing): before a rise the faster body is the one
+ * that bonks. That rule for every rise (RISE_DOM) gained nothing and blew the
+ * work on the ten-ways courses: off. PF_GAIT_RISER=0 for A/B.
+ */
+const RISER_EASE = typeof process === 'undefined' || process.env.PF_GAIT_RISER !== '0'
+const RISER_TICKS = 3
+/** No lead dominance short of a rise (PF_GAIT_RISEDOM=1 to try: A/B). */
+const RISE_DOM = typeof process !== 'undefined' && process.env.PF_GAIT_RISEDOM === '1'
+const RISER_EASES = 6
+/** ...on this share of the work left to the search when they start. */
+const RISER_SHARE = 0.4
+const RISER_DEPTH = Number((typeof process !== 'undefined' ? process.env.PF_GAIT_RISER_DEPTH : undefined) ?? 1)
 /** The ground states a phase has explored (labels): where, how fast, when, with what left to do, and how it came out. */
 const LABELS = 4096
 const OPEN = 0
@@ -400,6 +463,10 @@ class Search {
   private readonly over: boolean[] = []
   private readonly overAt: number[] = []
   private readonly flew: number[] = []
+  /** Per depth: did a jump flown on from the landing of the flight there scrape a riser rising (RISER_EASE)? */
+  private readonly scraped: boolean[] = []
+  /** Flying a riser's eased flights (RISER_EASE): no lead dominance over their landings - the faster body ahead is the one that bonked. */
+  private riserEasing = false
   private readonly nudged = newBody(0, 0, 0)
   /** The first tick of the feet's schedule (GaitResult.step): taken down while `stepWanted`. */
   private step: GaitStep | null = null
@@ -425,6 +492,8 @@ class Search {
   private readonly reach: number[] = []
   /** The speed a runner settles to at the most, and a tick's push (togo). */
   private vRun = 0
+  /** The pruning's top speed for this search (GAIT_VMAX_SLIP). */
+  private vMax = GAIT_VMAX
   private aRun = 0
   /** The labels of this phase (dominated), the ones each call of dfs opened, and whether the hop from each came to anything. */
   private labels = 0
@@ -484,12 +553,19 @@ class Search {
       this.catchLow = y
     }
     const i0 = this.pass(root, 0, 1, false)
-    const none: GaitResult = { hop: Infinity, run: Infinity, spent: false, work: 0, flight: this.flight, strafe: this.strafe, ease: EASE_NEVER, step: null }
+    const none: GaitResult = { hop: Infinity, goal: this.index, goalLast: this.last, run: Infinity, spent: false, work: 0, flight: this.flight, strafe: this.strafe, ease: EASE_NEVER, step: null }
     // the goal from here, this tick: nothing to schedule
     if (i0 > this.index) return none
     this.scout(root, i0)
     this.vRun = this.k.speedBase * RUN_PUSH * RUN_SETTLE
     this.aRun = this.k.speedBase * RUN_PUSH
+    // (the pruning's top speed: a slippery floor under the body or a node in reach, a body already fast - GAIT_VMAX_SLIP)
+    this.vMax = GAIT_VMAX
+    if (GAIT_VMAX_STATE) {
+      let slip = this.k.slipUnder(root.x, root.y, root.z) > SLIP_FAST
+      for (let j = 0; j <= this.index && !slip; j++) slip = this.k.slipUnder(this.path[j].x, this.path[j].y, this.path[j].z) > SLIP_FAST
+      this.vMax = slip ? GAIT_VMAX_SLIP : GAIT_VMAX
+    }
     for (let j = this.index; j >= 0; j--) {
       const n = this.path[j]
       this.reach[j] = n.parkour === true ? PASS_REACH_LANDED : PASS_REACH
@@ -514,14 +590,17 @@ class Search {
       const al = Math.hypot(ax, az)
       const bl = Math.hypot(bx, bz)
       const turn = al > 0.35 && bl > 1e-6 && (ax * bx + az * bz) / (al * bl) < HOP_TURN_COS
-      this.clear[j] = turn ? 0 : bl + this.clear[j + 1]
+      // (nor short of a rise: there the faster body is the one that bonks - RISER_EASE)
+      const rise = RISE_DOM && m.y > n.y + SIM.stepHeight
+      this.clear[j] = turn || rise ? 0 : bl + this.clear[j + 1]
     }
     const jumps = this.lipAhead[0]
 
     let hop = Infinity
     this.best = GAIT_BUDGET + 1
     const asked = this.needsJump(root, i0)
-    if (this.mayHop(root, i0, asked)) {
+    const rootCut = !this.mayHop(root, i0, asked)
+    if (!rootCut) {
       this.jump(root, i0, 0, asked ? 0 : 1, 0, asked ? i0 : -1, asked)
       if (this.best <= GAIT_BUDGET) hop = this.best
     }
@@ -549,19 +628,40 @@ class Search {
     this.best = bound
     // (the first schedule under the bound answers "can the feet do as well";
     // with no jump on offer the question is the best way on, not any)
-    this.firstWins = hop !== Infinity || !GAIT_NEARAIM
+    this.firstWins = this.goal.best !== true && (hop !== Infinity || !GAIT_NEARAIM)
     this.heldAt[0] = false
     this.limit = this.work + GAIT_WORK_RUN
     this.spent = false
     this.labels = 0
     this.stepWanted = true
+    // (the feet's first tick steps `root` itself)
+    const held = rootCut && GAIT_ROOT_UNCUT ? copyBody(newBody(0, 0, 0), root) : null
     const i = this.stride(root, i0, 0, 0)
     if (i >= 0) this.dfs(root, i, this.at, 0, 1, -1)
     const run = this.best < bound ? this.best : Infinity
+    const runSpent = this.spent
+    // The turn cut is on the search's work, not a model of the jump: where it
+    // has left the body no schedule at all, the jump it cut is flown after all
+    // (arena mcc-5-2: down on a skull against a wall, the velocity 7° one way
+    // and the next node 40° the other; 47° was 'none' and four ticks of the
+    // gates, where the hop from there is as quick as any).
+    if (held !== null && hop === Infinity && run === Infinity) {
+      this.best = GAIT_BUDGET + 1
+      this.firstWins = false
+      this.done = false
+      this.limit = this.work + GAIT_WORK_HOP
+      this.spent = false
+      this.labels = 0
+      this.stepWanted = false
+      this.jump(held, i0, 0, asked ? 0 : 1, 0, asked ? i0 : -1, asked)
+      if (this.best <= GAIT_BUDGET) hop = this.best
+    }
     return {
       hop,
+      goal: this.index,
+      goalLast: this.last,
       run,
-      spent: run === Infinity && (this.spent || hopSpent),
+      spent: run === Infinity && (this.spent || hopSpent || runSpent),
       work: this.work,
       flight: this.flight,
       strafe: this.strafe,
@@ -875,7 +975,7 @@ class Search {
         if (same) return DEAD
         continue
       }
-      if (!same && !(clear && labelClear[a] === 1 && labelS[a] - s >= DOM_LEAD * Math.max(0, v - labelV[a]))) continue
+      if (!same && !(clear && !this.riserEasing && labelClear[a] === 1 && labelS[a] - s >= DOM_LEAD * Math.max(0, v - labelV[a]))) continue
       if (state === ALIVE) return ALIVE
       open = true
     }
@@ -1040,7 +1140,7 @@ class Search {
       head = Math.hypot(dx, dz)
     }
     const speed = Math.hypot(b.vx, b.vz)
-    return !(speed > 0.1 && head > 1e-6 && (b.vx * dx + b.vz * dz) / (speed * head) < (asked ? HOP_TURN_COS : GAIT_TURN_COS))
+    return !(speed > 0.1 && head > 1e-6 && (b.vx * dx + b.vz * dz) / (speed * head) < (asked ? ASKED_TURN_COS : GAIT_TURN_COS))
   }
 
   /**
@@ -1055,7 +1155,7 @@ class Search {
       const d = Math.hypot(n.x - b.x, n.z - b.z) - this.reach[m]
       if (d > 0 && d + this.rest[m] > far) far = d + this.rest[m]
     }
-    return far / (running ? Math.max(this.vRun, Math.hypot(b.vx, b.vz) + this.aRun) : GAIT_VMAX)
+    return far / (running ? Math.max(this.vRun, Math.hypot(b.vx, b.vz) + this.aRun) : this.vMax)
   }
 
   /**
@@ -1125,6 +1225,79 @@ class Search {
   }
 
   private readonly round = { dx: 0, dz: 0 }
+  /** The best box roundCorner found in the way: its grown x0, z0, x1, z1, and how far along the step it starts. */
+  private readonly inWay = new Float64Array(5)
+  /** The hazard cells round the window (SIM_HAZARD: a fire, a cobweb), as x, y, z; gathered once a search (hazardCells). */
+  private hazards: number[] | null = null
+
+  /**
+   * The cells round the window a body must not touch (SIM_HAZARD): no box
+   * keeps it out of them, and the kernel stops a body that does. Gathered
+   * once, over the window's nodes and the root, ROUND_REACH and a block wide.
+   */
+  private hazardCells (b: SimBody): number[] {
+    if (this.hazards !== null) return this.hazards
+    let x0 = b.x
+    let x1 = b.x
+    let y0 = b.y
+    let y1 = b.y
+    let z0 = b.z
+    let z1 = b.z
+    for (let j = 0; j <= this.index && j < this.path.length; j++) {
+      const n = this.path[j]
+      x0 = Math.min(x0, n.x); x1 = Math.max(x1, n.x)
+      y0 = Math.min(y0, n.y); y1 = Math.max(y1, n.y)
+      z0 = Math.min(z0, n.z); z1 = Math.max(z1, n.z)
+    }
+    // (no further than a schedule goes from the body: a shortcut's first node may lie far off)
+    const r = HAZARD_SCAN
+    x0 = Math.max(x0, b.x - r); x1 = Math.min(x1, b.x + r)
+    z0 = Math.max(z0, b.z - r); z1 = Math.min(z1, b.z + r)
+    y0 = Math.max(y0, b.y - r); y1 = Math.min(y1, b.y + r)
+    const m = ROUND_REACH + 1
+    const out: number[] = []
+    for (let y = Math.floor(y0) - 1; y <= Math.floor(y1 + this.k.height); y++) {
+      for (let z = Math.floor(z0 - m); z <= Math.floor(z1 + m); z++) {
+        for (let x = Math.floor(x0 - m); x <= Math.floor(x1 + m); x++) {
+          if ((this.k.kindAt(x + 0.5, y + 0.5, z + 0.5) & SIM_HAZARD) !== 0) out.push(x, y, z)
+        }
+      }
+    }
+    this.hazards = out
+    return out
+  }
+
+  /**
+   * Is the box [x0, x1] x [z0, z1] (grown already) in the way of the straight
+   * step from body `b` along (ux, uz) within `reach`, and nearer than the best
+   * so far (inWay)? Then it is the best. A box the body is already against is
+   * not in the way: the walk rules have it.
+   */
+  private takeInWay (b: SimBody, ux: number, uz: number, reach: number, x0: number, z0: number, x1: number, z1: number): void {
+    if (b.x > x0 + 1e-6 && b.x < x1 - 1e-6 && b.z > z0 + 1e-6 && b.z < z1 - 1e-6) return
+    let t0 = 0
+    let t1 = reach
+    if (Math.abs(ux) < 1e-9) {
+      if (b.x <= x0 || b.x >= x1) return
+    } else {
+      let a = (x0 - b.x) / ux
+      let c = (x1 - b.x) / ux
+      if (a > c) { const q = a; a = c; c = q }
+      t0 = Math.max(t0, a)
+      t1 = Math.min(t1, c)
+    }
+    if (Math.abs(uz) < 1e-9) {
+      if (b.z <= z0 || b.z >= z1) return
+    } else {
+      let a = (z0 - b.z) / uz
+      let c = (z1 - b.z) / uz
+      if (a > c) { const q = a; a = c; c = q }
+      t0 = Math.max(t0, a)
+      t1 = Math.min(t1, c)
+    }
+    const w = this.inWay
+    if (t0 < t1 - 1e-6 && t0 < w[4]) { w[0] = x0; w[1] = z0; w[2] = x1; w[3] = z1; w[4] = t0 }
+  }
 
   /**
    * The first box at body height (ROUND_BAND up to the head) in the way of
@@ -1134,7 +1307,11 @@ class Search {
    * outside it), into `h`. False when nothing is in the way, or the corner is
    * where the body already is. A box no higher than the node's feet (`ny`) is
    * the step the path climbs, not a box in the way: rounding the riser it was
-   * to jump onto cost spiral3-c 13 ticks and climb2 a hop a step.
+   * to jump onto cost spiral3-c 13 ticks and climb2 a hop a step. A hazard's
+   * cell (a fire, a cobweb: SIM_HAZARD) is a box in the way at any height the
+   * body spans, its feet too: no box turns the body off it, and the kernel
+   * stops one that touches it (arena mcc-8-3: the stair foot's fire, which
+   * every plain schedule nicked - the gait had none, and the gates walked in).
    */
   private roundCorner (b: SimBody, ndx: number, ndz: number, ny: number, h: { dx: number, dz: number }): boolean {
     const k = this.k
@@ -1150,45 +1327,24 @@ class Search {
     if (lo >= b.y + k.height - 0.01) return false
     const n = k.boxesIn(Math.min(b.x, ex) - hw - 0.1, lo, Math.min(b.z, ez) - hw - 0.1, Math.max(b.x, ex) + hw + 0.1, b.y + k.height - 0.01, Math.max(b.z, ez) + hw + 0.1)
     const buf = k.scratchBoxes
-    let bestT = Infinity
-    let bi = -1
+    const w = this.inWay
+    w[4] = Infinity
     for (let j = 0; j < n; j++) {
       const o = j * 6
       if (!(buf[o + 4] > lo - 0.01 && buf[o + 1] < b.y + k.height)) continue
-      const x0 = buf[o] - hw
-      const x1 = buf[o + 3] + hw
-      const z0 = buf[o + 2] - hw
-      const z1 = buf[o + 5] + hw
-      // (already against it: not in the way, the walk rules have it)
-      if (b.x > x0 + 1e-6 && b.x < x1 - 1e-6 && b.z > z0 + 1e-6 && b.z < z1 - 1e-6) continue
-      let t0 = 0
-      let t1 = reach
-      if (Math.abs(ux) < 1e-9) {
-        if (b.x <= x0 || b.x >= x1) continue
-      } else {
-        let a = (x0 - b.x) / ux
-        let c = (x1 - b.x) / ux
-        if (a > c) { const q = a; a = c; c = q }
-        t0 = Math.max(t0, a)
-        t1 = Math.min(t1, c)
-      }
-      if (Math.abs(uz) < 1e-9) {
-        if (b.z <= z0 || b.z >= z1) continue
-      } else {
-        let a = (z0 - b.z) / uz
-        let c = (z1 - b.z) / uz
-        if (a > c) { const q = a; a = c; c = q }
-        t0 = Math.max(t0, a)
-        t1 = Math.min(t1, c)
-      }
-      if (t0 < t1 - 1e-6 && t0 < bestT) { bestT = t0; bi = j }
+      this.takeInWay(b, ux, uz, reach, buf[o] - hw, buf[o + 2] - hw, buf[o + 3] + hw, buf[o + 5] + hw)
     }
-    if (bi < 0) return false
-    const o = bi * 6
-    const cx0 = buf[o] - hw
-    const cx1 = buf[o + 3] + hw
-    const cz0 = buf[o + 2] - hw
-    const cz1 = buf[o + 5] + hw
+    // (a hazard's cell, at any height the body spans)
+    const hz = this.hazardCells(b)
+    for (let j = 0; j < hz.length; j += 3) {
+      if (!(hz[j + 1] + 1 > b.y + 1e-3 && hz[j + 1] < b.y + k.height)) continue
+      this.takeInWay(b, ux, uz, reach, hz[j] - hw, hz[j + 2] - hw, hz[j] + 1 + hw, hz[j + 2] + 1 + hw)
+    }
+    if (w[4] === Infinity) return false
+    const cx0 = w[0]
+    const cx1 = w[2]
+    const cz0 = w[1]
+    const cz1 = w[3]
     let best = Infinity
     let px = 0
     let pz = 0
@@ -1272,22 +1428,56 @@ class Search {
    */
   private jump (w: SimBody, i: number, t: number, hops: number, depth: number, used: number, asked: boolean): boolean {
     let before = this.best
+    this.scraped[depth] = false
     let alive = this.hop(copyBody(this.scratch(this.fly, depth), w), w, i, t, hops, depth, used, asked, EASE_NEVER, false)
     if (depth === 0 && this.best < before) this.keep(EASE_NEVER)
-    if (!this.over[depth] || this.done || !(asked || (this.last && this.overAt[depth] === this.index))) return alive
-    let lo = 1
-    let hi = this.flew[depth] - 1
-    let ease = 0
-    while (lo <= hi) {
-      const mid = (lo + hi) >> 1
-      this.hop(copyBody(this.scratch(this.fly, depth), w), w, i, t, hops, depth, used, asked, mid, true)
-      if (this.over[depth]) hi = mid - 1
-      else { ease = mid; lo = mid + 1 }
+    const scraped = this.scraped[depth]
+    const flew = this.flew[depth]
+    if (this.over[depth] && !this.done && (asked || (this.last && this.overAt[depth] === this.index))) {
+      let lo = 1
+      let hi = this.flew[depth] - 1
+      let ease = 0
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1
+        this.hop(copyBody(this.scratch(this.fly, depth), w), w, i, t, hops, depth, used, asked, mid, true)
+        if (this.over[depth]) hi = mid - 1
+        else { ease = mid; lo = mid + 1 }
+      }
+      if (ease > 0) {
+        before = this.best
+        if (this.hop(copyBody(this.scratch(this.fly, depth), w), w, i, t, hops, depth, used, asked, ease, false)) alive = true
+        if (depth === 0 && this.best < before) this.keep(ease)
+      }
     }
-    if (ease === 0) return alive
-    before = this.best
-    if (this.hop(copyBody(this.scratch(this.fly, depth), w), w, i, t, hops, depth, used, asked, ease, false)) alive = true
-    if (depth === 0 && this.best < before) this.keep(ease)
+    // (the jump on from its landing scraped a riser: the flight eased, landing shorter and slower - RISER_EASE)
+    if (scraped && RISER_EASE && depth <= RISER_DEPTH) {
+      // (on a share of the work left: extras, never the search's own answer - opk2-1's run phase spent on them)
+      const was = this.riserEasing
+      const limit0 = this.limit
+      const spent0 = this.spent
+      const labels0 = this.labels
+      const alive0 = alive
+      const best0 = this.best
+      this.riserEasing = true
+      this.limit = Math.min(limit0, this.work + Math.max(0, limit0 - this.work) * RISER_SHARE)
+      try {
+        for (let ease = flew - 1; ease >= Math.max(1, flew - RISER_EASES) && !this.done && this.work <= this.limit; ease--) {
+          before = this.best
+          if (this.hop(copyBody(this.scratch(this.fly, depth), w), w, i, t, hops, depth, used, asked, ease, false)) alive = true
+          if (depth === 0 && this.best < before) this.keep(ease)
+        }
+      } finally {
+        // (cut short by its share: what it left half flown is no evidence -
+        // its states not dominating any later, and alive only for what it recorded)
+        if (this.spent && !spent0) {
+          for (let a = labels0; a < this.labels; a++) labelState[a] = VOID
+          alive = alive0 || this.best < best0
+        }
+        this.riserEasing = was
+        this.limit = limit0
+        this.spent = spent0
+      }
+    }
     return alive
   }
 
@@ -1344,6 +1534,8 @@ class Search {
       this.work++
       c.forward = true
       this.flew[depth] = f + 1
+      // (a jump the path asks for, scraping a riser as it rises - not a fall into a hole against its far wall: RISER_EASE)
+      if (RISER_EASE && asked && !bare && depth > 0 && depth - 1 <= RISER_DEPTH && f < RISER_TICKS && h.collidedH && !h.onGround && h.vy > 0) this.scraped[depth - 1] = true
       t++
       const drop = Math.max(0, y0 - h.y)
       fall += drop

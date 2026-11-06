@@ -86,6 +86,12 @@ export interface SnapshotView {
   special?: Uint8Array | null
   /** Thin footprint byte per cell (shapes.ts thinFootprint) — with allowParkourExtended. */
   thin?: Uint8Array | null
+  /**
+   * Moves never generated, as (from cell index, to cell index) pairs: a
+   * planner jump the physics flies from no rest on its take-off
+   * (hopPipeline.ts verifiedFollowUp). Its cells stay open to every other move.
+   */
+  bannedEdges?: Int32Array | null
 }
 
 export interface DigContext {
@@ -203,6 +209,17 @@ const DOOR_CLOSED = LutFlags.DOOR_CLOSED;
 const DOOR_OPEN = LutFlags.DOOR_OPEN;
 const GATE_OPEN = LutFlags.GATE_OPEN;
 const PASSABLE_WHEN_OPEN = DOOR_OPEN | GATE_OPEN;
+/**
+ * Extended: what entering a cell beside a hazard costs (MoveGen.hazardNear: a
+ * fire, lava or a cobweb among its 8 neighbours at the feet or the head) - a
+ * secondary criterion. Of two lines that cost the same, the one a block off
+ * the hazard wins; no detour is taken for it (a block is 1 to 1.4: a hundred
+ * cells beside a hazard to outweigh one, where 0.25 a cell bought a detour
+ * along a long lava-side corridor). The gait turns into a node from its 0.35
+ * box and carries its speed through the turn: a line turning beside a fire
+ * nicks it (arena mcc-8-3).
+ */
+const HAZARD_NEAR_COST = 0.01;
 const CAN_FALL = DigFlags.CAN_FALL;
 const CANT_BREAK = DigFlags.CANT_BREAK;
 const BUBBLE_UP = LutSpecial.BUBBLE_UP;
@@ -288,6 +305,10 @@ export class MoveGen {
   private pendingAim = 0
   /** generate(): the node's head+1 lid lies inside its support panel's strip (lidInStrip). */
   private lidHere = false
+  /** SnapshotView.bannedEdges, or null when there are none. */
+  private readonly bannedEdges: Int32Array | null = null
+  /** generate(): the node's cell index when a banned edge leaves it, else -1 (push skips those moves). */
+  private bannedFrom = -1
     /** Set by parkourExtTarget for the landing it is about to push. */
   private pendingMom = MOM_NONE
     /** The centre line's landing (node y, support y), reused by its aimed variants. */
@@ -369,6 +390,8 @@ export class MoveGen {
         else {
             this.entityMap = null;
         }
+        if (snap.bannedEdges != null && snap.bannedEdges.length >= 2)
+            this.bannedEdges = snap.bannedEdges;
         this.stepExclusion = stepExclusion;
         this.allowParkour = cfg.allowParkour;
         this.allowSprinting = cfg.allowSprinting;
@@ -418,6 +441,42 @@ export class MoveGen {
   flagsAt (x: number, y: number, z: number): number {
         const idx = this.cellIndex(x, y, z);
         return idx < 0 ? 0 : this.flags[idx];
+    }
+    /** cellIndex for a neighbour test: -1 outside, and the boundary flag untouched (no move goes there). */
+  private cellIndexQuiet (x: number, y: number, z: number): number {
+        const lx = x - this.x0;
+        const ly = y - this.y0;
+        const lz = z - this.z0;
+        if (lx < 0 || lx >= this.w || ly < 0 || ly >= this.h || lz < 0 || lz >= this.l) return -1;
+        return (ly * this.l + lz) * this.w + lx;
+    }
+    /**
+     * A hazard cell: no collision box, and never entered (fire, lava, a
+     * cobweb: blocksToAvoid) - nothing keeps the body's box out of it, which
+     * a diagonal cuts past by up to 0.21 (moveDiagonal). Not a fence or a
+     * closed gate (a box: the body slides off it), nor an open door or gate.
+     */
+  private hazardAt (x: number, y: number, z: number): boolean {
+        const idx = this.cellIndexQuiet(x, y, z);
+        if (idx < 0) return false;
+        return (this.flags[idx] & (SAFE | PHYSICAL | PASSABLE_WHEN_OPEN)) === 0 && (this.heights[idx] & 63) === 0;
+    }
+    /** Is cell (x, y, z) (index `idx`) beside a hazard: one of its 8 neighbours at the feet or the head (hazardAt)? Kept per cell (nearHazard). */
+  private hazardNear (x: number, y: number, z: number, idx: number): boolean {
+        let m = this.nearHazard;
+        if (m === null) m = this.nearHazard = new Uint8Array(this.flags.length);
+        const v = m[idx];
+        if (v !== 0) return v === 2;
+        let near = false;
+        for (let dy = 0; dy <= 1 && !near; dy++) {
+            for (let dz = -1; dz <= 1 && !near; dz++) {
+                for (let dx = -1; dx <= 1; dx++) {
+                    if ((dx !== 0 || dz !== 0) && this.hazardAt(x + dx, y + dy, z + dz)) { near = true; break; }
+                }
+            }
+        }
+        m[idx] = near ? 2 : 1;
+        return near;
     }
     /** Absolute collision-top height of the cell (upstream b.height). The
      * height byte is packed — bits 6–7 carry the top-catch class (types.ts). */
@@ -565,12 +624,25 @@ export class MoveGen {
         cost += dig.data.labor[dig.states[idx]] * this.digCost;
         return cost;
     }
+  /** hazardNear's answers by cell: 0 not asked, 1 clear, 2 beside a hazard (one solve's snapshot). */
+  private nearHazard: Uint8Array | null = null;
   private push (x: number, y: number, z: number, cost: number, meta: number): void {
         const mom = this.pendingMom;
         this.pendingMom = MOM_NONE;
         const idx = this.cellIndex(x, y, z);
         if (idx < 0)
             return; // target outside snapshot — boundaryTouched already set
+        if (this.bannedFrom >= 0 && this.edgeBanned(idx)) {
+            // (a banned edge: dropped whole, its pending fields with it)
+            this.pendingVia = -1;
+            this.pendingAim = 0;
+            if (this.moveBreaks.length > 0)
+                this.moveBreaks = [];
+            return;
+        }
+        // Extended: a cell beside a hazard, a tie-breaker dearer (HAZARD_NEAR_COST)
+        if (this.parkourExtended && this.hazardNear(x, y, z, idx))
+            cost += HAZARD_NEAR_COST;
         const i = this.outCount++;
         this.outIdx[i] = idx;
         this.outX[i] = x;
@@ -593,8 +665,33 @@ export class MoveGen {
     }
     /** Fills the out* arrays for the node at (x, y, z), upstream order. `mom`
      * is the node's momentum state (MOM_NONE unless allowParkourMomentum). */
+  /** Is the move from this node's cell (bannedFrom) to cell index `to` banned (SnapshotView.bannedEdges)? */
+  private edgeBanned (to: number): boolean {
+        const e = this.bannedEdges as Int32Array;
+        for (let k = 0; k + 1 < e.length; k += 2) {
+            if (e[k] === this.bannedFrom && e[k + 1] === to)
+                return true;
+        }
+        return false;
+    }
   generate (x: number, y: number, z: number, mom: number = MOM_NONE): void {
         this.outCount = 0;
+        this.bannedFrom = -1;
+        if (this.bannedEdges !== null) {
+            // (the node's own cell, read without cellIndex's boundary flag)
+            const lx = x - this.x0;
+            const ly = y - this.y0;
+            const lz = z - this.z0;
+            if (lx >= 0 && lx < this.w && ly >= 0 && ly < this.h && lz >= 0 && lz < this.l) {
+                const from = (ly * this.l + lz) * this.w + lx;
+                for (let k = 0; k + 1 < this.bannedEdges.length; k += 2) {
+                    if (this.bannedEdges[k] === from) {
+                        this.bannedFrom = from;
+                        break;
+                    }
+                }
+            }
+        }
         this.momIn = this.parkourMomentum ? mom : MOM_NONE;
         if (this.momIn !== MOM_NONE) {
             this.momDx = momentumDx(this.momIn);
@@ -1101,6 +1198,16 @@ export class MoveGen {
             return;
         // A thin floor at the target feet cell is same-level ground, not a +1 hop.
         const yo = (fC & PHYSICAL) !== 0 && !this.isThinFloor(fC) ? 1 : 0;
+        // Extended: never diagonally past a hazard's corner (hazardAt) at the
+        // body's height, from its feet to its head over a jump up: no box
+        // turns the body off it (arena mcc-8-3: a stair landing's fire,
+        // touched at every step, the hazard escape walking it back out)
+        if (this.parkourExtended) {
+            for (let hy = y; hy <= y + yo + 1; hy++) {
+                if (this.hazardAt(x, hy, z + dz) || this.hazardAt(x + dx, hy, z))
+                    return;
+            }
+        }
         const h0 = this.heightAt(x, y - 1, z);
         // Two corner alternatives, each with its own toBreak set (upstream
         // toBreak1/toBreak2 — the cheaper corner's digs are kept).

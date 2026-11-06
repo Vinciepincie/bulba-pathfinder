@@ -71,7 +71,11 @@ const PALETTE: number[][] = [
   [mcData.blocksByName.slime_block.minStateId as number],
   statesOf('iron_bars'),
   statesOf('snow', p => Number(p.layers) <= 4),
-  statesOf('oak_leaves').slice(0, 1)
+  statesOf('oak_leaves').slice(0, 1),
+  // (a jump off honey rises at 0.4 - read under the floored feet, so stacks: SIM_HONEY; soul sand slows nothing in 1.21's prismarine)
+  [mcData.blocksByName.honey_block.minStateId as number],
+  [mcData.blocksByName.honey_block.minStateId as number],
+  [mcData.blocksByName.soul_sand.minStateId as number]
 ]
 
 interface TestWorld { get: (x: number, y: number, z: number) => number }
@@ -230,6 +234,77 @@ describe('PlayerSim vs prismarine-physics', function () {
       }
     }
     expect(ticks).to.be.greaterThan(20000)
+  })
+
+  it('jumps off honey as prismarine does: 0.4 off a stack (read under the floored feet), the full jump off one block (SIM_HONEY)', () => {
+    const honey = mcData.blocksByName.honey_block.minStateId as number
+    // a stone floor; a two-high honey stack at x 0, one honey block at x 3; a body on each top and one on stone, a sprint jump each
+    const stateAt = (x: number, y: number, z: number): number => {
+      if (Math.abs(x) > 8 || Math.abs(z) > 8 || y < -2 || y > 12) return -1
+      if (y === 0) return STONE
+      if (x === 0 && z === 0 && (y === 1 || y === 2)) return honey
+      if (x === 3 && z === 0 && y === 1) return honey
+      return AIR
+    }
+    const pworld = { getBlock: (pos: Vec3) => { const s = stateAt(Math.floor(pos.x), Math.floor(pos.y), Math.floor(pos.z)); if (s < 0) return null; const b = Block.fromStateId(s, 0) as { position?: Vec3 }; b.position = new Vec3(Math.floor(pos.x), Math.floor(pos.y), Math.floor(pos.z)); return b } }
+    const physics = Physics(mcData, pworld)
+    physics.playerHalfWidth = 0.30001
+    physics.playerHeight = 1.80001
+    const sim = new PlayerSim({ ...tables, stateAt }, 0.30001, 1.80001)
+    const rises: number[] = []
+    for (const [x0, y0] of [[0.5, 2.9375], [3.5, 1.9375], [-3.5, 1]]) {
+      const fake = {
+        version: mcData.version.minecraftVersion,
+        entity: { position: new Vec3(x0, y0, 0.5), velocity: new Vec3(0, 0, 0), onGround: true, isInWater: false, isInLava: false, isInWeb: false, isCollidedHorizontally: false, isCollidedVertically: false, elytraFlying: false, attributes: {}, effects: {}, yaw: 0, pitch: 0 },
+        jumpTicks: 0, jumpQueued: false, fireworkRocketDuration: 0, inventory: { slots: [] }
+      }
+      const ps = new PlayerState(fake, { forward: false, back: false, left: false, right: false, jump: true, sprint: true, sneak: false })
+      ps.onGround = true
+      const kb = newBody(x0, y0, 0.5)
+      kb.onGround = true
+      const ctl: SimControl = { forward: false, back: false, left: false, right: false, jump: true, sprint: true, sneak: false, hx: -Math.sin(Math.PI), hz: Math.cos(Math.PI) }
+      for (let t = 0; t < 3; t++) {
+        physics.simulatePlayer(ps, pworld)
+        sim.step(kb, ctl)
+        expect(kb.vy, `vy from ${x0} tick ${t}`).to.equal(ps.vel.y)
+        expect(kb.y, `y from ${x0} tick ${t}`).to.equal(ps.pos.y)
+        if (t === 0) rises.push(kb.vy)
+      }
+    }
+    // the stack's top jumps low, a lone honey block and stone jump full
+    expect(rises[0]).to.be.lessThan(0.2)
+    expect(rises[1]).to.be.greaterThan(0.3)
+    expect(rises[2]).to.be.greaterThan(0.3)
+  })
+
+  it('stops a body at a fire\'s cell, the box a thousandth in, by the grid as by the world (SIM_HAZARD)', () => {
+    // a stone floor, a fire on it two blocks ahead of a run along +z, and a lane beside it
+    // (and a cobweb's, which this model does not slow a body in)
+    const hazards = [mcData.blocksByName.fire.minStateId as number, mcData.blocksByName.cobweb.minStateId as number]
+    for (const [hazard, grid] of hazards.flatMap(h => [[h, true], [h, false]] as Array<[number, boolean]>)) {
+      const cells = new Map<string, number>()
+      for (let x = -3; x <= 3; x++) for (let z = -3; z <= 6; z++) cells.set(`${x},0,${z}`, STONE)
+      cells.set('0,1,2', hazard)
+      const tw: TestWorld = { get: (x, y, z) => (x < -8 || x > 8 || z < -8 || z > 8 || y < -2 || y > 12) ? -1 : (cells.get(`${x},${y},${z}`) ?? AIR) }
+      const k = new PlayerSim({ ...tables, stateAt: tw.get, grid: grid ? gridOf(tw) : undefined })
+      const run = (x: number): { stopped: number, z: number } => {
+        const b = newBody(x, 1, 0.5)
+        b.onGround = true
+        const c: SimControl = { forward: true, back: false, left: false, right: false, jump: false, sprint: true, sneak: false, hx: 0, hz: 1 }
+        for (let t = 1; t <= 30; t++) {
+          k.step(b, c)
+          if (b.inLiquid) return { stopped: t, z: b.z }
+        }
+        return { stopped: -1, z: b.z }
+      }
+      // into the fire: stopped once the box reaches its cell (z + 0.3 past 2), short of its far side
+      const into = run(0.5)
+      expect(into.stopped, `grid ${String(grid)}: into the fire`).to.be.greaterThan(0)
+      expect(into.z + 0.3, 'the box reached the fire').to.be.greaterThan(2)
+      expect(into.z - 0.3, 'not past it').to.be.lessThan(3)
+      // a lane a block and a half aside: never touched
+      expect(run(-1).stopped, `grid ${String(grid)}: beside it`).to.equal(-1)
+    }
   })
 
   it('reads a grid as it reads the world: a static grid by its bricks, a lazy window by its stamps, kept gathers', () => {

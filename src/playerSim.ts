@@ -11,8 +11,8 @@
 // taking the vector keeps every operation here +,-,*,/ and sqrt, which a Rust
 // port reproduces bit for bit.
 //
-// Out of scope (the caller is told, never silently wrong): water and lava
-// (`inLiquid` is raised and the step returns), cobwebs, bubble columns,
+// Out of scope (the caller is told, never silently wrong): water, lava and
+// fire (`inLiquid` is raised and the step returns), cobwebs, bubble columns,
 // elytra, levitation, slow falling. On 1.21 prismarine applies no soul-sand
 // or honey slowdown and no ladder-trapdoor climbing, and neither does this.
 
@@ -63,6 +63,32 @@ export const SIM_SLIME = 4
 /** Breaks a fall: keeps a fifth of its damage (hay, honey), or halves its height (a bed). See fallDamage.ts. */
 export const SIM_CUSHION = 8
 export const SIM_BED = 16
+/**
+ * A fire's cell (fire, soul fire): no collision box, but the executor walks a
+ * body touching one out before anything else (plugin.ts hazardEscape), so a
+ * run or a flight through it is not one the bot flies. And a cobweb's, which
+ * this model does not slow a body in. A body touching one stops the model as
+ * a liquid does (SimBody.inLiquid; KERNEL_HAZARD).
+ */
+export const SIM_HAZARD = 32
+/**
+ * PF_KERNEL_HAZARD=0: fire is air to the kernel (A/B). Arena mcc-8-3: the
+ * gait ran its stair landing 0.04 into a fire's cell, the hazard escape
+ * walked it 0.05 back out, and the two traded ticks for 11 of them.
+ */
+const KERNEL_HAZARD = typeof process === 'undefined' || process.env.PF_KERNEL_HAZARD !== '0'
+/**
+ * A honey block: a jump off it rises at 0.4 of the jump (index.js
+ * honeyblockJumpSpeed), read where prismarine reads it - the cell under the
+ * floored feet (pos.floored().offset(0, -0.5, 0)), so the honey under a body on
+ * honey's own 15/16 top is NOT that cell; the cell under it is.
+ */
+export const SIM_HONEY = 64
+/** index.js honeyblockJumpSpeed. */
+const HONEY_JUMP = 0.4
+/** PF_HAZARD_DEBUG=1: each hazard cell the kernel stops at, once (diagnostic). */
+const HAZARD_DEBUG = typeof process !== 'undefined' && process.env.PF_HAZARD_DEBUG === '1'
+const hazardSeen = new Set<string>()
 
 /** Mutable body state; one per simulated player. */
 export interface SimBody {
@@ -76,7 +102,7 @@ export interface SimBody {
   collidedH: boolean
   collidedV: boolean
   jumpTicks: number
-  /** Set when the body touches water or lava: this model stops there. */
+  /** Set when the body touches water, lava, a fire or a cobweb (SIM_HAZARD): this model stops there. */
   inLiquid: boolean
 }
 
@@ -145,6 +171,8 @@ const BRICK_SEEN = 1
 const BRICK_SOLID = 2
 /** A cell of the brick is a liquid. */
 const BRICK_WET = 4
+/** A cell of the brick is a fire or a cobweb (SIM_HAZARD). */
+const BRICK_HOT = 8
 
 /**
  * The simulator: world + body dimensions + scratch space. Not re-entrant
@@ -175,6 +203,9 @@ export class PlayerSim {
   /** touchesLiquid's last answer, by cell range (keyed as a slot). */
   private readonly liqKey = new Float64Array([0, 0, 0, 0, 0, 0, NO_RANGE])
   private liqLast = false
+  /** ...and touchesHazard's. */
+  private readonly hazKey = new Float64Array([0, 0, 0, 0, 0, 0, NO_RANGE])
+  private hazLast = false
   /**
    * An unstamped grid by brick of 4³ cells: BRICK_SEEN once looked at, with
    * BRICK_SOLID when a cell has a collision box and BRICK_WET when one is a
@@ -394,6 +425,12 @@ export class PlayerSim {
   }
 
   /** The SIM_* bits of the block at a point. */
+  /** The slipperiness a body with its feet at (x, y, z) runs on (step's `under`: the cell a block below the feet); 0 = the default 0.6. */
+  slipUnder (x: number, y: number, z: number): number {
+    const s = this.sid(Math.floor(x), Math.floor(y - 1), Math.floor(z))
+    return s < 0 ? 0 : this.world.slip[s]
+  }
+
   kindAt (x: number, y: number, z: number): number {
     const s = this.sid(Math.floor(x), Math.floor(y), Math.floor(z))
     return s < 0 ? 0 : this.world.kind[s]
@@ -439,6 +476,39 @@ export class PlayerSim {
     return hit
   }
 
+  /**
+   * Does the body's box touch a fire's or a cobweb's cell (SIM_HAZARD)? The box a
+   * thousandth in on every side, as the executor's hazardContacts reads it.
+   */
+  private touchesHazard (b: SimBody): boolean {
+    const hw = this.halfWidth
+    const x0 = Math.floor(b.x - hw + 0.001); const x1 = Math.floor(b.x + hw - 0.001)
+    const y0 = Math.floor(b.y + 0.001); const y1 = Math.floor(b.y + this.height - 0.001)
+    const z0 = Math.floor(b.z - hw + 0.001); const z1 = Math.floor(b.z + hw - 0.001)
+    const g = this.grid
+    if (g !== null && g.stamps === undefined && x0 >= g.x0 && y0 >= g.y0 && z0 >= g.z0 && x1 < g.x0 + g.w && y1 < g.y0 + g.h && z1 < g.z0 + g.l &&
+      this.bricksLack(g, BRICK_HOT, x0 - g.x0, y0 - g.y0, z0 - g.z0, x1 - g.x0, y1 - g.y0, z1 - g.z0)) return false
+    const serial = this.rangeSerial(x0, y0, z0, x1, y1, z1)
+    const k = this.hazKey
+    if (serial !== NO_RANGE && k[6] === serial && k[0] === x0 && k[1] === y0 && k[2] === z0 && k[3] === x1 && k[4] === y1 && k[5] === z1) return this.hazLast
+    let hit = false
+    cells: for (let y = y0; y <= y1; y++) {
+      for (let z = z0; z <= z1; z++) {
+        for (let x = x0; x <= x1; x++) {
+          const st = this.sid(x, y, z)
+          if (st >= 0 && (this.world.kind[st] & SIM_HAZARD) !== 0) {
+            hit = true
+            if (HAZARD_DEBUG && !hazardSeen.has(`${x},${y},${z},${st}`)) { hazardSeen.add(`${x},${y},${z},${st}`); console.warn(`[hazard] ${x},${y},${z} state ${st}`) }
+            break cells
+          }
+        }
+      }
+    }
+    k[0] = x0; k[1] = y0; k[2] = z0; k[3] = x1; k[4] = y1; k[5] = z1; k[6] = serial
+    this.hazLast = hit
+    return hit
+  }
+
   /** Do the bricks over grid cells [lx0..lx1]×[ly0..ly1]×[lz0..lz1] of an unstamped grid all lack `bit` (PlayerSim.bricks)? */
   private bricksLack (g: SimGrid, bit: number, lx0: number, ly0: number, lz0: number, lx1: number, ly1: number, lz1: number): boolean {
     for (let by = ly0 >> BRICK; by <= ly1 >> BRICK; by++) {
@@ -474,6 +544,7 @@ export class PlayerSim {
           if (st < 0) continue
           if (w.shapeStart[st] >= 0 && w.shapeCount[st] > 0) v |= BRICK_SOLID
           if ((w.kind[st] & SIM_LIQUID) !== 0) v |= BRICK_WET
+          if ((w.kind[st] & SIM_HAZARD) !== 0) v |= BRICK_HOT
         }
       }
     }
@@ -728,7 +799,7 @@ export class PlayerSim {
 
   /** One tick of index.js simulatePlayer for the normal-movement branch. */
   step (b: SimBody, c: SimControl): void {
-    if (this.touchesLiquid(b)) { b.inLiquid = true; return }
+    if (this.touchesLiquid(b) || (KERNEL_HAZARD && this.touchesHazard(b))) { b.inLiquid = true; return }
 
     if (Math.abs(b.vx) < SIM.negligibleVelocity) b.vx = 0
     if (Math.abs(b.vy) < SIM.negligibleVelocity) b.vy = 0
@@ -737,7 +808,9 @@ export class PlayerSim {
     if (c.jump) {
       if (b.jumpTicks > 0) b.jumpTicks--
       if (b.onGround && b.jumpTicks === 0) {
-        b.vy = vanillaJump && b.vy > SIM.jumpVelocity ? b.vy : SIM.jumpVelocity
+        // (off honey, as prismarine reads it: SIM_HONEY)
+        const power = (this.kindAt(b.x, Math.floor(b.y) - 0.5, b.z) & SIM_HONEY) !== 0 ? SIM.jumpVelocity * HONEY_JUMP : SIM.jumpVelocity
+        b.vy = vanillaJump && b.vy > power ? b.vy : power
         if (c.sprint) {
           b.vx += c.hx * SIM.sprintJumpBoost
           b.vz += c.hz * SIM.sprintJumpBoost
@@ -810,7 +883,7 @@ export function simSlipOf (name: string): number {
 /**
  * SIM_* kind bits of a block state: climbable (index.js isOnLadder), liquid
  * (water, lava and prismarine's waterLike set, or any waterlogged state),
- * slime, and what breaks a fall.
+ * slime, what breaks a fall, and a fire's or a cobweb's cell.
  */
 export function simKindOf (name: string, waterlogged: boolean): number {
   return (name === 'ladder' || name === 'vine' || name === 'scaffolding' || name.endsWith('_vines') || name.endsWith('_vines_plant') ? SIM_CLIMBABLE : 0) |
@@ -818,7 +891,9 @@ export function simKindOf (name: string, waterlogged: boolean): number {
      name === 'tall_seagrass' || name === 'kelp' || name === 'kelp_plant' || waterlogged ? SIM_LIQUID : 0) |
     (name === 'slime_block' ? SIM_SLIME : 0) |
     (name === 'hay_block' || name === 'honey_block' ? SIM_CUSHION : 0) |
-    (name.endsWith('_bed') ? SIM_BED : 0)
+    (name === 'honey_block' ? SIM_HONEY : 0) |
+    (name.endsWith('_bed') ? SIM_BED : 0) |
+    (name === 'fire' || name === 'soul_fire' || name === 'cobweb' || name === 'web' ? SIM_HAZARD : 0)
 }
 
 /**

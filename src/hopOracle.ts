@@ -35,7 +35,7 @@
 // Where no family lands, a beam over per-tick controls (beamSearch). The
 // whole design, and what it measured: docs/PhysicsHops.md.
 
-import { PlayerSim, newBody, copyBody, SIM, SIM_CLIMBABLE, SIM_SLIME, isVanillaJump } from './playerSim.js'
+import { PlayerSim, newBody, copyBody, SIM, SIM_CLIMBABLE, SIM_SLIME, SIM_LIQUID, SIM_HAZARD, isVanillaJump } from './playerSim.js'
 import { fallDamagePoints, SAFE_FALL } from './fallDamage.js'
 import type { SimBody, SimControl, SimWorld } from './playerSim.js'
 
@@ -171,6 +171,7 @@ export const ROBUST_NUDGE = 0.03
  * last hair of mismatch is left to cover.
  */
 export const LIVE_NUDGE = 0.01
+const LIVE_NUDGE_SAFE = process.env.PF_LIVE_NUDGE_SAFE !== '0'
 /**
  * A goal-side bridge (discover's goalSide) is held to this nudge: it is a hop
  * the pipeline would not try without the exemption, and the ones it opens
@@ -268,6 +269,9 @@ const KICK_LEAN = [0, 0.09, 0.17, 0.26]
 const KICK_OUT = [0.35, 0.52, 0.7, 0.87, 1.05]
 const KICK_JUMP_AT = Array.from({ length: 17 }, (_, i) => i)
 const KICK_TURN_TICKS = [1, 2, 3, 4, 5, 6, 8]
+// mcc-8-2: a body beside a kick's lane needs to steer back onto it.
+// PF_LANE_KICK=0: the live search's old families and budgets (A/B).
+export const LANE_KICK_TICKS = process.env.PF_LANE_KICK === '0' ? 0 : 40_000
 // The pivot family (HopProgram.precise): a run along a world axis toward the
 // landing (a strip or a rail runs along one), the jump pressed facing
 // PIVOT_JUMP off the bearing (at least PIVOT_MIN off the run: the sprint-jump
@@ -468,6 +472,63 @@ const BEAM_FOOTING = 3
 const BEAM_CHECKS_PER_LAYER = 24
 /** PF_BEAM_DEBUG=1: one line per beam layer on stderr (diagnostic). */
 const BEAM_DEBUG = typeof process !== 'undefined' && process.env.PF_BEAM_DEBUG === '1'
+/**
+ * The beam's detour field (DetourField): a beam with no corridor ranks a
+ * body by the way round what stands between it and the landing column, not
+ * the straight line through it. PF_BEAM_DETOUR=0: the straight line (A/B).
+ */
+const BEAM_DETOUR = typeof process === 'undefined' || process.env.PF_BEAM_DETOUR !== '0'
+/**
+ * Its grid step (blocks), the margin round the pads and the column, the most
+ * blocks either side of the column, the clearance a body may jump over (a
+ * box under the higher level plus this is no obstacle), the step between the
+ * body heights tried, the most a detour counts (a point the grid cannot
+ * reach: demoted, never dropped), and the least that counts at all.
+ */
+const DETOUR_STEP = 0.125
+const DETOUR_MARGIN = 3
+const DETOUR_HALF = 7
+const DETOUR_CLEAR = 1
+const DETOUR_DY = 0.5
+const DETOUR_CAP = 6
+const DETOUR_EPS = 0.05
+
+/**
+ * What a detour round the obstacles adds to the straight way to a landing
+ * column, over a grid of points (HopOracle.detourField): at each point the
+ * free-space octile geodesic to the column less the octile line, 0 outside
+ * the grid. A point inside an obstacle (the body cannot stand there at any
+ * height tried) reads the least of its free neighbours, or DETOUR_CAP.
+ */
+class DetourField {
+  constructor (readonly x0: number, readonly z0: number, readonly nx: number, readonly nz: number, readonly free: Uint8Array, readonly excess: Float32Array) {}
+
+  at (x: number, z: number): number {
+    const i = Math.round((x - this.x0) / DETOUR_STEP)
+    const j = Math.round((z - this.z0) / DETOUR_STEP)
+    if (i < 0 || j < 0 || i >= this.nx || j >= this.nz) return 0
+    const k = j * this.nx + i
+    if (this.free[k] === 1) return this.excess[k]
+    let best = DETOUR_CAP
+    for (let dj = -1; dj <= 1; dj++) {
+      for (let di = -1; di <= 1; di++) {
+        const ii = i + di
+        const jj = j + dj
+        if (ii < 0 || jj < 0 || ii >= this.nx || jj >= this.nz) continue
+        const kk = jj * this.nx + ii
+        if (this.free[kk] === 1 && this.excess[kk] < best) best = this.excess[kk]
+      }
+    }
+    return best
+  }
+}
+
+/** The octile length of (dx, dz): an 8-neighbour grid's shortest way with nothing in it. */
+const octile = (dx: number, dz: number): number => {
+  const a = Math.abs(dx)
+  const b = Math.abs(dz)
+  return Math.max(a, b) + (Math.SQRT2 - 1) * Math.min(a, b)
+}
 
 /**
  * A beam state's dedupe key. In the air: position to 1/16, velocity to 1/64
@@ -556,6 +617,8 @@ export class HopOracle {
   private readonly probe = newBody(0, 0, 0)
   private readonly aimPicked = new Int32Array(8)
   private readonly ctl: SimControl = { forward: false, back: false, left: false, right: false, jump: false, sprint: false, sneak: false, hx: 0, hz: -1 }
+  /** mcc-7-2's chain: a moving line-up checks its own controls on a bounded share, never a live search. */
+  private anchorDeadline: number | null = null
   /** The body's half-width (the kernel's). */
   get halfWidth (): number { return this.sim.halfWidth }
   /** Kernel ticks flown by the last discover() (diagnostics). */
@@ -567,6 +630,8 @@ export class HopOracle {
    * flew, and what came back is the answer.
    */
   noVerdict = false
+  /** The last hop() had no stand to fly from or to: the oracle is blind here, which says nothing of the jump (noVerdict is set too). */
+  noStand = false
   /**
    * A budget in kernel ticks, on top of the deadline (0: none). A live
    * search is stopped by its work, not by the clock: the same body in the
@@ -578,6 +643,8 @@ export class HopOracle {
   tickLimit = 0
   /** discover(): the hop being flown is a goal-side bridge (robust() holds it to SIDE_NUDGE). */
   private sideBridge = false
+  /** The beam's detour field (BEAM_DETOUR; a test switches it per oracle). */
+  beamDetour = BEAM_DETOUR
 
   constructor (world: SimWorld, flagsAt: (x: number, y: number, z: number) => number, halfWidth: number, height: number, speedBase = 0.1) {
     this.world = world
@@ -840,18 +907,15 @@ export class HopOracle {
    * level `ty` or above? The most ground it covers before it has fallen
    * past that level — forward held on any headings — is the speed it carries
    * and its air acceleration, summed over the ticks the fall takes, and
-   * nothing in the way adds to either. Past it by a step at most: a body
-   * that comes down beside the column, a step under its top, steps up onto
-   * it (arena mcc-8-2: off a 3/16 panel onto the strip beside the pipe and
-   * up the pipe's 0.19 - the hop the bot stood nine seconds for).
-   * (PF_REACH_PRUNE=0 flies everything, for A/B runs: the programs found are
-   * the same.)
+   * nothing in the way adds to either. (PF_REACH_PRUNE=0 flies everything,
+   * for A/B runs: the programs found are the same.) The level is search()'s
+   * reachY, a step lower where a step-up can carry the body onto the landing.
    */
   private canReach (b: SimBody, sprint: boolean, tx: number, ty: number, tz: number): boolean {
     let y = b.y
     let vy = b.vy
     let n = 0
-    while (n < MAX_AIR && !(vy < 0 && y < ty - SIM.stepHeight)) {
+    while (n < MAX_AIR && !(vy < 0 && y < ty)) {
       y += vy
       vy = (vy - SIM.gravity) * SIM.airdrag
       n++
@@ -866,10 +930,31 @@ export class HopOracle {
     return dx * dx + dz * dz <= (reach + 1e-6) * (reach + 1e-6)
   }
 
+  /** Is there a box with its top a step under `y` (and below it) in column (tx, tz) or one beside it (canReach's step-up allowance)? */
+  private stepUnder (tx: number, tz: number, y: number): boolean {
+    const w = this.world
+    for (let x = tx - 1; x <= tx + 1; x++) {
+      for (let z = tz - 1; z <= tz + 1; z++) {
+        for (let yy = Math.floor(y - SIM.stepHeight) - 1; yy <= Math.floor(y); yy++) {
+          const s = this.sim.stateAt(x, yy, z)
+          if (s < 0 || w.shapeStart[s] < 0) continue
+          for (let k = 0; k < w.shapeCount[s]; k++) {
+            const top = yy + w.boxes[(w.shapeStart[s] + k) * 6 + 4]
+            if (top < y - 1e-6 && top >= y - SIM.stepHeight - 1e-6) return true
+          }
+        }
+      }
+    }
+    return false
+  }
+
   /** Is the search out of budget: its work (tickLimit), or the clock at `deadline`? */
   private expired (deadline: number): boolean {
-    return (this.tickLimit > 0 && this.ticksFlown >= this.tickLimit) || performance.now() > deadline
+    return (this.tickLimit > 0 && this.ticksFlown >= this.tickLimit) || performance.now() > deadline || (this.abort !== null && this.abort())
   }
+
+  /** The search's owner has given it up (the worker's cancel flag): every search ends as if out of time. */
+  abort: (() => boolean) | null = null
 
   /**
    * Fixed headings that bring the rest of this flight down (unobstructed) on
@@ -1066,6 +1151,22 @@ export class HopOracle {
     return !catchTarget && (this.kindAt(t[0], t[1] - 1, t[2]) & SIM_SLIME) !== 0
   }
 
+  // mcc-6-2's neo lands flush against a wall: its inward twin starts inside
+  // the wall and flies a path no live body can. Keep both sides if neither
+  // is clear, and every twin of a start already overlapping a box.
+  private requiredNudges (p: HopProgram, n: number): Array<[number, number]> {
+    const offsets: Array<[number, number]> = [[n, 0], [-n, 0], [0, n], [0, -n]]
+    const start = p.start
+    if (!LIVE_NUDGE_SAFE || start === undefined || n === 0 || this.sim.collides(start)) return offsets
+    const b = copyBody(newBody(0, 0, 0), start)
+    const hits = offsets.map(([nx, nz]) => {
+      b.x = start.x + nx
+      b.z = start.z + nz
+      return this.sim.collides(b)
+    })
+    return offsets.filter((_, i) => !hits[i] || hits[i ^ 1])
+  }
+
   /** Program `p`'s first state nudged by (nx, nz): its live start, or a body come to rest (or hanging, `climb`) at its start point. */
   private origin (p: HopProgram, nx: number, nz: number): Flight | null {
     if (p.start === undefined) return p.climb === true ? this.hang(p.sx + nx, p.sy, p.sz + nz) : this.pad(p.sx + nx, p.sy, p.sz + nz)
@@ -1102,6 +1203,7 @@ export class HopOracle {
     const c = this.ctl
     const rebounds0 = f.rebounds
     for (;;) {
+      if (this.anchorDeadline !== null && this.expired(this.anchorDeadline)) return -1
       if (f.fired) {
         if (f.air >= airUntil || (f.rebounds > rebounds0 && airUntil !== Infinity)) return FLYING
         // the pre-screen, as the program commits to its last heading
@@ -1224,6 +1326,11 @@ export class HopOracle {
         f.leg = f.t
         return FLYING
       }
+      // (a stone the plan goes on from: its touchdown is the landing, not a stop on it - hopChain)
+      if (this.goLanding) {
+        if (this.touch !== null) copyBody(this.touch, b)
+        return t + 1
+      }
       return this.stays(b, p) ? t + 1 : -1
     }
     if (b.y < Math.min(p.sy, p.ty) - 14 - (p.deep === true ? BOUNCE_DROP_LONG : 0)) return -1
@@ -1276,19 +1383,21 @@ export class HopOracle {
       // (a source's pads are all of a kind: a climbable's hang, a floor's rests)
       climb: this.climbing(pads[0].f.b), slimeLand: this.slimeLanding(t, catchTarget), land
     }
+    // (a beam to the landing alone ranks by the way round what is in it: BEAM_DETOUR)
+    const field = corridor.length === 0 ? this.detourField(t, landY, pads) : null
     const nodes: BeamNode[] = []
     let layer: number[] = []
     pads.forEach((pad, i) => {
       // the ensemble, the way robust() will fly the program: its start, nudged
       const start: HopProgram = { ...tpl, sx: pad.f.b.x, sy: pad.f.b.y, sz: pad.f.b.z, start: pad.live, yaw0: Number.isNaN(pad.f.yaw) ? undefined : pad.f.yaw }
-      const nudge = LIVE_NUDGE
+      const nudges = this.requiredNudges(start, LIVE_NUDGE)
       const fs: Flight[] = [flightInto(newFlight(), pad.f)]
-      for (const [nx, nz] of [[nudge, 0], [-nudge, 0], [0, nudge], [0, -nudge]]) {
+      for (const [nx, nz] of nudges) {
         const f = this.origin(start, nx, nz)
         if (f !== null) fs.push(f)
       }
-      if (fs.length < 5) return // a nudged start that cannot rest there: no robust program from this pad
-      nodes.push({ fs, done: [FLYING, FLYING, FLYING, FLYING, FLYING], parent: -1, want: NaN, flags: 0, pad: i, score: 0, wp: reach(pad.f.b, 0) })
+      if (fs.length !== nudges.length + 1) return // a required start cannot rest there: no robust program from this pad
+      nodes.push({ fs, done: fs.map(() => FLYING), parent: -1, want: NaN, flags: 0, pad: i, score: 0, wp: reach(pad.f.b, 0) })
       layer.push(nodes.length - 1)
     })
     const found: HopProgram[] = []
@@ -1351,7 +1460,7 @@ export class HopOracle {
             for (let k = 0; k < fs.length; k++) {
               if (done[k] !== FLYING) continue
               score = Math.max(score, child.wp === way.length - 1
-                ? this.beamScore(fs[k], t, landY, catchTarget, 0)
+                ? this.beamScore(fs[k], t, landY, catchTarget, 0, field)
                 : this.beamScore(fs[k], [way[child.wp][0], way[child.wp][1], way[child.wp][2]], way[child.wp][1], false, tail[child.wp]))
             }
             if (score === Infinity) continue
@@ -1424,17 +1533,25 @@ export class HopOracle {
    * it is, not as a detour (a chain of ice pads is legs that each fall short
    * of the last, and a surcharge on them left the beam standing on the first).
    * `t` is the next waypoint when the beam follows a corridor, and `after` the
-   * corridor's length beyond it.
+   * corridor's length beyond it. With a detour field (to the landing alone,
+   * BEAM_DETOUR) the distance is the way round what is in it; and a body in
+   * the air whose straight line is blocked ranks by that way, not by its
+   * disc, which is blind to the obstacle the body is about to meet.
    */
-  private beamScore (f: Flight, t: [number, number, number], landY: number, catchTarget: boolean, after: number): number {
+  private beamScore (f: Flight, t: [number, number, number], landY: number, catchTarget: boolean, after: number, field: DetourField | null = null): number {
     const b = f.b
     const tcx = t[0] + 0.5
     const tcz = t[2] + 0.5
-    const toGo = Math.hypot(tcx - b.x, tcz - b.z) + after
+    const detour = field !== null ? field.at(b.x, b.z) : 0
+    const toGo = Math.hypot(tcx - b.x, tcz - b.z) + detour + after
     // below the landing, a body climbs back about a block a jump
     const climb = Math.max(0, landY - b.y) * BEAM_CLIMB
     if (catchTarget) return f.t + toGo / BEAM_SPEED + climb
     if (!f.fired) return f.t + toGo / BEAM_SPEED + climb + this.spinUp(b, tcx, tcz)
+    if (detour > DETOUR_EPS) {
+      if (b.vy < 0 && b.y < landY - 0.5 && !this.slimeUnder(b)) return Infinity
+      return f.t + toGo / BEAM_SPEED + climb
+    }
     const disc = this.landingDisc(b, true, landY)
     if (disc === null) {
       // falling, and already under the landing: it cannot get back up —
@@ -1466,6 +1583,185 @@ export class HopOracle {
       return f.t + s + (gap + after) / BEAM_SPEED
     }
     return f.t + s + after / BEAM_SPEED + BEAM_MISS_WEIGHT * Math.max(0, Math.hypot(tcx - cx, tcz - cz) - r)
+  }
+
+  /**
+   * The beam's detour field to landing column `t` (DetourField), over a grid
+   * round the pads and the column: a point is free when a body centred there
+   * clears every collision box at some height from the lower of the pads and
+   * the landing to the higher plus DETOUR_CLEAR (a one-high step or a slab is
+   * jumped, a pane or a fence is not), and its detour is the octile geodesic
+   * over free points to the column (widened by what a landing may hang over)
+   * less the octile line. Null when no point is blocked, or no detour counts:
+   * the beam ranks as it always has. The work is charged to ticksFlown.
+   * Arena opk-2: two panes across a one-wide strip, where the straight line
+   * ranked the bodies diving at the first pane as landing.
+   */
+  private detourField (t: [number, number, number], landY: number, pads: readonly Pad[]): DetourField | null {
+    if (!this.beamDetour) return null
+    const w = this.world
+    const hw = this.sim.halfWidth
+    const height = this.sim.height
+    let lo = landY
+    let hi = landY
+    let ax = t[0]
+    let bx = t[0] + 1
+    let az = t[2]
+    let bz = t[2] + 1
+    for (const p of pads) {
+      const b = p.f.b
+      lo = Math.min(lo, b.y)
+      hi = Math.max(hi, b.y)
+      ax = Math.min(ax, b.x)
+      bx = Math.max(bx, b.x)
+      az = Math.min(az, b.z)
+      bz = Math.max(bz, b.z)
+    }
+    hi += DETOUR_CLEAR
+    const x0 = Math.max(Math.floor(ax) - DETOUR_MARGIN, t[0] - DETOUR_HALF)
+    const x1 = Math.min(Math.ceil(bx) + DETOUR_MARGIN, t[0] + 1 + DETOUR_HALF)
+    const z0 = Math.max(Math.floor(az) - DETOUR_MARGIN, t[2] - DETOUR_HALF)
+    const z1 = Math.min(Math.ceil(bz) + DETOUR_MARGIN, t[2] + 1 + DETOUR_HALF)
+    const nx = Math.round((x1 - x0) / DETOUR_STEP) + 1
+    const nz = Math.round((z1 - z0) / DETOUR_STEP) + 1
+    const n = nx * nz
+    this.ticksFlown += Math.ceil(n / 4)
+    // the heights a point is blocked at (a box overlaps the body's there), counted
+    const blocked = new Uint16Array(n)
+    const mark = new Uint16Array(n)
+    let heights = 0
+    let any = false
+    // (every DETOUR_DY from the lower level to the higher plus the clearance,
+    // and the levels the bodies stand at: a landing under a head-hitter is
+    // free at its floor alone)
+    const ys: number[] = [hi, landY]
+    for (let y = lo; y < hi; y += DETOUR_DY) ys.push(y)
+    for (const p of pads) ys.push(p.f.b.y)
+    ys.sort((a, b) => a - b)
+    for (let s = 0; s < ys.length; s++) {
+      if (s > 0 && ys[s] - ys[s - 1] < 1e-6) continue
+      const fy = ys[s]
+      heights++
+      for (let cy = Math.floor(fy) - 1; cy <= Math.floor(fy + height); cy++) {
+        for (let cz = z0 - 1; cz <= z1; cz++) {
+          for (let cx = x0 - 1; cx <= x1; cx++) {
+            const st = this.sim.stateAt(cx, cy, cz)
+            if (st < 0 || w.shapeStart[st] < 0) continue
+            for (let q = 0; q < w.shapeCount[st]; q++) {
+              const o = (w.shapeStart[st] + q) * 6
+              if (cy + w.boxes[o + 4] <= fy + 1e-7 || cy + w.boxes[o + 1] >= fy + height - 1e-7) continue
+              // the points strictly inside the box widened by the half-width
+              const i0 = Math.max(0, Math.floor((cx + w.boxes[o] - hw - x0) / DETOUR_STEP) + 1)
+              const i1 = Math.min(nx - 1, Math.ceil((cx + w.boxes[o + 3] + hw - x0) / DETOUR_STEP) - 1)
+              const j0 = Math.max(0, Math.floor((cz + w.boxes[o + 2] - hw - z0) / DETOUR_STEP) + 1)
+              const j1 = Math.min(nz - 1, Math.ceil((cz + w.boxes[o + 5] + hw - z0) / DETOUR_STEP) - 1)
+              for (let j = j0; j <= j1; j++) {
+                for (let i = i0; i <= i1; i++) {
+                  const k = j * nx + i
+                  if (mark[k] === heights) continue
+                  mark[k] = heights
+                  blocked[k]++
+                  any = true
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    if (!any) return null
+    const free = new Uint8Array(n)
+    let walls = false
+    for (let k = 0; k < n; k++) {
+      free[k] = blocked[k] < heights ? 1 : 0
+      if (free[k] === 0) walls = true
+    }
+    if (!walls) return null
+    // Dijkstra from the column (its points seeded at their octile to the centre)
+    const cx = t[0] + 0.5
+    const cz = t[2] + 0.5
+    const reach = hw - LAND_OVERLAP
+    const g = new Float64Array(n).fill(Infinity)
+    let hk = new Float64Array(1024)
+    let hv = new Int32Array(1024)
+    let hn = 0
+    const push = (key: number, v: number): void => {
+      if (hn === hk.length) {
+        const k2 = new Float64Array(hn * 2); k2.set(hk); hk = k2
+        const v2 = new Int32Array(hn * 2); v2.set(hv); hv = v2
+      }
+      let i = hn++
+      while (i > 0) {
+        const p = (i - 1) >> 1
+        if (hk[p] <= key) break
+        hk[i] = hk[p]; hv[i] = hv[p]; i = p
+      }
+      hk[i] = key; hv[i] = v
+    }
+    const pop = (): number => {
+      const top = hv[0]
+      const key = hk[--hn]
+      const v = hv[hn]
+      let i = 0
+      for (;;) {
+        let c = 2 * i + 1
+        if (c >= hn) break
+        if (c + 1 < hn && hk[c + 1] < hk[c]) c++
+        if (hk[c] >= key) break
+        hk[i] = hk[c]; hv[i] = hv[c]; i = c
+      }
+      hk[i] = key; hv[i] = v
+      return top
+    }
+    const ci0 = Math.max(0, Math.ceil((t[0] - reach - x0) / DETOUR_STEP))
+    const ci1 = Math.min(nx - 1, Math.floor((t[0] + 1 + reach - x0) / DETOUR_STEP))
+    const cj0 = Math.max(0, Math.ceil((t[2] - reach - z0) / DETOUR_STEP))
+    const cj1 = Math.min(nz - 1, Math.floor((t[2] + 1 + reach - z0) / DETOUR_STEP))
+    for (let j = cj0; j <= cj1; j++) {
+      for (let i = ci0; i <= ci1; i++) {
+        const k = j * nx + i
+        if (free[k] === 0) continue
+        g[k] = octile(x0 + i * DETOUR_STEP - cx, z0 + j * DETOUR_STEP - cz)
+        push(g[k], k)
+      }
+    }
+    // (no free point to land at: the field has nothing to rank by)
+    if (hn === 0) return null
+    const diag = DETOUR_STEP * Math.SQRT2
+    while (hn > 0) {
+      const key = hk[0]
+      const k = pop()
+      if (key > g[k]) continue
+      const i = k % nx
+      const j = (k - i) / nx
+      for (let dj = -1; dj <= 1; dj++) {
+        for (let di = -1; di <= 1; di++) {
+          if (di === 0 && dj === 0) continue
+          const ii = i + di
+          const jj = j + dj
+          if (ii < 0 || jj < 0 || ii >= nx || jj >= nz) continue
+          const kk = jj * nx + ii
+          if (free[kk] === 0) continue
+          // (no corner cut between two blocked points)
+          if (di !== 0 && dj !== 0 && (free[j * nx + ii] === 0 || free[jj * nx + i] === 0)) continue
+          const v = key + (di !== 0 && dj !== 0 ? diag : DETOUR_STEP)
+          if (v < g[kk]) { g[kk] = v; push(v, kk) }
+        }
+      }
+    }
+    const excess = new Float32Array(n)
+    let most = 0
+    for (let j = 0; j < nz; j++) {
+      for (let i = 0; i < nx; i++) {
+        const k = j * nx + i
+        const e = g[k] === Infinity ? DETOUR_CAP : Math.min(DETOUR_CAP, Math.max(0, g[k] - octile(x0 + i * DETOUR_STEP - cx, z0 + j * DETOUR_STEP - cz)))
+        excess[k] = e
+        if (free[k] === 1 && e > most) most = e
+      }
+    }
+    if (BEAM_DEBUG) console.warn(`[beam] detour field ${nx}x${nz} over y ${lo.toFixed(2)}..${hi.toFixed(2)}: most ${most.toFixed(2)}`)
+    if (most <= DETOUR_EPS) return null
+    return new DetourField(x0, z0, nx, nz, free, excess)
   }
 
   /**
@@ -1547,7 +1843,11 @@ export class HopOracle {
     if (this.touch !== null) copyBody(this.touch, b)
     const c = this.ctl
     c.forward = false; c.sprint = false; c.jump = false; c.sneak = true
-    for (let k = 0; k < STAY_TICKS; k++) this.sim.step(b, c)
+    for (let k = 0; k < STAY_TICKS; k++) {
+      if (this.anchorDeadline !== null && this.expired(this.anchorDeadline)) { c.sneak = false; return false }
+      this.sim.step(b, c)
+      if (this.anchorDeadline !== null) this.ticksFlown++
+    }
     c.sneak = false
     if (p.catchTarget) return Math.floor(b.x) === p.tx && Math.floor(b.z) === p.tz && b.y >= p.ty - 1.001 && b.y < p.ty + 1
     // (a landing that slid into liquid did not stay: the kernel freezes a
@@ -1562,20 +1862,42 @@ export class HopOracle {
   /**
    * Is a body at rest carried at node (tx, ty, tz): by its column's own boxes
    * (PlayerSim.supportedIn) - or centred over the column, on a neighbour's
-   * box no more than a step above the node's own stands. Arena mcc-8-2's
-   * strip of 3/16 panels runs beside a closed trapdoor 0.19 higher: every hop
-   * onto the strip comes down on the trapdoor by box overlap, centred over
-   * the strip's column, and none was a landing - the bot stood, gave up and
-   * re-planned three times (9 s) for the one cell its gait could reach. The
-   * executor arrives there as it does (plugin.ts progLanded), and walks on
-   * from it to the node's own stands.
+   * box no more than a step above the node's own stands, with the column's
+   * own footing under its box a step down at most (footingUnder: off the
+   * neighbour it comes down on it). Arena mcc-8-2's strip of 3/16 panels runs
+   * beside a closed trapdoor 0.19 higher: every hop onto the strip comes down
+   * on the trapdoor by box overlap, centred over the strip's column, and
+   * none was a landing - the bot stood, gave up and re-planned three times
+   * (9 s) for the one cell its gait could reach. The executor arrives there
+   * as it does (plugin.ts progLanded).
    */
   private carriedAt (b: SimBody, tx: number, ty: number, tz: number): boolean {
     if (this.sim.supportedIn(b, tx, tz)) return true
     if (!NEIGHBOUR_CARRY || Math.floor(b.x) !== tx || Math.floor(b.z) !== tz || !this.sim.carried(b)) return false
     let floor = Infinity
     for (const st of this.stands(tx, ty, tz)) if (!st.catch) floor = Math.min(floor, st.y)
-    return b.y >= floor && b.y <= floor + SIM.stepHeight
+    return b.y >= floor && b.y <= floor + SIM.stepHeight && this.footingUnder(b, tx, tz)
+  }
+
+  /**
+   * Does a box of column (tx, tz) lie under body `b`'s box, its top at the
+   * feet or up to a step below? (A rest on the take-off's own lip, centred
+   * past a gap from the node's footing, has none: carriedAt.)
+   */
+  private footingUnder (b: SimBody, tx: number, tz: number): boolean {
+    const w = this.world
+    const hw = this.sim.halfWidth
+    for (let yy = Math.floor(b.y - SIM.stepHeight) - 1; yy <= Math.floor(b.y); yy++) {
+      const s = this.sim.stateAt(tx, yy, tz)
+      if (s < 0 || w.shapeStart[s] < 0) continue
+      for (let k = 0; k < w.shapeCount[s]; k++) {
+        const o = (w.shapeStart[s] + k) * 6
+        const top = yy + w.boxes[o + 4]
+        if (top > b.y + 1e-6 || top < b.y - SIM.stepHeight - 1e-6) continue
+        if (b.x - hw < tx + w.boxes[o + 3] && b.x + hw > tx + w.boxes[o] && b.z - hw < tz + w.boxes[o + 5] && b.z + hw > tz + w.boxes[o + 2]) return true
+      }
+    }
+    return false
   }
 
   /**
@@ -1596,7 +1918,7 @@ export class HopOracle {
     // a bounce chain likewise to its first rebound, off the slime it aims at
     this.reboundIsLanding = p.bounces !== undefined && p.bounces.length > 0
     try {
-      for (const [nx, nz] of [[n, 0], [-n, 0], [0, n], [0, -n]]) {
+      for (const [nx, nz] of this.requiredNudges(p, n)) {
         if (this.fly(p, nx, nz) < 0) return -1
       }
     } finally {
@@ -1791,7 +2113,7 @@ export class HopOracle {
   }
 
   /** One family's program classes from start `st`, simplest (gentlest) first. */
-  private * classes (family: Family, st: { x: number, y: number, z: number }, aims: ReadonlyArray<[number, number]>, tcx: number, tcz: number, walk: boolean, grid: boolean, ty: number, runAxes: ReadonlyArray<[number, number]> = AXES8): Generator<ProgramClass> {
+  private * classes (family: Family, st: { x: number, y: number, z: number }, aims: ReadonlyArray<[number, number]>, tcx: number, tcz: number, walk: boolean, grid: boolean, ty: number, runAxes: ReadonlyArray<[number, number]> = AXES8, hint?: HopProgram): Generator<ProgramClass> {
     if (family === 'straight') {
       for (const a of aims) {
         yield { run: point(a[0], a[1]), sprint: true, jumpAts: STRAIGHT_JUMP_AT, turnAirs: NO_TURN, air2s: [point(a[0], a[1])], aim: false }
@@ -1808,6 +2130,29 @@ export class HopOracle {
         for (const [ux, uz] of AXES8) yield { run: dir(ux, uz), sprint, jumpAts: LEAVE_AT, turnAirs: LEAVE_TURN, air2s, aim: true, leave: true }
       }
     } else if (family === 'kick') {
+      if (hint !== undefined) {
+        // mcc-8-2: a parallel run keeps the landing's sideways miss.
+        // Aim past the plan's take-off, measured before its jump tick moves.
+        const f = this.origin(hint, 0, 0)
+        if (f === null || this.advance(f, hint, hint.jumpAt, 0, null) !== FLYING ||
+            f.fired || !f.b.onGround || f.t !== hint.jumpAt) return
+        const u = hint.run
+        const ax = Math.atan2(u.z, u.x)
+        const out = Math.atan2(u.x * hint.air1.z - u.z * hint.air1.x, u.x * hint.air1.x + u.z * hint.air1.z)
+        const side = out >= 0 ? 1 : -1
+        const neighbours = KICK_OUT.map(a => side * a).filter(a => Math.abs(a - out) > 1e-6)
+          .sort((a, b) => Math.abs(a - out) - Math.abs(b - out)).slice(0, 2)
+        const kicks = [hint.air1, ...neighbours.map(a => dir(Math.cos(ax + a), Math.sin(ax + a)))]
+        const runs = [point(f.b.x + 1.5 * u.x, f.b.z + 1.5 * u.z), point(f.b.x + 2 * u.x, f.b.z + 2 * u.z), u]
+        const bearing = Math.atan2(tcz - st.z, tcx - st.x)
+        const air2s = [hint.air2, ...YAW_TURN.map(a => dir(Math.cos(bearing + a), Math.sin(bearing + a)))]
+        for (const kick of kicks) {
+          for (const run of runs) {
+            yield { run, kick, sprint: hint.sprint, jumpAts: KICK_JUMP_AT, turnAirs: KICK_TURN_TICKS, air2s, aim: true }
+          }
+        }
+        return
+      }
       // a run along a world axis (the strip a body is on), turned into the
       // jump at the lip: the jump pressed already facing KICK_OUT off the
       // axis toward the landing's side, held KICK_TURN_TICKS, then the
@@ -1939,7 +2284,7 @@ export class HopOracle {
    * after it and every flight after that, so the family costs its branches,
    * not its programs × their length.
    */
-  private search (pads: readonly Pad[], lands: readonly Stand[], t: [number, number, number], family: Family, deadline: number, walk: boolean, grid: boolean, land?: { x: number, y: number, z: number }): HopProgram | null {
+  private search (pads: readonly Pad[], lands: readonly Stand[], t: [number, number, number], family: Family, deadline: number, walk: boolean, grid: boolean, land?: { x: number, y: number, z: number }, hint?: HopProgram): HopProgram | null {
     const tcx = t[0] + 0.5
     const tcz = t[2] + 0.5
     const catchTarget = lands[0].catch
@@ -1948,7 +2293,12 @@ export class HopOracle {
     // slab's, a closed trapdoor's or a pipe's node is a cell above its top,
     // a carpet's or a wall top's below it; the node's y pruned flights that
     // land on mcc-8-2's pipes, feet 279.19 under nodes at 280)
-    const reachY = lands.reduce((m, s) => Math.min(m, s.y), Infinity)
+    let reachY = lands.reduce((m, s) => Math.min(m, s.y), Infinity)
+    // (a step lower where a box a step under the landing stands in or beside
+    // its column: a body coming down on it steps up onto the landing - arena
+    // mcc-8-2, off a 3/16 panel up the pipe's 0.19; the hop the bot stood
+    // nine seconds for. Not a catch: that holds the body in its column.)
+    if (!catchTarget && this.stepUnder(t[0], t[2], reachY)) reachY -= SIM.stepHeight
     const aimsRaw: Array<[number, number]> = [[tcx, tcz], ...lands.map(p => [p.x, p.z] as [number, number])]
     const aims = aimsRaw.filter((p, i) => aimsRaw.findIndex(q => Math.abs(q[0] - p[0]) < 0.05 && Math.abs(q[1] - p[1]) < 0.05) === i)
     const [run, launch, air, branch] = this.flights
@@ -1973,7 +2323,7 @@ export class HopOracle {
       // where slime may throw it back up, nor off a climbable it may regain.
       const falls = REACH_PRUNE && family !== 'bounce' && !climb && !slimeLand &&
         this.slimeTops(Math.floor(st.x), Math.floor(st.y + 1e-9), Math.floor(st.z)).length === 0
-      for (const cls of this.classes(family, st, aims, tcx, tcz, walk, grid, t[1], runAxes)) {
+      for (const cls of this.classes(family, st, aims, tcx, tcz, walk, grid, t[1], runAxes, hint)) {
         if ((++n & 3) === 0 && this.expired(deadline)) { this.noVerdict = true; return this.quickestRobust(found, deadline) }
         // the run (no jump) and the first air phase (no turn) of this class
         const base: HopProgram = {
@@ -1982,6 +2332,7 @@ export class HopOracle {
         }
         flightInto(run, pad.f)
         for (const j of cls.jumpAts) {
+          if (hint !== undefined && this.expired(deadline)) { this.noVerdict = true; return this.quickestRobust(found, deadline) }
           if (this.advance(run, base, j, 0, null) !== FLYING) break
           // ran off an edge before tick j: no later jump tick is pressed either
           const walkedOff = run.fired
@@ -2099,8 +2450,8 @@ export class HopOracle {
     for (const i of order) {
       if (stop === Infinity && this.expired(deadline)) { this.noVerdict = true; stop = this.ticksFlown + QR_GRACE_TICKS }
       if (this.ticksFlown >= stop) break
-      // (collecting for the next-leg ranking: the robust ones within NEXT_SLACK of the quickest too)
-      if (first !== null && (this.collect === null || found[i].ticks > first.ticks + NEXT_SLACK || this.collect.length >= NEXT_COLLECT)) break
+      // (collecting for the next-leg ranking: the robust ones within its slack of the quickest too)
+      if (first !== null && (this.collect === null || found[i].ticks > first.ticks + this.collectSlack || this.collect.length >= this.collectCap)) break
       const ticks = this.robust(found[i])
       if (ticks < 0) continue
       const r = { ...found[i], ticks }
@@ -2110,10 +2461,39 @@ export class HopOracle {
     return first
   }
 
-  /** quickestRobust(): when set, also receives the robust programs within NEXT_SLACK of each search's quickest (hopFrom's next-leg ranking). */
+  /** quickestRobust(): when set, also receives the robust programs within collectSlack of each search's quickest (hopFrom's next-leg ranking), collectCap in all. */
   private collect: HopProgram[] | null = null
+  private collectSlack = NEXT_SLACK
+  private collectCap = NEXT_COLLECT
   /** stays(): when set, receives the body at the touchdown it judges (touchdownOf). */
   private touch: SimBody | null = null
+  /** A touchdown over the node is the landing, the body going on at once (hopChain). */
+  private goLanding = false
+
+  /**
+   * Does program `p`'s landing hurt (fallDamagePoints over the fall from the
+   * top of its flight)? For one flight (singleFlight): a chain's legs each
+   * start their own fall. False when it does not land.
+   */
+  landingHurts (p: HopProgram, whole = true): boolean {
+    // (a catch hangs on its climbable: no landing, no fall)
+    if (p.catchTarget) return false
+    const track: number[] = []
+    if (this.fly(p, 0, 0, track) < 0 || track.length < 6) return false
+    let top = p.sy
+    for (let i = 0; i < track.length; i += 3) {
+      // (a climbable touched on the way ends the fall there, as the server counts it)
+      if ((this.kindAt(Math.floor(track[i]), Math.floor(track[i + 1]), Math.floor(track[i + 2])) & SIM_CLIMBABLE) !== 0) top = track[i + 1]
+      else top = Math.max(top, track[i + 1])
+    }
+    const x = track[track.length - 3]
+    const y = track[track.length - 2]
+    const z = track[track.length - 1]
+    const kind = this.kindAt(Math.floor(x), Math.floor(y - 0.2), Math.floor(z))
+    // (a slime landing is sneaked onto, as the replay does - sneakLanding - and takes the whole fall)
+    const sneaking = p.slimeLand === true && (kind & SIM_SLIME) !== 0
+    return fallDamagePoints(top - y, Math.max(0, track[track.length - 5] - y), kind, sneaking, whole) >= 1
+  }
 
   /** The body at program `p`'s touchdown, flown from its start, or null. */
   private touchdownOf (p: HopProgram): SimBody | null {
@@ -2159,12 +2539,21 @@ export class HopOracle {
    * quickest comes down all but stopped (NEXT_PINNED: pinned on a post, a
    * wall): one that keeps its speed goes on as quick as any, and the
    * ranking's search work (a fifth to a half more per take-off) buys nothing.
+   * The speed is the one along the way to `next`: arena opk-2's second neo
+   * came down at 0.122, sideways, 0.057 of it toward the finish, and ran four
+   * ticks to get going (PF_NEXT_ALONG=0: the whole speed, for A/B).
    */
   private nextLegPick (best: HopProgram, cands: HopProgram[], next: [number, number, number], deadline: number): HopProgram {
     const pool = cands.filter(p => p.ticks <= best.ticks + NEXT_SLACK).sort((p, q) => p.ticks - q.ticks)
     if (pool.length < 2) return best
     const td0 = this.touchdownOf(best)
-    if (td0 === null || Math.hypot(td0.vx, td0.vz) >= NEXT_PINNED) return best
+    if (td0 === null) return best
+    if (NEXT_ALONG) {
+      const dx = next[0] + 0.5 - td0.x
+      const dz = next[2] + 0.5 - td0.z
+      const d = Math.hypot(dx, dz)
+      if ((d > 1e-6 ? (td0.vx * dx + td0.vz * dz) / d : Math.hypot(td0.vx, td0.vz)) >= NEXT_PINNED) return best
+    } else if (Math.hypot(td0.vx, td0.vz) >= NEXT_PINNED) return best
     const seen: SimBody[] = []
     const stop = this.ticksFlown + NEXT_TOTAL_TICKS
     let pick = best
@@ -2196,11 +2585,13 @@ export class HopOracle {
    */
   hop (r: [number, number, number], t: [number, number, number], deadline: number, families: HopFamilies = 'simple', grid = false, corridor: ReadonlyArray<{ x: number, y: number, z: number }> = [], depthLimit = BEAM_DEPTH): HopProgram | null {
     this.noVerdict = true
+    this.noStand = true
     const lands = this.stands(t[0], t[1], t[2])
     if (lands.length === 0) return null
     const pads = this.padsAt(r[0], r[1], r[2])
     if (pads.length === 0) return null
     this.noVerdict = false
+    this.noStand = false
     if (families === 'beam') return this.beamSearch(pads, lands, t, deadline, corridor, undefined, depthLimit)
     this.deepOnly = families === 'deep'
     try {
@@ -2217,6 +2608,18 @@ export class HopOracle {
 
   /** hop() on the deep family: classes('bounce') yields its deep classes alone. */
   private deepOnly = false
+
+  /**
+   * Does program `p` come down on its own landing in one flight, robustly? A
+   * touch-and-go program (HopProgram.legs: every beam program) holds its nudged
+   * twins only to their first touchdown (robust), and the first touchdown may
+   * be short of the node: a skip past a planned node must land past it, every
+   * twin (plugin.ts SKIP_AHEAD).
+   */
+  singleFlight (p: HopProgram): boolean {
+    if (p.legs !== true) return true
+    return this.robust({ ...p, legs: false }) >= 0
+  }
 
   /**
    * Program `p` re-anchored at body `b` as it is (yaw `yaw`): the same
@@ -2248,7 +2651,11 @@ export class HopOracle {
    * thousandths. The presses' yaws, the rest they leave and the program
    * from it, or null.
    */
-  lineUp (p: HopProgram, b: SimBody, yaw: number, deadline: number): { yaws: number[], rest: SimBody, prog: HopProgram } | null {
+  lineUp (p: HopProgram, b: SimBody, yaw: number, deadline: number, moving?: { reach: number, tried: boolean }): { yaws: number[], delay?: number, rest: SimBody, prog: HopProgram } | null {
+    if (moving !== undefined) {
+      moving.tried = false
+      return MOVING_LINEUP ? this.movingLineUp(p, b, yaw, deadline, moving) : null
+    }
     const c = this.ctl
     const steps = Math.round((2 * Math.PI) / Math.abs(LOOK_STEP))
     // (the yaw after m more LOOK_STEPs from y: HopOracle.turnTo's arithmetic, so the replay's looks reproduce it to the bit)
@@ -2308,6 +2715,119 @@ export class HopOracle {
     return null
   }
 
+  // mcc-7-2's chain need not stop before lining up: aim from the glide's rest.
+  // 'tried' spends the approach's one search only once that rest is near;
+  // the presses still start at b, not at the predicted rest.
+  private movingLineUp (p: HopProgram, b: SimBody, yaw: number, deadline: number, moving: { reach: number, tried: boolean }): ReturnType<HopOracle['lineUp']> {
+    const clone = (q: SimBody): SimBody => copyBody(newBody(0, 0, 0), q)
+    // anchored() changes this.ctl; mcc-7-2's next coast must release every key.
+    const c: SimControl = { forward: false, back: false, left: false, right: false, jump: false, sprint: false, sneak: true, hx: 0, hz: -1 }
+    const safe = (q: SimBody): boolean => {
+      if (!q.onGround || q.vy > 0 || q.inLiquid || Math.abs(q.y - p.sy) > 1e-6 || !this.sim.carried(q)) return false
+      const hw = this.sim.halfWidth
+      for (let y = Math.floor(q.y + 0.001); y <= Math.floor(q.y + this.sim.height - 0.001); y++) {
+        for (let z = Math.floor(q.z - hw + 0.001); z <= Math.floor(q.z + hw - 0.001); z++) {
+          for (let x = Math.floor(q.x - hw + 0.001); x <= Math.floor(q.x + hw - 0.001); x++) {
+            const s = this.sim.stateAt(x, y, z)
+            if (s < 0 || (this.world.kind[s] & (SIM_LIQUID | SIM_HAZARD)) !== 0) return false
+          }
+        }
+      }
+      return true
+    }
+    const step = (q: SimBody, look?: number): boolean => {
+      if (this.expired(deadline)) return false
+      c.forward = look !== undefined
+      if (look !== undefined) { c.hx = -Math.sin(Math.PI - look); c.hz = Math.cos(Math.PI - look) }
+      this.sim.step(q, c)
+      this.ticksFlown++
+      // mcc-8-2's panel can set onGround on the tick the box slides off it.
+      return safe(q)
+    }
+    const coast = (q: SimBody): number => {
+      for (let k = 1; k <= LINEUP_COAST; k++) {
+        if (!step(q)) return -1
+        if (q.vx === 0 && q.vz === 0) return k
+      }
+      return -1
+    }
+    const anchor = (q: SimBody, look: number): HopProgram | null => {
+      if (this.expired(deadline)) return null
+      const limit = this.tickLimit
+      const previous = this.anchorDeadline
+      this.tickLimit = Math.min(limit > 0 ? limit : Infinity, this.ticksFlown + LINEUP_ANCHOR_TICKS)
+      this.anchorDeadline = deadline
+      try { return this.anchored(p, q, look) } finally { this.tickLimit = limit; this.anchorDeadline = previous }
+    }
+    if (p.climb === true || p.deep === true || !safe(b)) return null
+    const glide = clone(b)
+    const glideTicks = coast(glide)
+    if (glideTicks < 0 || Math.hypot(glide.x - p.sx, glide.z - p.sz) > moving.reach) return null
+    moving.tried = true
+    // (the prefix held from the nudged bodies too, not the exact one alone: a
+    // coast that skims a 3/16 panel's edge by less than LIVE_NUDGE is no line-up)
+    const holds = (delay: number, yaws: number[]): boolean => {
+      for (const [nx, nz] of [[LIVE_NUDGE, 0], [-LIVE_NUDGE, 0], [0, LIVE_NUDGE], [0, -LIVE_NUDGE]]) {
+        const q = clone(b)
+        q.x += nx
+        q.z += nz
+        if (this.sim.collides(q) && !this.sim.collides(b)) continue
+        for (let k = 0; k < delay; k++) if (!step(q)) return false
+        for (const y of yaws) if (!step(q, y)) return false
+        if (coast(q) < 0) return false
+      }
+      return true
+    }
+    const zero = anchor(glide, yaw)
+    if (zero !== null && holds(0, [])) return { yaws: [], delay: 0, rest: glide, prog: zero }
+    const steps = Math.round((2 * Math.PI) / Math.abs(LOOK_STEP))
+    const aimed = (from: SimBody, look: number): number =>
+      look + Math.round((Math.atan2(from.x - p.sx, from.z - p.sz) - look) / LOOK_STEP) * LOOK_STEP
+    const first = aimed(glide, yaw)
+    const cands: Array<{ ticks: number, err: number, delay: number, yaws: number[], rest: SimBody }> = []
+    const keep = (q: SimBody, delay: number, yaws: number[]): void => {
+      const ticks = coast(q)
+      if (ticks < 0) return
+      const err = Math.hypot(q.x - p.sx, q.z - p.sz)
+      if (err < LINEUP_ACCEPT) cands.push({ ticks: delay + yaws.length + ticks, err, delay, yaws, rest: q })
+    }
+    // Leave work for the checks: mcc-7-2's long chain must fit the same 60k.
+    const searchEnd = this.tickLimit > 0 ? this.ticksFlown + Math.floor((this.tickLimit - this.ticksFlown) * 0.75) : Infinity
+    const searching = (): boolean => this.ticksFlown < searchEnd && !this.expired(deadline)
+    for (let presses = 1; presses <= 2 && searching(); presses++) {
+      for (let delay = 0; delay <= 1 && searching(); delay++) {
+        const start = clone(b)
+        if (delay !== 0 && !step(start)) continue
+        for (let k = 0; k < steps && searching(); k += presses * LINEUP_STRIDE) {
+          const y1 = first + k * LOOK_STEP
+          const q1 = clone(start)
+          if (!step(q1, y1)) continue
+          if (presses === 1) { keep(q1, delay, [y1]); continue }
+          const end = clone(q1)
+          if (coast(end) < 0) continue
+          const second = aimed(end, y1)
+          for (let dm = -LINEUP_SPREAD; dm <= LINEUP_SPREAD && searching(); dm += 2) {
+            const y2 = second + dm * LOOK_STEP
+            const q = clone(q1)
+            if (step(q, y2)) keep(q, delay, [y1, y2])
+          }
+        }
+      }
+    }
+    cands.sort((u, v) => u.ticks - v.ticks || u.err - v.err)
+    let best: ReturnType<HopOracle['lineUp']> = null
+    let cost = Infinity
+    for (let i = 0; i < cands.length && i < LINEUP_VERIFY && !this.expired(deadline); i++) {
+      const cd = cands[i]
+      const q = anchor(cd.rest, cd.yaws[cd.yaws.length - 1])
+      if (q !== null && cd.ticks + q.ticks < cost && holds(cd.delay, cd.yaws)) {
+        cost = cd.ticks + q.ticks
+        best = { yaws: cd.yaws, delay: cd.delay, rest: cd.rest, prog: q }
+      }
+    }
+    return best
+  }
+
   /**
    * A robust LIVE program to node `t` from body state `b` exactly as it is
    * (the executor's take-off, where no gate would fly the jump): every
@@ -2318,7 +2838,8 @@ export class HopOracle {
    * (NaN: unknown). When no family lands, the beam (beamSearch). Null if
    * nothing lands.
    */
-  hopFrom (b: SimBody, t: [number, number, number], deadline: number, yaw = NaN, land?: { x: number, y: number, z: number }, next?: [number, number, number]): HopProgram | null {
+  hopFrom (b: SimBody, t: [number, number, number], deadline: number, yaw = NaN, land?: { x: number, y: number, z: number }, next?: [number, number, number], beam = true,
+    seed?: ReadonlyArray<'kick' | 'pivot'>, seedTicks = 0, seedFirst = true, hint?: HopProgram): HopProgram | null {
     // (a planned region landing's live search lands in that region: HopProgram.land)
     const lands = land !== undefined ? this.regionOf(t, land) : this.stands(t[0], t[1], t[2])
     if (lands.length === 0) return null
@@ -2327,22 +2848,141 @@ export class HopOracle {
     let best: HopProgram | null = null
     // (with the node after: the programs within NEXT_SLACK of each family's quickest, for the next-leg ranking)
     const cands: HopProgram[] | null = next !== undefined ? [] : null
+    // Seed families (the kick and the pivot are no live families: FAMILIES.all)
+    // on `seedTicks` of their own, in order until one lands, the families'
+    // budget left as it was. From a body come down beside a kick or pivot
+    // plan's line the live families find nothing in all their budget, and the
+    // plan's own family flies it: arena mcc-7-1 a pivot 13t from the landing
+    // (36 ticks to touchdown flown), mcc-8-2 a pivot 17t (28); a kick plan's
+    // landing at mcc-8-2 has a pivot 23t and no kick. `seedFirst`: before the
+    // families, else only where they find nothing.
+    const seeded = (): void => {
+      if (seed === undefined || seed.length === 0) return
+      const limit = this.tickLimit
+      const from = this.ticksFlown
+      this.tickLimit = seedTicks > 0 ? from + seedTicks : limit
+      try {
+        for (const family of seed) {
+          if (this.expired(deadline)) break
+          const p = this.search(pads, lands, t, family, deadline, true, true, land)
+          if (p !== null && (best === null || p.ticks < best.ticks)) best = p
+          if (p !== null) break
+        }
+      } finally {
+        this.tickLimit = limit > 0 && seedTicks > 0 ? limit + (this.ticksFlown - from) : limit
+      }
+    }
     this.collect = cands
     try {
+      // mcc-8-2: try the plan's lane before spending the seed families' work.
+      // The rollout and verification belong to this pass's own allowance.
+      if (LANE_KICK_TICKS > 0 && hint?.family === 'kick' && hint.kick === true && hint.seq === undefined &&
+          hint.run.fixed && hint.air1.fixed && hint.jumpOnLeave !== true && hint.climb !== true && hint.deep !== true &&
+          Number.isInteger(hint.jumpAt) && hint.jumpAt >= 0 && hint.jumpAt <= 16 &&
+          hint.tx === t[0] && hint.ty === t[1] && hint.tz === t[2]) {
+        const limit = this.tickLimit
+        const from = this.ticksFlown
+        this.tickLimit = from + LANE_KICK_TICKS
+        try {
+          if (!this.expired(deadline)) best = this.search(pads, lands, t, 'kick', deadline, false, true, land, hint)
+        } finally {
+          this.tickLimit = limit > 0 ? limit + (this.ticksFlown - from) : limit
+        }
+      }
+      if (seedFirst) seeded()
       for (const family of FAMILIES.all) {
         if (this.expired(deadline)) break
         if (family === 'leave' && best !== null) break
         const p = this.search(pads, lands, t, family, deadline, true, true, land)
         if (p !== null && (best === null || p.ticks < best.ticks)) best = p
       }
+      if (!seedFirst && best === null) seeded()
     } finally {
       this.collect = null
     }
-    if (best === null) return this.beamSearch(pads, lands, t, deadline, [], land)
+    // (the beam where no family lands - unless the caller asked the families alone: plugin.ts SKIP_AHEAD)
+    if (best === null) return beam ? this.beamSearch(pads, lands, t, deadline, [], land) : null
     // the landing that leaves the quickest next leg (arena opk-1: the
     // quickest 9t onto the first arm pins the body on its fence post, the
     // next leg from rest 15t; a 9t landing still moving goes on in 9)
     return cands !== null && next !== undefined ? this.nextLegPick(best, cands, next, deadline) : best
+  }
+
+  /**
+   * The leg onto a stone the plan goes straight on from, picked for the leg
+   * after it: a robust program from body `b` to stone `t` that touches down
+   * over it and goes on (no stop on it: stays() is the wrong test, a stone this
+   * thin stops nothing at the speed the next jump needs), the least total of
+   * its ticks and the next leg's from that touchdown (the same search the
+   * arrival will run, the kernel's flight being the body's to the bit). Null
+   * if no touchdown has a next leg. Arena mcc-5-2, a skull to a 0.125 bar to a
+   * skull: the jump past the bar needs a second ground tick, a quarter of the
+   * tick phases; the gates' touchdown 0.09 further on had none, and 73 ticks
+   * were lost on the bar. `nextGo`: the next leg's landing is a stone too.
+   */
+  hopChain (b: SimBody, t: [number, number, number], next: [number, number, number], deadline: number, yaw = NaN, nextGo = false): HopProgram | null {
+    const lands = this.stands(t[0], t[1], t[2])
+    // (no stand on the node after: no next leg to weigh a touchdown by)
+    if (lands.length === 0 || this.stands(next[0], next[1], next[2]).length === 0) return null
+    const live = copyBody(newBody(0, 0, 0), b)
+    const pads: Pad[] = [{ f: { b: copyBody(newBody(0, 0, 0), b), t: 0, fired: false, air: 0, rebounds: 0, yaw, leg: 0, top: b.y }, live }]
+    // (one budget, the caller's: the searches and the weighing each a share,
+    // the first round leaving the yaw round enough to search and weigh a few)
+    const limit = this.tickLimit
+    const end = limit > 0 ? limit : Infinity
+    const share = (ticks: number, until: number): number => {
+      const at = Math.min(until, this.ticksFlown + ticks)
+      return at === Infinity ? 0 : at
+    }
+    const reserve = CHAIN_SEARCH_TICKS + QR_GRACE_TICKS + CHAIN_YAW_LEGS * NEXT_LEG_TICKS
+    const seen: SimBody[] = []
+    let pick: HopProgram | null = null
+    let pickTotal = Infinity
+    const round = (families: readonly Family[], until: number): void => {
+      const cands: HopProgram[] = []
+      this.collect = cands
+      this.goLanding = true
+      this.tickLimit = share(CHAIN_SEARCH_TICKS, until)
+      for (const family of families) {
+        if (this.expired(deadline)) break
+        this.collectCap = cands.length + CHAIN_PICK_COLLECT
+        this.search(pads, lands, t, family, deadline, true, family === 'yaw')
+      }
+      this.collect = null
+      cands.sort((p, q) => p.ticks - q.ticks)
+      const stop = Math.min(until, this.ticksFlown + CHAIN_PICK_TICKS)
+      this.tickLimit = limit
+      let weighed = 0
+      for (const p of cands) {
+        // (a next leg is never begun where it cannot end: one cut short is no verdict)
+        if (weighed >= CHAIN_PICK_CANDS || this.ticksFlown + NEXT_LEG_TICKS > stop || performance.now() > deadline) break
+        // (no touchdown a tick later can beat the total in hand on a next leg of a run and a flight)
+        if (p.ticks + CHAIN_PICK_LEAST >= pickTotal) break
+        this.goLanding = true
+        const td = this.touchdownOf(p)
+        this.goLanding = nextGo
+        if (td === null) continue
+        if (seen.some(s => Math.abs(s.x - td.x) < 0.02 && Math.abs(s.z - td.z) < 0.02 && Math.abs(s.vx - td.vx) < 0.01 && Math.abs(s.vz - td.vz) < 0.01)) continue
+        seen.push(td)
+        weighed++
+        const n = this.nextLegTicks(td, next, deadline)
+        if (n >= 0 && p.ticks + n < pickTotal) { pickTotal = p.ticks + n; pick = p }
+      }
+    }
+    this.collectSlack = CHAIN_PICK_SLACK
+    try {
+      round(NEXT_FAMILIES, end - reserve)
+      // (the yaw family, five times the work, where no simple touchdown has a
+      // next leg - and there is room left for it to search and weigh some)
+      if (pick === null && !this.expired(deadline) && end - this.ticksFlown >= CHAIN_SEARCH_TICKS + NEXT_LEG_TICKS) round(CHAIN_YAW_FAMILY, end)
+      return pick
+    } finally {
+      this.collect = null
+      this.collectSlack = NEXT_SLACK
+      this.collectCap = NEXT_COLLECT
+      this.goLanding = false
+      this.tickLimit = limit
+    }
   }
 
   // ── regions: the places one planner node holds ─────────────────────────
@@ -2895,12 +3535,29 @@ const SLIME_EDGE = 1.5
 const NEXT_SLACK = 1
 /** A touchdown slower than this horizontally is pinned (nextLegPick ranks only then): opk-1's post-pinned 0.08 against 0.26 moving. */
 const NEXT_PINNED = 0.12
+const NEXT_ALONG = typeof process === 'undefined' || process.env.PF_NEXT_ALONG !== '0'
 const NEXT_COLLECT = 6
 const NEXT_CANDS = 4
 /** ...each next leg searched within NEXT_LEG_TICKS of kernel work, all of them within NEXT_TOTAL_TICKS, by the simple families. */
 const NEXT_LEG_TICKS = 10_000
 const NEXT_TOTAL_TICKS = 40_000
 const NEXT_FAMILIES: readonly Family[] = ['straight', 'run-turn', 'air-turn']
+/**
+ * The two-leg pick (hopChain): programs within CHAIN_PICK_SLACK ticks of a
+ * family's quickest, CHAIN_PICK_COLLECT a family, on CHAIN_SEARCH_TICKS of
+ * kernel work a round; CHAIN_PICK_CANDS distinct touchdowns weighed on
+ * CHAIN_PICK_TICKS a round, all within the caller's budget; CHAIN_PICK_LEAST the
+ * least a next leg takes (the pick stops where no later touchdown can win).
+ */
+const CHAIN_YAW_FAMILY: readonly Family[] = ['yaw']
+const CHAIN_PICK_SLACK = 2
+const CHAIN_PICK_COLLECT = 12
+const CHAIN_PICK_CANDS = 24
+const CHAIN_SEARCH_TICKS = 60_000
+const CHAIN_PICK_TICKS = 110_000
+const CHAIN_PICK_LEAST = 5
+/** Next legs the first round leaves room for the yaw round to weigh (hopChain's reserve). */
+const CHAIN_YAW_LEGS = 3
 /** The committed window's disturbances (commitGate): position COMMIT_POS each way on x and z on entering it, velocity COMMIT_VEL each way on x, y and z at every tick. */
 const COMMIT_POS = 0.5
 const COMMIT_VEL = 0.05
@@ -2925,6 +3582,9 @@ const LINEUP_SPREAD = 12
 const LINEUP_PRESS = 0.059
 const LINEUP_ACCEPT = 0.01
 const LINEUP_VERIFY = 6
+/** mcc-7-2's moving line-up checks the chain's controls, with room left for other prefixes. */
+const MOVING_LINEUP = typeof process === 'undefined' || process.env.PF_MOVING_LINEUP !== '0'
+const LINEUP_ANCHOR_TICKS = 4000
 /** How many nodes back a carry chain may start (chainStart), and the beam depth it gets per tick of its corridor at chain speed (chain). */
 const CHAIN_BACK = 16
 const CHAIN_SLACK = 1.4

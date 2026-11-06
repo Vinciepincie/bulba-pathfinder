@@ -39,6 +39,46 @@ body over dry bricks touches no liquid without a cell read. Warm pipelines:
 mcc-3-1 266 to 178 ms, opk2-1 513 to 459, mcc-7-2 886 to 676, the same
 kernel ticks.
 
+**Fire and cobwebs stop the model** (`SIM_HAZARD`, `KERNEL_HAZARD`). A body
+whose box (a thousandth in) touches a fire's or a soul fire's cell, or a
+cobweb's, stops as a liquid stops it (`inLiquid`): fire has no box, but the
+executor walks a body touching one out before anything else (plugin.ts
+`hazardEscape`), and this model does not slow a body in a web. So no gait
+schedule, program or skip flies through either. Read by 4³ bricks (a third
+bit beside solid and wet) and by cell range as the liquid test is; no
+measurable cost. Arena mcc-8-3: the stair landing came down 0.04 into a
+fire's cell, the escape walked it 0.05 out, and with the asked-jump cap at 45
+degrees the gait and the escape traded 11 ticks of it. The planner's half of
+it is the diagonal rule (`moveGen.ts hazardAt`, below). PF_KERNEL_HAZARD=0
+for A/B.
+
+**No diagonal past a hazard's corner** (extended profile, `MoveGen.hazardAt`
+and its Rust mirror). A diagonal keeps the cheaper of its two corner columns
+(upstream); past a solid corner the box slides off it, but past a cell with
+no box that is never entered (fire, lava, a cobweb: `blocksToAvoid`, not a
+fence or an open door) the body cuts it by up to 0.21. From the feet to the
+head over a jump up, either corner such a cell: no diagonal. Two of the 60
+arena plans changed, mcc-8-1 and mcc-8-3, each to a line of the same cost
+round its fire.
+
+**A cell beside a hazard costs a little more** (extended, `HAZARD_NEAR_COST`
+0.01, `MoveGen.hazardNear` and its Rust mirror, kept per cell a solve). A
+secondary criterion: of two lines that cost the same, the one a block off a
+fire, lava or a cobweb wins; no detour is taken for it (a hundred cells beside
+a hazard to outweigh one block - at 0.25 a cell a long lava-side corridor
+bought one). The gait turns into a node from
+its 0.35 box and carries its speed through the turn, so a line turning beside
+a fire nicks it: on mcc-8-3 every schedule from the stair foot grazed the
+fire's cell by hundredths, the kernel (rightly) refused them all, and the
+gates walked in. Its neighbour test indexes quietly (`cellIndexQuiet`: no
+boundary flag for a cell no move goes to). Changes only mcc-8-1's and mcc-8-3's
+plans; mcc-8-3 21.8-22.0 to 21.5 s. On mcc-8-1 the reshuffled tie meets more
+of the aimed neos no flight makes, which the neo lookahead (below) catches.
+
+**The gait rounds a hazard as it rounds a box** (`Search.roundCorner`,
+`hazardCells`): the rounding policy's first box in the way may be a hazard's
+cell, at any height the body spans, gathered once a search.
+
 **The jump rule follows the bot's own physics.** Vanilla's jumpFromGround
 (1.21.11, LivingEntity and Paper's mapped copy alike) sets the rise to
 max(jumpPower, vy): a jump held on the grounded tick of a slime rebound keeps
@@ -93,10 +133,13 @@ side). The oracle returns the **quickest** robust program, not the first.
 flight covers before it has fallen past the landing's level, by a step at
 most, is the speed it carries plus its air acceleration, summed over the
 ticks the fall takes: nothing in the way adds to either. (The step: a body
-coming down beside the column a step under its top steps up onto it. Held at
-the level itself, the test cut every hop onto mcc-8-2's pipe, which is
-reached off the 3/16 panel beside it and up the pipe's 0.19: the live search
-found none, the bot stood nine seconds for the one its gait flew.) A take-off (and, later, a first air phase)
+coming down beside the column a step under its top steps up onto it - only
+where a box a step under the landing stands in or beside its column, and
+never for a catch, which holds the body in its column; elsewhere the level
+is the landing's own and the pruning unchanged. Held at the level itself, the
+test cut every hop onto mcc-8-2's pipe, which is reached off the 3/16 panel
+beside it and up the pipe's 0.19: the live search found none, the bot stood
+nine seconds for the one its gait flew.) A take-off (and, later, a first air phase)
 the landing column lies beyond is dropped with its whole subtree of turns.
 Sound, so the programs found are the same (`PF_REACH_PRUNE=0` flies
 everything for A/B); not asked where slime could throw the body back up or
@@ -122,10 +165,13 @@ and come down hanging over the strip's edge. The aim sweeps the widened
 column, and the executor retires a program's node by the same test.
 Carried by the column's own boxes - or, centred over the column, by a
 neighbour's box no more than a step above the node's own stands
-(`carriedAt`): mcc-8-2's strip of 3/16 panels runs beside a closed trapdoor
-0.19 higher, and a hop onto the strip comes down on the trapdoor by box
-overlap, centred over the strip. The executor's arrival box already counted
-it (progLanded); the oracle did not, and found no landing there at all.
+(`carriedAt`), with the column's own footing under the box a step down at
+most (`footingUnder`; a rest on the take-off's own lip, centred past a gap
+from the node's footing, is none): mcc-8-2's strip of 3/16 panels runs beside
+a closed trapdoor 0.19 higher, and a hop onto the strip comes down on the
+trapdoor by box overlap, centred over the strip. The executor's arrival box
+already counted it (progLanded); the oracle did not, and found no landing
+there at all.
 
 **Slime.** A landing on a slime top is made with sneak pressed on the
 touchdown tick (`sneakLanding`: in the air, coming down, the feet reaching the
@@ -248,6 +294,23 @@ coast. Programs are the controls themselves (`HopProgram.seq`).
 - **Corridor.** Given the planner's partial path, the beam follows it
   waypoint by waypoint (a chain carries its momentum along the pads the
   planner found).
+- **The way round** (`DetourField`, `BEAM_DETOUR`). A beam to the landing
+  alone ranks a body by the way round what stands between it and the landing
+  column, not the straight line through it. A grid of 1/8-block points round
+  the pads and the column: a point is free when a body centred there clears
+  every collision box at some height from the lower of the pads and the
+  landing to the higher plus a block (a one-high step or a slab is jumped, a
+  two-high pane or a fence is not) - every half block, and the levels the
+  pads and the landing stand at (a landing under a head-hitter is free at its
+  floor alone); its detour is the octile geodesic over free points to the
+  column less the octile line (a point the grid cannot reach: 6, demoted,
+  never dropped). A body in the air whose straight line is blocked ranks by
+  that way, not by its landing disc, which is blind to the obstacle it is
+  about to meet. With no point blocked, or none of the column free, the field
+  is null and the beam ranks as it always has. Arena opk-2's two panes across a one-wide
+  strip: the straight-line beam flew 707k kernel ticks and found nothing; with
+  the field it flies round both panes in 17 ticks from the arrival (375k
+  ticks), 18 from the braked rest (597k).
 - **Bookkeeping.** A body already down (or a twin let go) is never stepped
   again, so a child shares it instead of copying it; and the merge classes
   are integer tuples hashed into a map (collisions compared exactly), not
@@ -409,6 +472,29 @@ mcc-7-1's 3/16 trapdoor strips need a jump some 80 degrees off the run, which
 no other family flies. In the live search it would cost 0.5M ticks a strip
 and starve the beam's verdict, so it stays in the pipeline.
 
+**The planner's strip jumps are flown before they are stitched**
+(`verifiedPath`). A planner jump onto or off a strip - the take-off's or the
+landing's stands span less than 0.35 along the jump, where the planner prices
+a run-up or a landing the body has no room for - is flown: from the known
+rest when it is a path's first move (the body's own at a replan, a program's
+landing), then from the take-off's stand points on the grid of turns, as the
+executor searches a take-off it is stuck at, each on the executor's own
+budget. One that the families searched to their end (or, where they ran out,
+the beam) cannot land is banned as an EDGE (`SnapshotView.bannedEdges`:
+both cores skip that one move, its cells stay open to every other) and the
+path searched again; a budget spent is no verdict, as the executor bans only
+an exhausted search. Momentum chains and slime bounces fly off the jump
+before them and are not asked. Applied to the first search, every follow-up
+that could be kept, every re-solve and every way to an off-path take-off; at
+most 8 bans a path, 16 a pipeline. Arena mcc-8-2: the planner's diagonal
+jumps off P3's 3/16 panel and off the trapdoor beside it onto the strip by
+the pipe fly from nowhere - the executor gave up and re-planned three times,
+3 s each, a strip cell a time (its own ban makes the CELL impassable). Seven
+bans (about 1.5 s of the pipeline) and the pipeline stitches the run-up east
+and a 20-tick straight program onto the pipe: 22.5 s to 15.6 s, no replans.
+If nothing stitches, the worker posts the verified first search (its bans
+kept), not the original.
+
 **The failed search's partial is walked while the pipeline runs**
 (`streamablePrefix`): up to, not including, the earliest point of the walk
 that any level-0 off-path take-off (a vantage, a drop edge) is nearest to,
@@ -419,6 +505,38 @@ pipeline (mcc-3-2: 14 ticks; mcc-4-2: 75); the host's partial rules
 candidate) pair cut mcc-3-1 at a drop by the partial's far end: the bot
 walked 6-14 ticks west and back to the drop behind its start that the
 pipeline chose (take-off at tick 31-37 against 12 unstreamed).
+
+**And its stitched legs, as they are found** (`STREAM_STITCH`,
+`HopPipelineContext.onStitched`). Past 150 ms of a pipeline still running, a
+state pushed closer to the goal than any streamed before is posted as a
+partial (its stitched legs, to the last one's landing: the follow-up's tail is
+no leg, and a later state may branch off before its end), only on along the
+branch already streamed: the bot may be on its legs, and another branch is the
+whole path's to bring. The legs are verified programs onto landings a body stops on;
+the host's cuts (a one-way drop, ice) still hold, so a leg down a drop waits
+for the whole path. Only the round's best kept state is streamed, and only when it is the one the
+search goes on from next (the first kept past the delay could be one a better
+sibling leaves). On the host a program in replay keeps its flight across a
+path update, a line-up for the same program keeps its line-up, and every path
+of a solve must hold the leg flown since it started (a leg the pipeline
+streamed in THIS solve: its nodes are tagged with the solve's generation as
+they come in, before a carried program lands on one; the executor's own live
+program on a partial is no such leg - held to it, mcc-8-2's final was refused
+and re-solved for 27 ticks - and neither is an old solve's): a partial without it is
+not installed, a whole path is dropped - in the air the flight is kept alone
+and the solve made from its landing, on the ground the path cut before its next
+unflown leg. A cancelled pipeline gives up at once (`PF_PIPE_ABORT`: the
+oracle's searches end as if out of time); it used to run to its deadline with
+the next solve queued behind it in the worker.
+mcc-8-2: its first legs were known 0.3 s in, the whole path 3.4 s in, the bot
+ran the first search's prefix down a side line, stood 29 ticks at its end and
+walked 15 back; streamed, the kick took off at tick 59, not 85.
+
+**A path come in mid-flight without the landing is taken up from the landing**
+(`FLIGHT_TRIM`), not from the body in the air: the node nearest a body still
+over its take-off may lie behind where it comes down (mcc-8-2, a streamed path
+from a re-verified first search 3.5 blocks back from a live program's landing:
+70 ticks stood at it, then the futility reset).
 
 **A box grown for an earlier goal is not inherited** (`ensureSnapshot`,
 `INHERITED_BOX_RATIO` 4). mcc-6-1's twice-grown 237x120x206 box carried
@@ -544,12 +662,18 @@ Every schedule is flown the way the executor would fly it:
   landing it stays carried. A post reached at a hop's speed is slid off the
   far side, and is no arrival.
 - **A landing that hurts loses its speed** (below), **slime is the oracle's**
-  (the kernel's bounce is no landing), and no hop of the gait takes off into
-  a turn of more than 45°, no jump the path asks for into one of more than
-  20°. Into a turn a jump flies the old heading; the kernel flies it exactly,
-  so the angles are a cut on the search's work: a flight thrown across the
-  line is one more to refute. At 45° the gait took 73 ticks off 21 routes
-  offline for a quarter more work; at 90° and 180° less, for more.
+  (the kernel's bounce is no landing), and no hop of the gait, nor a jump the
+  path asks for, takes off into a turn of more than 45° (the asked jumps were
+  held to 20° until 2026-10-29: two same-host A/Bs -1.2 to -3.9 s). Into a
+  turn a jump flies the old heading; the kernel flies it exactly, so the
+  angles are a cut on the search's work: a flight thrown across the line is
+  one more to refute. At 45° the gait took 73 ticks off 21 routes offline for
+  a quarter more work; at 90° and 180° less, for more. Being a cut, it gives
+  way where it leaves nothing (`GAIT_ROOT_UNCUT`): a root whose jump it cut
+  and whose feet have no schedule either flies the jump after all (mcc-5-2,
+  down on a skull against a wall, the velocity 7° one way and the next node 40°
+  the other: 47° was 'none' and four ticks of the gates, the hop from there as
+  quick as any).
 - **A landing that hurts costs what the health is worth** (HURT_COST, six
   ticks): a schedule comes down hurt only where that saves it as much. Timed
   alone, a hop off a ledge into a fall that hurts beat running off it by a
@@ -665,7 +789,10 @@ landing, eased or not, and is not re-steered. Air control first, mcc-8-3's
 trapdoor tower held forward through a hop eased from its first air tick
 onto a 3/16 panel top; the head caught the panel above (the body above
 289.2 under a panel at 291), the push was lost and the body fell 200 blocks.
-In ABBA12's 30 routes no kernel hop was ever air-controlled (0 of 314).
+In ABBA12's 30 routes no kernel hop was ever air-controlled (0 of 314). The
+flag ends on any grounded tick, whichever branch takes it: a branch that
+handled a touchdown before the replay's own check left it set, and a later
+flight replayed the old tape without air control.
 
 **No search twice from the same spot.** A program the lined search installs
 skips the program branch's first try (it was the same search); the gate
@@ -703,6 +830,232 @@ moving goes on in 9 (24 to 18, the same search work give or take 12k).
 Only where the quickest comes down all but stopped (under 0.12 a tick
 across, `NEXT_PINNED`): a landing that keeps its speed goes on as quick as
 any, and ranking every take-off cost a fifth to a half more search work.
+The speed is the one along the way to the next node (`NEXT_ALONG`): opk-2's
+second neo came down at 0.122 a tick, sideways, 0.057 of it toward the
+finish, and ran four ticks to get going.
+
+**A live program slower than the plan is not taken on the way to it**
+(`PROG_LIVE_PLAN`). As a planned program's node comes up, a live search from
+the moving body runs first; what it finds is taken only if it is no slower
+than the plan with its line-up (the walk to the start at 0.1 a tick, 4 ticks
+to settle, 2 more). opk2-2's deep bounce re-anchored on arrival in 111 ticks,
+or where it did not, the search's quickest was a 131-tick bounce, taken,
+where the line-up was 6 ticks to the planned 111. At the start (lined up),
+whatever the search finds is taken as before.
+
+**Skip-ahead** (`PhysicsSim.skipAhead`, plugin.ts `SKIP_AHEAD`). Where the
+gait's window stops at a node a planned program leaves from (it is stood on:
+the program takes off from rest there), a live program from the body as it
+is straight to that program's node, when it beats the gait's ticks to the
+stood node plus the least the plan's leg can take (`legFloor`: a standing
+jump's rise in the kernel under the lowest roof on the way - at the stood node
+and every half block on where a body fits, since a roof over the gap cuts the
+arc where the take-off has open sky - then the fall through free air, or a
+walk-off where the node is lower at all, and the ground
+between at most 0.5 a tick past 1.8 free; a floor, never an estimate, so a
+skip is taken only when the plan could not be quicker). Families only, on
+100k kernel ticks, one robust flight that comes down on the node itself
+(`HopOracle.singleFlight`: a touch-and-go program holds its nudged twins only
+to their first touchdown), installed as the node's own live program and flown
+whole; the nodes before it retire at the take-off. Tried on the touchdown
+tick and the one after and at a fresh rest, three searches a node at most;
+one that never takes off is undone (nodes and plan back, braked on the edge
+guard) and its node not tried again; a path installed in flight carries it
+onto the new path's landing node. opk2-1: from the moving body on the 969
+post the yaw family flies the cave moss in 10 ticks, where the bot hopped to
+the 967 post, lined up and flew the planned 12: the map timer 91 to 82.
+
+**Skip-ahead at a neo** (`PhysicsSim.skipNeo`, plugin.ts `SKIP_NEO`). With a
+neo's own live program found (on the arrival, `t0` ticks, or from the braked
+rest), a live program past it straight to the node after, when it beats `t0`
+plus the leg floor from the neo's cell centre; the beam too, with its detour
+field (500k kernel ticks on the arrival, 800k from the rest: a long tick
+costs no ticks). Installed, carried and undone as the skip-ahead's. opk-2's
+double neo flew 18 + 13 ticks with a landing between; one flight round both
+panes takes 17.
+
+**Skip-ahead over walk nodes** (`PhysicsSim.skipWalk`, plugin.ts
+`SKIP_WALK`). On a touchdown or a fresh rest, where the path walks aside to
+its next jump (the walk at least `SKIP_WALK_DETOUR` 0.5 longer than the
+straight line, the jump at most 3 nodes on): the gait's own time to be down
+on that node - its search with the node as the path's end, the phase that
+keeps its feet searched for its best (`GaitGoal.best`), not stopped at its
+first - against one live flight straight there, families only, one flight
+robust to the node itself. Not onto a momentum chain's stepping stone (the
+re-jump is the chain's), and no skip of any kind onto a node a climbable
+carries or catches (a ladder or vine in its cell or under it: the gait's catch
+window flies those; a skip landed on a ladder's plate on parkouradv1, was
+retired in the air, and the catch branch lost the body). opk2-1's ladder top
+walks a block aside to jump the +1 diagonal: 19 ticks; one flight, 10.
+
+**A skip's landing that hurts is charged as the gait charges one**
+(`HopOracle.landingHurts`, `HURT_TICKS`: the stand, the health, the speed),
+or a slower flight with the same fall would beat the gait's charged time. A
+slime landing is sneaked onto, as the replay does, and takes the whole fall;
+the executor's own fall rule (`wholeFall`) applies.
+
+**A neo a few nodes on is judged before the body gets there** (`NEO_AHEAD`,
+`PhysicsSim.hopFromCell`). Once a node, on a gait tick, the first neo within
+3 nodes gets the lined-up verdict from its take-off node's own stands: the
+simple and yaw families, then the beam. Every family flown out with nothing
+landing is the verdict the arrival would reach after braking and searching
+from the moving body and from rest; reached early, the neo is banned and the
+plan replanned while the body walks on (`softReplan`). mcc-8-1's aimed
+four-block neos past a two-high post on a one-wide strip (the planner sweeps
+an aimed neo at a half-width of 0.2, a 0.1 corner allowance kept for the
+neos that slide along a pillar) cost 10-15 ticks each at the take-off; with
+the lookahead mcc-8-1 8.75 to 8.55 s (0 replans) with the near-hazard cost at
+0.01 a cell; mcc-8-3 21.2.
+
+**A planned chain is flown by the kernel, picked for the leg after it**
+(`CHAIN_KERNEL`, `HopOracle.hopChain`). The gait's window stops before a chain
+node and the gates flew it, the first tick a jump landed, blind to the next
+leg. mcc-5-2's chain runs skull, a 0.125 iron-bar arm, skull: the long jump off
+the bar needs one more ground tick on it, and the body keeps `onGround` a tick
+past the bar's edge (vertical collision resolves at the old x/z), so the last
+position over it must be past z -290.8625 - a quarter of the tick phases. Any
+upstream change that moved the touchdown 0.09 on (the 45° asked cap did) left
+no flight at all, and 73 ticks went on brake, creep, wait, the lined and the
+old search, recovery and the 3.5 s futility reset (7.9 to 12.1 s). The pick:
+touch and go onto the stone (`goLanding`: the touchdown over it is the landing,
+no stop asked - a stone that thin stops nothing at the speed the next jump
+needs), programs within 2 ticks of each family's quickest, the least total of
+the leg and the next leg's search from its touchdown, the yaw family where no
+simple touchdown has one, all inside the caller's budget. Traced: `chain
+run-turn 13t` then `straight 16t` = 29 ticks, chosen, not lucky. At rest on a
+chain's stone with no flight (`CHAIN_LOST`) the carried speed and the plan's
+edge are gone together: a replan from there at once, no ban (a start has no
+momentum, so the planner cannot bring the chain back from the rest).
+Only mcc-5-2's first plan holds chains, so the reach is small. Measured and not
+built: the same two-leg pick on every live take-off - replayed over every one
+of the 60-route trace, mcc-6-3 3 ticks, mcc-8-2 1, opk2-1 -1, all else 0.
+
+**A line-up never slides the body off its take-off** (`PROG_LINEUP_BRAKE`,
+`PhysicsSim.holdsOn` with `keyTicks`). Where the line-up's keys and the coast
+after them would leave the support, the body is braked against its velocity
+(sneak off) for as long as the brake keeps it on. Sneak is no guard on a
+panel: prismarine's edge guard asks whether the moved box's cells hold a
+block. mcc-8-2 with streamed legs came down on a 3/16 open-trapdoor panel at
+0.25 b/t with +0.026 sideways: every sneaking line-up and coast slid off in two
+ticks (a 200-block fall); three ticks of brake along the velocity hold it.
+
+**A stuck take-off is given up on the lined search's verdict, from beside it
+too** (`LINED_GIVEUP`). Every family flown out with nothing landing gave the
+take-off up only from the plan's own take-off cell; a run-back leaves the body
+a cell off it, with the old search's 36 ticks and the futility clock to follow
+(tenways-ladder, five of them). Within 1.5 blocks of the node it left, the
+take-off cell's own verdict is asked and given up on, or its program flown; off
+it, a replan from there. A search cut by its budget is no verdict: the old ways
+go on as before. The old search (`solveJump`, whose grid is the yaw family's:
+877 ticks in 42 traced races found nothing) runs only where the lined one gave
+none, and the lined search's beam gets a budget of its own (150k: the shared
+one left it a layer at most in 30 of 88 traced searches).
+
+**On the way to a planned program's start, the plan from the moving body**
+(`PROG_MOVE_ANCHOR`). Each grounded tick within 2 blocks of the start the
+plan is re-anchored at the body as it is (`HopOracle.anchored`: one robust
+flight, under a ms) and taken when it flies no slower than after the rest of
+its line-up (the PROG_LIVE_PLAN estimate). Line-ups in the arena's traces:
+mcc-8-2 42 ticks, mcc-4-2 23, mcc-6-1 12, mcc-7-1/7-2 10, opk-6 9; with it
+mcc-4-2 -18, mcc-6-1 -6, opk-6 -6, mcc-8-2 -6 on the legs. A beam program
+re-anchored or found live is spent past its own verified landing, not at its
+controls' end: the oracle holds the last control on, and the replay does too.
+Same-host A/B of the moving anchor and the walk skip together (2026-10-28,
+31 routes): wasm -3.90 s, JS -3.33, nohop -1.91; mcc-4-2 -0.64, basic3 -0.57,
+parkouradv1 -0.52, mcc-8-2 -0.41, opk2-1 -0.39 (map timer 82 to 75), mcc-8-1
+-0.37, mcc-2-3 -0.30, opk-6 -0.30; nothing slower beyond its noise.
+
+**A kick or pivot plan is searched live in its own family** (`SEED_FAMILY`,
+`HopOracle.hopFrom` seed, `physics.seedFamilies`). The kick and the pivot are
+the planner's families only; a body come down beside such a plan's line found
+nothing in the live families' whole budget (every `from none` of the
+2026-11-04 trace was a budget cut, 101-140k of 100k) and stopped, lined up,
+pressed. At a program node whose plan is a kick or pivot the live search tries
+that family first, then the other, on 150k of their own; at a neo the kick
+after the live families find nothing. Offline at the traced states: a pivot
+13t from mcc-7-1's landing (36 ticks to touchdown flown), a pivot 23t and a
+pivot 17t on mcc-8-2 (29 and 28), a kick 17t from mcc-6-2's neo (24). The
+skip-ahead takes a kick or pivot target too, seeded, and prices the plan's leg
+no lower than its program's ticks (`SKIP_PLAN_LEG`: the floor alone priced
+mcc-7-1's 18t pivot plus its 14-tick exact line-up as a 4-block jump, and the
+13t skip lost). A live pivot replays from the state it was found from, so its
+`precise` (an exact line-up) never comes into it. The cost: a seeded search
+that finds nothing takes 300-400 ms of the main thread instead of 70-90 (no
+ticks: mineflayer catches the backlog up).
+
+**A partial path run out is coasted off, not stopped dead** (`PARTIAL_END_COAST`).
+`fullStop()` zeroes the velocity and snaps the body to its block's centre:
+right at the goal, wrong at the end of a partial whose solve is still running.
+mcc-7-2's whole path came 1.1-1.5 s in; past ~1.4 s the bot ran out of the
+first partial (cut before the ice), was snapped 0.57 off its line at 0.17 b/t,
+and the program's line-up from that dead rest failed its anchor and pressed
+(+6 ticks). Now the keys are let go and the body coasts to rest, where the
+coast with no keys is verified to stay on the support at its level
+(`holdsOn` with `maxDrop` 0.01: no step down off the node the next path leaves
+from) and no fire, lava or cobweb lies in the 3x3 columns round it (`holdsOn`
+sees neither: a coast into them still "holds"); else the stop as before.
+
+**A live start flush against a wall keeps only the nudges that fit**
+(`LIVE_NUDGE_SAFE`, `HopOracle.requiredNudges`). `robust()` flies a live
+program from its start and four copies 0.01 off it; a body pressed flat on a
+wall had one copy 0.01 INSIDE it, which no kernel clamps against the box it
+already overlaps, so it flew a path the body cannot and failed every
+candidate. A copy is dropped only when it collides and the start does not,
+never both of an axis, and the beam builds the same ensemble. mcc-6-2's neo,
+landed flat on its pillar (z = -364 + 0.30001): no live family in 289k ticks
+before, run-turn 16t in 2k with it.
+
+**Speed tricks, measured in the kernel** (bench `speedTricks.ts`): head-hitter
+hops TAPPED (jump released in the air: the held jump re-arms only every 10
+ticks) 0.487 b/t on stone against 0.355 sprint-jumping in the open, 0.967 on
+ice, 0.995 on blue ice; held, no gain at all. The gait taps (a flight presses
+jump on its first tick only) and its pruning bound now lifts to 1.4 where a
+slippery floor is in reach (`GAIT_VMAX_SLIP`; the fixed 0.5 lost half a tick on
+ice under a ceiling). The kernel jumps off honey at 0.4 where prismarine does
+(`SIM_HONEY`: the cell under the floored feet, so a honey STACK, not one block).
+
+**A kick plan's lane, pursued** (`LANE_KICK`, `classes(..., hint)`): from a body
+come down 0.2-0.4 beside a kick plan's run lane (mcc-8-2's 3/16 panels), a
+run parallel to the lane keeps the miss; classes that steer at a point 1.5-2
+blocks past the plan's own take-off on its lane, the plan's kick and its two
+neighbours, every jump tick, on 40k of their own before the seed families.
+**A precise plan lined up from the moving body** (`MOVING_LINEUP`,
+`HopOracle.movingLineUp`): the glide of the moving body to its rest first
+(its anchor, if it holds, is the line-up: let go), else one or two presses
+from the moving body aimed from that glide's end, every candidate coasted to
+rest and anchored there, the prefix held from the nudged bodies too; once per
+approach, after the live search and the moving anchor. mcc-7-2's 107t chain
+anchored at t33, not t35-41. Same-host A/B of these two, the wall-safe
+nudges and the slippery bound (2026-11-06, all 60): -1.54 s; mcc-7-2 -0.71,
+mcc-8-2 -0.63 (stand-still 25-79 ticks -> 4), mcc-6-1 -0.21.
+
+**A teleport across a stale gap is a teleport** (`forcedAtTick`): the fall test
+skips a move over ticks it did not see, and a server position in that gap was
+counted as a fall: opk-8 raced after mcc-7-2 stood 8 ticks settling a
+"61-block fall" at its start.
+
+Same-host session A/B of the seed families, the plan-leg price and the coast
+(2026-11-05, all 60 routes, ABBA, quiet CPU; the coast's hazard and level
+guards came after it): 59 arrive in both arms, -2.02 s in all; mcc-7-1 -1.14
+(t -66: the skip's pivot 13t from the landing, 23 ticks on the leg),
+mcc-6-2 -0.35 (t -26: the neo's kick 17t), mcc-7-2 -0.34, mcc-4-2 -0.24;
+nothing slower beyond its noise (opk2-2 +0.14 and opk2-1 +0.11 one run each,
+basic1 +0.11 at t 1.6).
+
+**A riser's eased flights** (gaitSearch.ts `RISER_EASE`). A jump the path asks
+for that scrapes a riser on its first three rising ticks has the flight it
+took off from flown eased too, forward let go up to six ticks before its
+touchdown: a shorter, slower landing that leaves room to clear the riser.
+opk-2's hop onto the slab came down 0.17 short of the stair, the jump up
+bonked it (0.27 to 0) and crawled on from 0.13; eased 6, the jump clears it
+at 0.26. Only for jumps at depth 1 at most (nested, the eases multiplied the
+work past the budget), on 0.4 of the work left (spent on them, opk2-1's run
+phase had no answer and hopped into a header), and the eased landings are not
+dominated by the un-eased flight's faster bodies ahead (before a rise the
+faster body is the one that bonks; that rule for every rise gained nothing and
+blew the work on the ten-ways courses). Same-host A/B with the along-track
+next-leg gate: -2.55 s over the 31-route book (basic3 -1.27, climb2 -0.54,
+opk-2 -0.38, mcc-2-3 -0.33), no route slower beyond its noise.
 
 **The window ends before a neo** too (`Move.wOff`): the gait flew at it
 straight and came back 'none' or spent, 10-30k work a tick on opk-2 and
@@ -869,7 +1222,10 @@ water and a ladder take the fall with them. The executor counts the fall the
 same way and, after a landing that hurts, decides nothing until the packet is
 in (at best before the next tick, four ticks late when the server stalls;
 eight ticks is when it stops waiting). A packet after a landing only the
-older rule hurts switches the rule for the session.
+older rule hurts switches the rule for the session. A teleport (the body
+moved further than a tick can) ends the fall and any wait owed to the last
+landing: the server put the body anew (arena opk-9 stood 7 ticks at its start
+for opk-7's hurt landing).
 
 Sneaking refuses slime's bounce, and with it slime's spare: a body sneaking
 onto slime takes the whole fall. The executor's onto-slime rule (sneak on the

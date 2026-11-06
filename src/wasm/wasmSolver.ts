@@ -107,6 +107,8 @@ export interface WasmSnapshotInput {
   thin?: Uint8Array | null
   entityIdx: Int32Array
   entityWeight: Int32Array
+  /** Banned (from cell, to cell) move pairs (SnapshotView.bannedEdges). */
+  bannedEdges?: Int32Array | null
 }
 
 export interface WasmSolveOptions {
@@ -256,7 +258,8 @@ export class WasmSolver {
     // ── per-solve blobs: params + entity weights + parkour table ─────────
     const entityCount = snap.entityIdx.length
     const entitySize = entityCount * 8
-    const paramsSize = 4 * 4 + specs.length * 36 + 4 * 2 + 8 * 7 + 4 * 2 + 4 * 2
+    const bannedPairs = snap.bannedEdges != null ? snap.bannedEdges.length >> 1 : 0
+    const paramsSize = 4 * 4 + specs.length * 36 + 4 * 2 + 8 * 7 + 4 * 2 + 4 * 2 + 4 * 2
     // The extended-parkour table is the one the JS reference builds — one
     // geometry source. It is a process constant (~0.7 MB serialized with its
     // aimed variants), so it is uploaded and parsed ONCE and stays resident in
@@ -281,6 +284,7 @@ export class WasmSolver {
     // memory; resident snapshot/dig data stays valid (growth extends).
     const entityPtr = entityCount > 0 ? ex.wasm_alloc(entitySize) : 0
     const extPtr = extBlob !== null ? ex.wasm_alloc(extBlob.byteLength) : 0
+    const bannedPtr = bannedPairs > 0 ? ex.wasm_alloc(bannedPairs * 8) : 0
     const paramsPtr = ex.wasm_alloc(paramsSize)
     if (extBlob !== null) {
       new Uint8Array(ex.memory.buffer).set(new Uint8Array(extBlob), extPtr)
@@ -293,6 +297,10 @@ export class WasmSolver {
         interleaved[i * 2 + 1] = snap.entityWeight[i]
       }
       new Uint8Array(ex.memory.buffer).set(new Uint8Array(interleaved.buffer), entityPtr)
+    }
+    if (bannedPairs > 0) {
+      const pairs = (snap.bannedEdges as Int32Array).slice(0, bannedPairs * 2)
+      new Uint8Array(ex.memory.buffer).set(new Uint8Array(pairs.buffer), bannedPtr)
     }
 
     const view = new DataView(ex.memory.buffer)
@@ -328,6 +336,7 @@ export class WasmSolver {
     f64(opts.searchRadius)
     u32(entityPtr); u32(entityCount)
     u32(extPtr); u32(extBlob !== null ? extBlob.byteLength : 0)
+    u32(bannedPtr); u32(bannedPairs)
 
     try {
       const initT0 = timing ? performance.now() : 0
@@ -376,6 +385,7 @@ export class WasmSolver {
       ex.wasm_free(paramsPtr, paramsSize)
       if (entityPtr) ex.wasm_free(entityPtr, entitySize)
       if (extPtr) ex.wasm_free(extPtr, (extBlob as ArrayBuffer).byteLength)
+      if (bannedPtr) ex.wasm_free(bannedPtr, bannedPairs * 8)
     }
   }
 

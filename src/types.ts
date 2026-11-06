@@ -382,7 +382,7 @@ export interface PhysicsLike {
   /** Would this control combination actually move the body, safely? */
   canNudge (control: { forward?: boolean, back?: boolean, left?: boolean, right?: boolean, jump?: boolean, sneak?: boolean }, ticks?: number): boolean
   /** Optional: these keys a tick (null: the controls as set), then a coast to rest - still on what carries it (physics.ts holdsOn)? */
-  holdsOn? (keys: { forward?: boolean, back?: boolean, sneak?: boolean } | null, ticks?: number): boolean
+  holdsOn? (keys: { forward?: boolean, back?: boolean, sneak?: boolean } | null, ticks?: number, keyTicks?: number, maxDrop?: number): boolean
   /** A take-off heading offset that lands this jump, or null. */
   bestHeading (path: XYZ[], jump: boolean, sprint: boolean): number | null
   /** A heading offset that WALKS a flat step round a clipped corner, or null. */
@@ -415,7 +415,24 @@ export interface PhysicsLike {
   /** Optional: the movement-speed attribute without sprinting (the worker kernel's speed). */
   walkSpeed? (): number
   /** Optional: a live control program to this planner node from the body as it is (physics.ts hopFrom). */
-  hopFrom? (cell: readonly [number, number, number], budgetTicks: number, land?: { x: number, y: number, z: number }, next?: readonly [number, number, number]): import('./hopOracle.js').HopProgram | null
+  hopFrom? (cell: readonly [number, number, number], budgetTicks: number, land?: { x: number, y: number, z: number }, next?: readonly [number, number, number], beam?: boolean,
+    seed?: ReadonlyArray<'kick' | 'pivot'>, seedFirst?: boolean): import('./hopOracle.js').HopProgram | null
+  /** Optional: a live program straight past the gait's stood node to the one a planned program leaves for (physics.ts skipAhead, plugin.ts SKIP_AHEAD). */
+  skipAhead? (path: ReadonlyArray<XYZ & { parkour?: boolean }>, drive: GaitDrive): { program: import('./hopOracle.js').HopProgram, cut: number } | null
+  /** Did the last skipAhead() fly a search? */
+  skipSearched?: boolean
+  /** Skip-ahead at a neo (plugin.ts SKIP_NEO): a live program past neo path[0] to path[1], against its own program's `t0` ticks. */
+  skipNeo? (path: ReadonlyArray<XYZ & { parkour?: boolean }>, t0: number, rest: boolean): { program: import('./hopOracle.js').HopProgram, cut: number } | null
+  /** Optional: had the last hopLinedUp no stand to fly from or to (physics.ts linedVerdict)? */
+  hopNoStand?: boolean
+  /** Optional: a live program onto a stone the plan goes straight on from, picked for the leg after it (physics.ts hopChain, plugin.ts CHAIN_KERNEL). */
+  hopChain? (cell: readonly [number, number, number], next: readonly [number, number, number], budgetTicks: number, nextGo?: boolean): import('./hopOracle.js').HopProgram | null
+  /** Optional: the lined-up verdict on node `to` from node `from` before the body is there (physics.ts hopFromCell, plugin.ts NEO_AHEAD). */
+  hopFromCell? (from: readonly [number, number, number], to: readonly [number, number, number], budgetTicks: number, beam?: boolean): import('./hopOracle.js').HopProgram | null
+  /** Optional: the cell the last lined verdict was flown from (physics.ts linedVerdict). */
+  linedFrom?: readonly [number, number, number] | null
+  /** Skip-ahead over walk nodes (plugin.ts SKIP_WALK): a live program past walked path[0..c-1] to the first jump, against the gait's own way there. */
+  skipWalk? (path: ReadonlyArray<XYZ & { parkour?: boolean }>, allowed: (m: XYZ) => boolean): { program: import('./hopOracle.js').HopProgram, cut: number } | null
   /** On the ground, nothing under the box: the latched tick (HopProgram.jumpOnLeave); null without a kernel. */
   latchedNow? (): boolean | null
   /** Optional: a control program to this planner node from rest at a stand point of the body's node (physics.ts hopLinedUp). */
@@ -426,8 +443,8 @@ export interface PhysicsLike {
   probeVanillaJump? (): boolean
   /** Optional: a deep bounce's live check - does the rest of it arrive, does its abort land in the pool (physics.ts deepVerdict)? */
   deepVerdict? (prog: import('./hopOracle.js').HopProgram, t: number, fired: boolean, air: number, rebounds: number): { arrives: boolean, abortable: boolean } | null
-  /** Optional: the exact line-up for a precision program from the body at rest (physics.ts hopLineUp). */
-  hopLineUp? (prog: import('./hopOracle.js').HopProgram, budgetTicks: number): { yaws: number[], prog: import('./hopOracle.js').HopProgram } | null
+  /** mcc-7-2's moving line-up spends its attempt only at a safe, near glide end (moving.tried); delay precedes the presses. */
+  hopLineUp? (prog: import('./hopOracle.js').HopProgram, budgetTicks: number, moving?: { reach: number, tried: boolean }): { yaws: number[], delay?: number, prog: import('./hopOracle.js').HopProgram } | null
   /** Why the last hopFrom / hopLinedUp came out as it did. Trace diagnostics. */
   hopNote?: string
   /** Did the last hopLinedUp fly every family's programs and land none (a verdict, not a timeout)? */
@@ -458,6 +475,15 @@ export interface GaitDrive {
   ease: number
   yaw: number
   sprint: boolean
+  /** The kernel's ticks to the window's goal (the better of its hop and run schedules; Infinity: none). */
+  ticks?: number
+  /** The path index of the node the window stopped short of, a program (or chain, via, neo) leaving from the one before it; -1 when not cut so. */
+  cut?: number
+  /** The window's goal as the search ended it (an index into the path) and whether it was a stop there (GaitResult.goal). */
+  goal?: number
+  goalLast?: boolean
+  /** Kernel ticks the search flew. */
+  work?: number
 }
 
 export type { Vec3 }

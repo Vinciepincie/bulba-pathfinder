@@ -49,24 +49,39 @@ export interface HopPipelineContext {
    */
   startRest?: { x: number, y: number, z: number } | null
   /**
-   * Ban landing cell (x, y, z) for every solve after this one (an entity
-   * weight of BAN_WEIGHT: impassable to both cores, as the executor bans a
-   * take-off it could not fly). Absent: no planner jump is verified
-   * (stitchHops verifiedFollowUp).
+   * Ban the move from cell `from` to cell `to` for every solve after this
+   * one (SnapshotView.bannedEdges: both cores skip it, the cells stay open to
+   * every other move). Absent: no planner jump is verified (stitchHops
+   * verifiedPath).
    */
-  ban?: (x: number, y: number, z: number) => void
+  banEdge?: (from: { x: number, y: number, z: number }, to: { x: number, y: number, z: number }) => void
+  /** The first search as verified (stitchHops verifiedPath), when that changed it: what the worker posts if nothing stitches. */
+  onVerifiedFirst?: (r: RawSolveResult) => void
+  /**
+   * A stitched way to a landing no search reached before, past STREAM_AFTER_MS
+   * of a pipeline still running, for the bot to go on along meanwhile (its legs
+   * flown and verified, each landing one a body stops on): the worker's partial.
+   */
+  onStitched?: (path: RawPathNode[]) => void
+  /** The host has cancelled the solve: the pipeline gives up at once (its result would be dropped). */
+  cancelled?: () => boolean
 }
 
 /**
- * verifiedFollowUp: the kernel ticks a planner jump off a known rest is flown
- * for (the executor's own search at a rest, plugin.ts TAKEOFF_REST_TICKS), the
- * take-off it is asked for (its stands span less than VERIFY_NARROW along the
- * jump: a strip, where the planner prices a run-up the body has no room for),
- * and the bans one follow-up may take before it stands as it is.
+ * verifiedPath: the kernel ticks one planner jump is flown for (the executor's
+ * own searches at a rest and from the stand points, plugin.ts
+ * TAKEOFF_REST_TICKS / TAKEOFF_LINED_TICKS), the footing it is asked for (the
+ * take-off's or the landing's stands span less than VERIFY_NARROW along the
+ * jump: a strip, where the planner prices a run-up or a landing the body has
+ * no room for), the bans one path may take before it stands, and the bans of
+ * a whole pipeline.
  */
 const VERIFY_TICKS = 200_000
+/** ...and the beam after the families, from stands (the executor's for a beam at a rest, plugin.ts TAKEOFF_REST_BEAM_TICKS). */
+const VERIFY_BEAM_TICKS = 300_000
 const VERIFY_NARROW = 0.35
-const VERIFY_BANS = 3
+const VERIFY_BANS = 8
+const VERIFY_BANS_TOTAL = 16
 
 /**
  * Goal-side closure bounds: predecessors are looked for within a hop's reach
@@ -168,6 +183,11 @@ const MAX_REGION_ROUNDS = 20
 const REGION_SLACK = 1
 /** Nodes at the end of the best partial path the oracle takes off from. */
 const SOURCES = 8
+/**
+ * A pipeline streams nothing for this long (ms): one done sooner reaches the
+ * bot as a whole path before the bot could use a part of it.
+ */
+const STREAM_AFTER_MS = 150
 /** Candidate hops per round, each judged by a follow-up search. */
 const EDGES = 6
 /**
@@ -467,6 +487,8 @@ function stitchTime (path: ReadonlyArray<RawPathNode>): number {
  */
 export function stitchHops (first: RawSolveResult, start: XYZ, ctx: HopPipelineContext): RawSolveResult | null {
   const t0 = performance.now()
+  // (the first search's own think time: a verified re-solve's is inside this pipeline's)
+  const firstTime = first.time
   const h = (n: XYZ): number => ctx.heuristic(n.x, n.y, n.z)
   const last = (r: RawSolveResult, at: XYZ): XYZ => r.path.length > 0 ? r.path[r.path.length - 1] : at
   // (progress extends the deadline: PROGRESS_*)
@@ -482,59 +504,116 @@ export function stitchHops (first: RawSolveResult, start: XYZ, ctx: HopPipelineC
   const chunks = new Map<string, [number, number]>()
   const addChunks = (r: RawSolveResult): void => { for (const c of r.touchedChunks) chunks.set(`${c[0]},${c[1]}`, c) }
   addChunks(first)
-  /** Does take-off cell `from`'s stands span less than VERIFY_NARROW along the jump to `n` (a strip)? */
-  const narrowTakeoff = (from: XYZ, n: XYZ): boolean => {
-    const along = Math.abs(n.x - from.x) >= Math.abs(n.z - from.z)
-    let lo = Infinity
-    let hi = -Infinity
-    for (const s of ctx.oracle.stands(from.x, from.y, from.z)) {
-      if (s.catch) continue
-      lo = Math.min(lo, along ? s.x : s.z)
-      hi = Math.max(hi, along ? s.x : s.z)
-    }
-    return hi - lo < VERIFY_NARROW
-  }
   /**
-   * Follow-up `f` from `from`, its first move a planner jump off a narrow
-   * take-off, flown first from `rest` - the body's own at a replan, a
-   * program's landing - as the executor will search it there; none landing,
-   * its landing cell is banned (ctx.ban) and the follow-up searched again
-   * (`again`). Arena mcc-8-2: the planner's jump off P3's 3/16 panel onto
-   * the strip beside the pipe flies from no rest on P3, and the executor gave
-   * up and re-planned three times, 3 s each, banning a strip cell a time,
-   * before a plan took the pipe.
+   * Do the stands of take-off `from` or landing `n` span less than
+   * VERIFY_NARROW along the jump between them (a strip)? False where either
+   * has none: the oracle has no model of that footing.
    */
-  const verifiedFollowUp = (from: XYZ, rest: XYZ, f: RawSolveResult, again: () => RawSolveResult): RawSolveResult => {
-    if (ctx.ban === undefined) return f
-    for (let k = 0; k < VERIFY_BANS && f.path.length > 0; k++) {
-      const n = f.path[0]
-      if (n.parkour !== true || (n.program !== null && n.program !== undefined) || !narrowTakeoff(from, n)) return f
-      const b = newBody(rest.x, rest.y, rest.z)
-      b.onGround = true
-      b.vy = -SIM.gravity * SIM.airdrag
-      ctx.oracle.tickLimit = VERIFY_TICKS
-      let flies = false
-      try {
-        flies = ctx.oracle.hopFrom(b, [n.x, n.y, n.z], ctx.deadline) !== null
-      } finally {
-        ctx.oracle.tickLimit = 0
+  const narrowJump = (from: XYZ, n: XYZ): boolean => {
+    const along = Math.abs(n.x - from.x) >= Math.abs(n.z - from.z)
+    const span = (c: XYZ): number => {
+      let lo = Infinity
+      let hi = -Infinity
+      for (const s of ctx.oracle.stands(c.x, c.y, c.z)) {
+        if (s.catch) continue
+        lo = Math.min(lo, along ? s.x : s.z)
+        hi = Math.max(hi, along ? s.x : s.z)
       }
-      if (DEBUG) console.warn(`[hops]   verify ${from.x},${from.y},${from.z} -> ${n.x},${n.y},${n.z} from ${rest.x.toFixed(2)},${rest.y.toFixed(2)},${rest.z.toFixed(2)}: ${flies ? 'flies' : 'none, banned'}`)
-      if (flies || performance.now() >= ctx.deadline) return f
-      ctx.ban(n.x, n.y, n.z)
-      f = again()
-      visited += f.visitedNodes
-      generated += f.generatedNodes
+      return hi - lo
     }
-    return f
+    const a = span(from)
+    const b = span(n)
+    return a >= 0 && b >= 0 && (a < VERIFY_NARROW || b < VERIFY_NARROW)
   }
-  // (a replan from the body's own rest: the first search's first jump, flown from there)
-  if (ctx.startRest != null) {
+  /** Planner jumps verifiedPath has flown (they land) or banned, by from:to cells. */
+  const verifiedJumps = new Set<string>()
+  let bans = 0
+  /**
+   * Path `r` from `from` with its planner jumps that are no jumps banned:
+   * each one onto or off a strip (narrowJump) is flown first - from `rest`
+   * when it is the path's first move off a known rest (the body's own at a
+   * replan, a program's landing), then from its take-off's stand points on
+   * the grid of turns, as the executor searches a take-off it is stuck at
+   * (plugin.ts: at the rest, then hopLinedUp) - and one that no search run
+   * to its end lands (a budget spent is no verdict: the executor bans only an
+   * exhausted search: the families run to their end with nothing, or the
+   * beam where they ran out) is banned (ctx.banEdge) and the path searched again
+   * (`again`). Momentum chains and slime bounces are flown off the jump
+   * before them, never from rest: not asked. Arena mcc-8-2: the planner's
+   * jumps onto the strip of 3/16 panels beside the pipe fly from nowhere, and
+   * the executor gave up and re-planned three times, 3 s each, a strip cell a
+   * time, before a plan took the pipe.
+   */
+  const verifiedPath = (from: XYZ, rest: XYZ | null, r: RawSolveResult, again: () => RawSolveResult): RawSolveResult => {
+    if (ctx.banEdge === undefined) return r
+    const o = ctx.oracle
+    // one search on its own budget: did it land a flight, and did it run to its end?
+    const attempt = (ticks: number, fly: () => unknown): { found: boolean, complete: boolean } => {
+      o.tickLimit = o.ticksFlown + ticks
+      o.noVerdict = false
+      try {
+        return fly() !== null ? { found: true, complete: true } : { found: false, complete: !o.noVerdict }
+      } finally {
+        o.tickLimit = 0
+      }
+    }
+    scan: for (let k = 0; k <= VERIFY_BANS; k++) {
+      let prev = from
+      for (let i = 0; i < r.path.length; i++) {
+        const n = r.path[i]
+        const p = prev
+        prev = n
+        if (n.parkour !== true || (n.program !== null && n.program !== undefined)) continue
+        if (n.chain === true || (n.via !== null && n.via !== undefined)) continue
+        const key = `${p.x},${p.y},${p.z}:${n.x},${n.y},${n.z}`
+        if (verifiedJumps.has(key) || !narrowJump(p, n)) continue
+        if (k === VERIFY_BANS || bans >= VERIFY_BANS_TOTAL || performance.now() >= ctx.deadline) return r
+        const tV = performance.now()
+        const fromRest = i === 0 && rest !== null
+        let res = { found: false, complete: false }
+        let beamed = false
+        if (fromRest) {
+          const at = rest as XYZ
+          const b = newBody(at.x, at.y, at.z)
+          b.onGround = true
+          b.vy = -SIM.gravity * SIM.airdrag
+          res = attempt(VERIFY_TICKS, () => o.hopFrom(b, [n.x, n.y, n.z], ctx.deadline))
+        }
+        if (!res.found) {
+          // (the families run to their end with nothing are the verdict, as the
+          // executor's ban; the beam only where they ran out of budget)
+          res = attempt(VERIFY_TICKS, () => o.hop([p.x, p.y, p.z], [n.x, n.y, n.z], ctx.deadline, 'all', true))
+          if (!res.found && !res.complete) {
+            beamed = true
+            res = attempt(VERIFY_BEAM_TICKS, () => o.hop([p.x, p.y, p.z], [n.x, n.y, n.z], ctx.deadline, 'beam'))
+          }
+        }
+        verifiedJumps.add(key)
+        const verdict = res.found ? 'flies' : !res.complete ? 'no verdict' : 'none, banned'
+        if (DEBUG) {
+          const via = fromRest ? ` from ${(rest as XYZ).x.toFixed(2)},${(rest as XYZ).y.toFixed(2)},${(rest as XYZ).z.toFixed(2)}` : ''
+          console.warn(`[hops]   verify ${p.x},${p.y},${p.z} -> ${n.x},${n.y},${n.z}${n.run === true ? ' (run)' : ''}${via}: ${verdict}${beamed ? ' (beam)' : ''} (${(performance.now() - tV).toFixed(0)} ms)`)
+        }
+        if (res.found || !res.complete) continue
+        ctx.banEdge(p, n)
+        bans++
+        r = again()
+        visited += r.visitedNodes
+        generated += r.generatedNodes
+        continue scan
+      }
+      return r
+    }
+    return r
+  }
+  // (the first search's planner jumps: from the body's own rest at a replan)
+  {
     const r0 = first
-    first = verifiedFollowUp(start, ctx.startRest, first, () => ctx.solve(start, Math.max(FOLLOW_UP_MIN_MS, (ctx.deadline - performance.now()) * DISCOVER_SHARE)))
+    first = verifiedPath(start, ctx.startRest ?? null, first, () => ctx.solve(start, Math.max(FOLLOW_UP_MIN_MS, (ctx.deadline - performance.now()) * DISCOVER_SHARE)))
     if (first !== r0) {
       addChunks(first)
       bestSeen = h(last(first, start))
+      ctx.onVerifiedFirst?.(first)
     }
   }
   // (the goal side: computed once, against the FIRST search's reach, at the first escalation that uses it)
@@ -599,6 +678,9 @@ export function stitchHops (first: RawSolveResult, start: XYZ, ctx: HopPipelineC
   }
   const tried = new Set<string>()
   let expansions = 0
+  /** The closest a streamed way has got to the goal, and its legs (ctx.onStitched). */
+  let bestStreamed = Infinity
+  let streamedHops: RawPathNode[] = []
   while (frontier.length > 0) {
     frontier.sort((a, b) => a.tier - b.tier || a.level - b.level || a.score - b.score || (a.time ?? 0) - (b.time ?? 0))
     const st = frontier.shift() as StitchState
@@ -612,7 +694,7 @@ export function stitchHops (first: RawSolveResult, start: XYZ, ctx: HopPipelineC
         status: 'success',
         cancelled: false,
         cost,
-        time: first.time + (performance.now() - t0),
+        time: firstTime + (performance.now() - t0),
         visitedNodes: visited,
         generatedNodes: generated,
         path,
@@ -620,7 +702,7 @@ export function stitchHops (first: RawSolveResult, start: XYZ, ctx: HopPipelineC
         boundaryLimited: false
       }
     }
-    if (performance.now() >= ctx.deadline) return null
+    if (performance.now() >= ctx.deadline || ctx.cancelled?.() === true) return null
     // (a region state has one level: simple families from its rest)
     if (st.depth >= (st.rest !== null ? MAX_REGION_ROUNDS : MAX_ROUNDS) || st.level > (st.rest !== null ? 0 : 4)) continue
     // (level 1 is the tail when level 0 skipped it; otherwise straight on to the frontier, no re-solve)
@@ -638,10 +720,12 @@ export function stitchHops (first: RawSolveResult, start: XYZ, ctx: HopPipelineC
       // the follow-ups (or a search to one cell) overwrote what `reached` answers for
       // (a share of what is left, as a follow-up gets: one search that floods
       // its box must not take the whole think budget)
-      cur = ctx.solve(curStart, Math.max(FOLLOW_UP_MIN_MS, (ctx.deadline - performance.now()) * DISCOVER_SHARE))
+      const resolve = (): RawSolveResult => ctx.solve(curStart, Math.max(FOLLOW_UP_MIN_MS, (ctx.deadline - performance.now()) * DISCOVER_SHARE))
+      cur = resolve()
       reachedFor = curStart
       visited += cur.visitedNodes
       generated += cur.generatedNodes
+      cur = verifiedPath(curStart, st.rest, cur, resolve)
     }
     const bestH = h(last(cur, curStart))
     const sources: XYZ[] = [curStart, ...cur.path.map(n => ({ x: n.x, y: n.y, z: n.z }))].slice(-SOURCES)
@@ -737,10 +821,12 @@ export function stitchHops (first: RawSolveResult, start: XYZ, ctx: HopPipelineC
     if (st.rest === null && st.level < 4 && st.dropsOnly !== true) frontier.push({ ...st, cur, level: st.level + 1, tailSkipped, deferL0: deferNext, dropsOnly: undefined })
     if (DEBUG) console.warn(`[hops] L${st.level} #${expansions} depth ${st.depth} from ${curStart.x},${curStart.y},${curStart.z}: ${cur.status} path ${cur.path.length} best h ${bestH.toFixed(1)}; ${edges.length} edges in ${(performance.now() - tD).toFixed(0)} ms (${ctx.oracle.ticksFlown} ticks)${high.length > 0 ? `; vantages ${high.map(v => `${v.x},${v.y},${v.z}`).join(' ')}` : ''}${drops.length > 0 ? `; drops ${drops.map(v => `${v.x},${v.y},${v.z}`).join(' ')}` : ''}${front.length > 0 ? `; frontier ${front.map(v => `${v.x},${v.y},${v.z}`).join(' ')}` : ''}`)
     const seenLand = new Set<string>()
+    /** The round's best kept state (ctx.onStitched). */
+    let roundBest: StitchState | null = null
     for (let ei = 0; ei < edges.length; ei++) {
       const e = edges[ei]
       const left = ctx.deadline - performance.now()
-      if (left <= 0) break
+      if (left <= 0 || ctx.cancelled?.() === true) break
       const target = { x: e.program.tx, y: e.program.ty, z: e.program.tz }
       // (never a program off ice: its line-up slides, and the ones it opens
       // are over voids - mcc-7-2's pads; the precision line-up is not there yet)
@@ -766,8 +852,9 @@ export function stitchHops (first: RawSolveResult, start: XYZ, ctx: HopPipelineC
       if (!under) reachedFor = target
       visited += f.visitedNodes
       generated += f.generatedNodes
-      // (its first planner jump, flown from the hop's own rest)
-      if (!under && rest !== null) f = verifiedFollowUp(target, rest, f, () => ctx.solve(target, Math.max(FOLLOW_UP_MIN_MS, (ctx.deadline - performance.now()) / (edges.length - ei + 1))))
+      // (its planner jumps onto and off strips, the first from the hop's own rest)
+      // (only one that could be kept: a ban never brings a follow-up closer)
+      if (!under && (f.status === 'success' || h(last(f, target)) < bestH || region)) f = verifiedPath(target, rest, f, () => ctx.solve(target, Math.max(FOLLOW_UP_MIN_MS, (ctx.deadline - performance.now()) / (edges.length - ei + 1))))
       const score = f.status === 'success' ? -Infinity : h(last(f, target))
       const pk = region && rest !== null ? placeKey(target, rest) : ''
       if (DEBUG) console.warn(`[hops]   cand ${e.fromX},${e.fromY},${e.fromZ} -> ${target.x},${target.y},${target.z} ${prog.family} ${prog.ticks}t${rest !== null ? ` rest ${rest.x.toFixed(2)},${rest.y.toFixed(2)},${rest.z.toFixed(2)}${under ? ' UNDER' : ''}` : ''}: follow-up ${f.status} visited ${f.visitedNodes} best h ${score.toFixed(1)}`)
@@ -795,10 +882,13 @@ export function stitchHops (first: RawSolveResult, start: XYZ, ctx: HopPipelineC
         } else {
           // an off-path take-off (a vantage, a drop edge): the way to it, reached so there is one
           if (ctx.solveTo === undefined) continue
-          const up = ctx.solveTo(curStart, from, Math.max(FOLLOW_UP_MIN_MS, (ctx.deadline - performance.now()) * DISCOVER_SHARE))
+          const solveTo = ctx.solveTo
+          const way = (): RawSolveResult => solveTo(curStart, from, Math.max(FOLLOW_UP_MIN_MS, (ctx.deadline - performance.now()) * DISCOVER_SHARE))
+          let up = way()
           reachedFor = null
           visited += up.visitedNodes
           generated += up.generatedNodes
+          up = verifiedPath(curStart, st.rest, up, way)
           if (up.status !== 'success') continue
           addChunks(up)
           prefix = up.path
@@ -822,10 +912,34 @@ export function stitchHops (first: RawSolveResult, start: XYZ, ctx: HopPipelineC
         if (time >= bestDone) continue
         bestDone = time
       }
-      frontier.push({ stitched, cur: f, curStart: target, score, depth: st.depth + 1, level: 0, tailSkipped: false, rest: region && rest !== null ? { x: rest.x, y: rest.y, z: rest.z } : null, under, tier: st.tier, time })
+      const pushed: StitchState = { stitched, cur: f, curStart: target, score, depth: st.depth + 1, level: 0, tailSkipped: false, rest: region && rest !== null ? { x: rest.x, y: rest.y, z: rest.z } : null, under, tier: st.tier, time }
+      frontier.push(pushed)
+      // (a region's place is no node the host can carry on from)
+      if (!succeeded && !region && (roundBest === null || score < roundBest.score)) roundBest = pushed
       if (score < bestSeen - PROGRESS_MIN) {
         bestSeen = score
         ctx.deadline = Math.max(ctx.deadline, Math.min(hardDeadline, performance.now() + PROGRESS_STEP_MS))
+      }
+    }
+    // The round's best kept state streamed (ctx.onStitched) when it is the one
+    // the search goes on from next - not merely the first kept past the
+    // delay, which a better sibling kept before it would leave - and nothing
+    // has reached the goal yet (a whole path is about to be returned); only
+    // on along the branch already streamed: the bot may be on its legs, and
+    // another branch is the whole path's to bring, which the host holds to
+    // the leg flown.
+    if (ctx.onStitched !== undefined && roundBest !== null && bestDone === Infinity && roundBest.score < bestStreamed &&
+        performance.now() - t0 >= STREAM_AFTER_MS) {
+      const order = (a: StitchState, b: StitchState): number => a.tier - b.tier || a.level - b.level || a.score - b.score || (a.time ?? 0) - (b.time ?? 0)
+      const nextUp = frontier.reduce((m, s) => order(s, m) < 0 ? s : m, frontier[0])
+      const hops = roundBest.stitched.filter(n => n.program !== null && n.program !== undefined)
+      if (nextUp === roundBest && hops.length > streamedHops.length && streamedHops.every((q, k) => hops[k] === q)) {
+        bestStreamed = roundBest.score
+        streamedHops = hops
+        // (the legs alone, to the last one's landing: the follow-up's tail is
+        // no leg - a later state may branch off before its end, and a body
+        // walked out along it is where the whole path does not go)
+        ctx.onStitched([...roundBest.stitched])
       }
     }
   }

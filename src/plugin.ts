@@ -20,7 +20,7 @@ import type { Bot } from 'mineflayer'
 import { Movements, VINE_CLIMBABLES } from './movements.js'
 import { Move } from './move.js'
 import { Goal } from './goals.js'
-import { PhysicsSim } from './physics.js'
+import { PhysicsSim, SEED_FAMILY, seedFamilies } from './physics.js'
 import { Solver } from './solver.js'
 import type { RawSolveResult } from './solver.js'
 import { GoalAdapter } from './goalAdapter.js'
@@ -57,7 +57,7 @@ import type {
 import type { ActionContext, DiggingBot } from './actions/context.js'
 import { resolveBlock, toVec3, inReach } from './actions/reach.js'
 import { GoalLookAtBlock, GoalNear } from './goals.js'
-import type { PathfinderOptions, GoalDescriptor, PhysicsLike, GotoOptions } from './types.js'
+import type { PathfinderOptions, GoalDescriptor, PhysicsLike, GotoOptions, GaitDrive } from './types.js'
 import { onLegPast, fallAim } from './gaitSearch.js'
 
 // Upstream lib/lock.js.
@@ -184,6 +184,16 @@ const HOLD_STILL = 1e-3
  * (1 / (1 - 0.6 · 0.91)).
  */
 const PROG_LINEUP_TOL = 0.02
+/**
+ * The line-up's support guard (plugin.ts program branch): a body whose line-up
+ * keys and coast would leave its take-off is braked against its velocity,
+ * PROG_BRAKE_TICKS of brake the most the check allows for. Arena mcc-8-2 with
+ * streamed legs: down on a 3/16 open-trapdoor panel at 0.25 b/t with +0.026
+ * sideways, every sneaking line-up and coast slid off in two ticks (a 200-block
+ * fall); three ticks of brake along the velocity, sneak off, holds it. PF_PROG_LINEUP_BRAKE=0 for A/B.
+ */
+const PROG_LINEUP_BRAKE = process.env.PF_PROG_LINEUP_BRAKE !== '0'
+const PROG_BRAKE_TICKS = 3
 const PROG_SNEAK_ZONE = 0.6
 const PROG_COAST = 1 / (1 - 0.6 * 0.91)
 /** Ticks of held jump without taking off before a replay is given up (hopOracle.ts JUMP_GRACE). */
@@ -196,6 +206,125 @@ const PROG_JUMP_GRACE = 6
  */
 const PROG_LIVE_TRIES = 3
 const PROG_LIVE_NEAR = 0.15
+/**
+ * A live program found on the way to a planned one's start is taken only
+ * if it is no slower than the plan with its line-up: the walk to the start at
+ * PROG_LINEUP_SPEED, PROG_LINEUP_SETTLE ticks to come to rest, PROG_LIVE_SLACK
+ * more. Arena opk2-2: its deep bounce re-anchored on arrival in 111 ticks, or
+ * where it did not, the live search's quickest was a 131-tick bounce, taken,
+ * where the line-up was 6 ticks to the planned 111 (bimodal, 8.9 or 9.9 s).
+ * Lined up (at the start), whatever the search finds is taken as before.
+ * PF_PROG_LIVE_PLAN=0 for A/B.
+ */
+const PROG_LIVE_PLAN = process.env.PF_PROG_LIVE_PLAN !== '0'
+/**
+ * On the way to a planned program's start: the plan re-anchored at the
+ * moving body (HopOracle.anchored, one robust flight, under a ms) each
+ * grounded tick within PROG_FAR_START of it, taken when no slower than the
+ * plan after the rest of its line-up. A line-up that would only stop the body
+ * where the plan already flies from is skipped. PF_PROG_MOVE_ANCHOR=0 for A/B.
+ */
+const PROG_MOVE_ANCHOR = process.env.PF_PROG_MOVE_ANCHOR !== '0'
+const PROG_LINEUP_SPEED = 0.1
+const PROG_LINEUP_SETTLE = 4
+const PROG_LIVE_SLACK = 2
+/**
+ * Skip-ahead (PhysicsSim.skipAhead): on the gait's ground ticks, where its
+ * window stops at a node a planned program leaves from, a live program from
+ * the body straight to that program's node, installed as that node's own and
+ * flown whole, the nodes before it retired at the take-off. Tried on the
+ * touchdown tick and the one after, and at a fresh rest; SKIP_TRIES searches
+ * a node at most. One that never takes off is undone (the nodes and the
+ * plan's program back, braked on the edge guard) and its node not tried
+ * again. In flight, a path installed mid-air carries it to the new path's
+ * landing node (a live program dropped there leaves the flight to gates that
+ * judge it otherwise). PF_SKIP_AHEAD=0 for A/B.
+ */
+const SKIP_AHEAD = process.env.PF_SKIP_AHEAD !== '0'
+const SKIP_TRIES = 3
+/**
+ * Skip-ahead at a neo (PhysicsSim.skipNeo): with the neo's own live program
+ * found (on the arrival, or from the braked rest), a live program past it
+ * straight to the node after, the beam too; installed, carried and undone as
+ * SKIP_AHEAD's. PF_SKIP_NEO=0 for A/B.
+ */
+const SKIP_NEO = process.env.PF_SKIP_NEO !== '0'
+/**
+ * Skip-ahead over walk nodes (PhysicsSim.skipWalk): on the gait's touchdown
+ * ticks and fresh rests, where the path walks aside to its next jump, one
+ * flight straight to that jump's node when it beats the gait's own way there;
+ * installed, carried and undone as SKIP_AHEAD's. PF_SKIP_WALK=0 for A/B.
+ */
+const SKIP_WALK = process.env.PF_SKIP_WALK !== '0'
+/**
+ * A neo up to NEO_AHEAD_NODES nodes on is given the lined-up verdict
+ * (PhysicsSim.hopFromCell: every family from its take-off node's stands, then
+ * the beam) before the body gets there, once a node. The verdict the arrival
+ * would reach - every family flown out and nothing landing, the take-off
+ * banned and the path replanned - reached a few nodes early: the plan is
+ * replanned while the body walks on (softReplan), not after it has braked at
+ * the take-off and searched from the moving arrival and from rest (arena
+ * mcc-8-1: aimed four-block neos past a two-high post on a one-wide strip that
+ * no flight makes, 10-15 ticks each). PF_NEO_AHEAD=0 for A/B.
+ */
+const NEO_AHEAD = process.env.PF_NEO_AHEAD !== '0'
+const NEO_AHEAD_NODES = 3
+/**
+ * A planned chain (Move.chain) flown by the exact kernel first, the gates only
+ * where it finds no flight; onto a stone the plan goes straight on from, the
+ * flight picked for the leg after it (PhysicsSim.hopChain) on CHAIN_PICK_BUDGET
+ * of kernel work. PF_CHAIN_KERNEL=0 for A/B.
+ */
+const CHAIN_KERNEL = process.env.PF_CHAIN_KERNEL !== '0'
+const CHAIN_PICK_BUDGET = 250_000
+/**
+ * At rest on a chain's stone with no flight from it: the chain's carried speed
+ * is gone and the plan's edge with it, so a replan from here at once (a start
+ * has no momentum: the planner brings the same chain back from no rest), not
+ * the line-up, the old search and the futility clock's 3.5 s that used to end
+ * in the same replan (arena mcc-5-2: 73 ticks on a bar). No ban: the same
+ * landing may well fly from elsewhere. Bounded per rest by replanLost.
+ * PF_CHAIN_LOST=0 for A/B.
+ */
+const CHAIN_LOST = process.env.PF_CHAIN_LOST !== '0'
+/**
+ * A body wedged at a take-off with a verdict from the lined search (every
+ * family flown out, nothing lands), on the plan's take-off cell: given up there
+ * and then, as ever; now also from a cell off it, within LINED_NEAR blocks each
+ * way, on that cell's own verdict. And the old search only where the lined one
+ * gave no verdict (no stand, or its budget out: those go on as they were, the
+ * futility clock's ban last). PF_LINED_GIVEUP=0 for A/B.
+ */
+const LINED_GIVEUP = process.env.PF_LINED_GIVEUP !== '0'
+/**
+ * The hop pipeline's stitched legs reach the bot as they are found
+ * (HopPipelineContext.onStitched), not with the whole path: on arena mcc-8-2
+ * its first legs were known 0.3 s in, the whole path 3.4 s in, and the bot ran
+ * the first search's prefix down a side line, stood 29 ticks at its end and
+ * walked 15 back to the take-off. A leg is flown only when the body gets to it
+ * and is a landing a body stops on; a program in replay is kept across a path
+ * update; a whole path that has lost a landing already flown to is dropped and
+ * the plan made from there. The host's cuts of a partial (a one-way drop, ice)
+ * hold. PF_STREAM_STITCH=0 for A/B (the worker reads it too).
+ */
+const STREAM_STITCH = process.env.PF_STREAM_STITCH !== '0'
+/** A path come in mid-flight without the flight's landing is taken up from that landing (handleDriveResult). PF_FLIGHT_TRIM=0 for A/B. */
+const FLIGHT_TRIM = process.env.PF_FLIGHT_TRIM !== '0'
+/**
+ * A partial path run out while its solve goes on: the keys let go and the body
+ * coasts to rest on its support (the empty-path branch's holdSupport), not
+ * fullStop's zeroed velocity and snap to the block centre. Arena mcc-7-2: the
+ * whole path came 3 ticks after the partial ran out, the snap had moved the
+ * body 0.57 off its line at 0.17 b/t, and the program's line-up from that dead
+ * rest failed its anchor and needed the presses (+6 ticks); mcc-4-2, mcc-8-2
+ * likewise. PF_PARTIAL_END_COAST=0 for A/B.
+ */
+const PARTIAL_END_COAST = process.env.PF_PARTIAL_END_COAST !== '0'
+/** The most a partial's end coast may come down (PARTIAL_END_COAST): none, a node's level kept. */
+const PARTIAL_COAST_DROP = 0.01
+/** A neo's live searches try the kick where the live families find nothing (physics.ts SEED_FAMILY). */
+const NEO_SEED: ReadonlyArray<'kick' | 'pivot'> = ['kick']
+const LINED_NEAR = 1.5
 /**
  * Replans a lost region program (HopProgram.land) may ask for from one rest
  * (within PROG_LIVE_NEAR): a complete path resets the futility clock, so
@@ -226,6 +355,8 @@ const PROG_EXACT_TOL = 0.05
 const PROG_EXACT_REACH = 0.11
 const PROG_PRESS_TRIES = 2
 const LINEUP_TICKS = 60_000
+/** mcc-7-2's precise chain can line up before its first rest; PF_MOVING_LINEUP=0 keeps the two-rest approach. */
+const MOVING_LINEUP = process.env.PF_MOVING_LINEUP !== '0'
 /** A program start further than this the kernel does not walk to is never lined up across: a replan (the body is past it, out on a gap's far side). */
 const PROG_FAR_START = 2
 /** A take-off up a climbable is climbed to until the feet are within this of its height (the program branch). */
@@ -494,6 +625,21 @@ const DEFAULT_OPTIONS: Required<Omit<PathfinderOptions, 'physicsFactory' | 'onNo
 }
 
 /**
+ * The same program to fly: start, target, landing region, every heading,
+ * timing, flag and control tick. A streamed update's line-up is kept only for
+ * this - two plans into one cell beside a pane land on different sides of it.
+ */
+function sameProgram (a: HopProgram, b: HopProgram): boolean {
+  const h = (u: { fixed: boolean, x: number, z: number }, v: { fixed: boolean, x: number, z: number }): boolean => u.fixed === v.fixed && u.x === v.x && u.z === v.z
+  const land = a.land === undefined ? b.land === undefined : b.land !== undefined && a.land.x === b.land.x && a.land.y === b.land.y && a.land.z === b.land.z
+  const seq = a.seq === undefined ? b.seq === undefined : b.seq !== undefined && a.seq.length === b.seq.length && a.seq.every((v, i) => v === b.seq![i] || (Number.isNaN(v) && Number.isNaN(b.seq![i])))
+  return a.sx === b.sx && a.sy === b.sy && a.sz === b.sz && a.tx === b.tx && a.ty === b.ty && a.tz === b.tz &&
+    a.ticks === b.ticks && a.family === b.family && a.jumpAt === b.jumpAt && a.turnAir === b.turnAir &&
+    a.sprint === b.sprint && a.kick === b.kick && a.precise === b.precise && a.climb === b.climb && a.deep === b.deep &&
+    h(a.run, b.run) && h(a.air1, b.air1) && h(a.air2, b.air2) && land && seq
+}
+
+/**
  * Create the plugin function. `pathfinder` (the default instance) is what
  * `bot.loadPlugin(pathfinder)` takes, exactly like upstream.
  */
@@ -528,6 +674,25 @@ export function createPathfinder (options: PathfinderOptions = {}) {
     let digging = false
     /** Sprint-hop latched at take-off, re-pressed on each landing (allowSprintHop). */
     let hopHold = false
+    /** An installed skip-ahead (SKIP_AHEAD): its target node, the nodes it retired, and the plan's program for the target. */
+    let skip: { target: Move, removed: Move[], planned: HopProgram | null | undefined } | null = null
+    /**
+     * Neos given the lined-up verdict ahead (NEO_AHEAD), by the edge's cells
+     * (a replan brings the same edge back as new nodes): true when it flew.
+     */
+    const neoChecked = new Map<string, boolean>()
+    /** The node the lined search gave no verdict on (LINED_GIVEUP): still the old search's. */
+    let linedOpen: object | null = null
+    /** Take-offs lost without a ban, by edge cells, across replans (lostReplan). */
+    const lostEdges = new Map<string, number>()
+    /** Skip-ahead searches flown per target node, and the targets a skip failed for. */
+    const skipTries = new WeakMap<Move, number>()
+    const skipFailed = new WeakSet<Move>()
+    /** The last rest a skip-ahead was asked at (and a walk skip-ahead). */
+    let skipRestX = NaN
+    let skipRestZ = NaN
+    let walkRestX = NaN
+    let walkRestZ = NaN
     /** The hop in the air was chosen by the kernel (allowHopIntoJump): flown as it was flown there. */
     let kernelHop = false
     /** The kernel had a schedule the last grounded tick it was asked (gaitDrive): the tick was its own. */
@@ -570,8 +735,9 @@ export function createPathfinder (options: PathfinderOptions = {}) {
     let progRestX = Infinity
     let progRestZ = Infinity
     /** The exact line-up's press yaws being replayed (HopOracle.lineUp; i: the next), and how many line-ups the node has had. */
-    let progPress: { yaws: number[], i: number } | null = null
+    let progPress: { yaws: number[], i: number, delay: number } | null = null
     let progPresses = 0
+    let progMovingTries = 0
     /** Region programs lost in a row from about one rest, and that rest (PROG_LOST_TRIES). */
     let progLostCount = 0
     let progLostAt: { x: number, y: number, z: number } | null = null
@@ -664,6 +830,11 @@ export function createPathfinder (options: PathfinderOptions = {}) {
     let cutFrom: Vec3 | null = null
     /** Body position at the last tick, for the lagback handler's cut-aware near test (CUT_LAG_NEAR). */
     let prevTickPos: Vec3 | null = null
+    /** Physics ticks seen, and the one prevTickPos was taken at. */
+    let physTicks = 0
+    let prevTickAt = 0
+    /** physTicks at the last server position (forcedMove): a teleport across a stale gap. */
+    let forcedAtTick = -1
     // Wedge recovery state — see the tick loop's recovery block.
     let wedgeAnchor: Vec3 | null = null
     let wedgeTicks = 0
@@ -718,7 +889,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
     let landedTicksAgo = 99
     let lastTickGrounded = false
     /** The node most recently retired by the arrival loop — the take-off of the next parkour node. */
-    let prevRetired: { x: number, y: number, z: number } | null = null
+    let prevRetired: { x: number, y: number, z: number, cell?: readonly [number, number, number] } | null = null
     /**
      * Decision trace (PF_EXEC_TRACE=<file prefix>): which branch of the tick
      * loop drove this tick. Written by a second physicsTick listener so every
@@ -749,6 +920,10 @@ export function createPathfinder (options: PathfinderOptions = {}) {
     let lastNodeTime = performance.now()
     /** The path installed is a streamed partial (handleDriveResult: not final). */
     let pathPartial = false
+    /** The landing of the last leg flown off a streamed partial, until a whole path has taken it up (STREAM_STITCH). */
+    let streamedLanding: readonly [number, number, number] | null = null
+    /** The solve the installed path came from (handleDriveResult's generation). */
+    let pathGen = -1
     /**
      * When a path node was last genuinely REACHED. `lastNodeTime` is also
      * pushed forward by server position corrections; this one never is, so it
@@ -1394,15 +1569,114 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       // 31-block drop into a pool turned the flight back toward the ledge,
       // then retired the pool 15 blocks up and steered for the node beyond
       // it, and the body came down on the obsidian rim — dead.
+      // (a program replayed in flight is one, whatever its node says: a skip
+      // carried onto a node the new path walks to keeps its flight)
       const flying = (bot.entity as { onGround?: boolean }).onGround !== true && path.length > 0 &&
-        (path[0] as { parkour?: boolean }).parkour === true
+        ((path[0] as { parkour?: boolean }).parkour === true || (progNode === path[0] && progPhase === 1 && progFired))
+      const n0 = path.length > 0 ? path[0] as Move : undefined
+      const hasProg = n0 !== undefined && progNode === n0 && n0.program !== null && n0.program !== undefined
+      // A program in replay keeps its flight across a path update: off a
+      // streamed path on its run-up too (STREAM_STITCH: a new Move for its node
+      // would start it over from a line-up), and in the air off any path
+      // (FLIGHT_TRIM: the gates would fly the rest of a flight verified only
+      // with its own controls).
+      const replaying = hasProg && progPhase === 1 && ((STREAM_STITCH && pathPartial) || (FLIGHT_TRIM && progFired))
+      // mcc-7-2's streamed updates keep phase 0 for the same program: the
+      // walking line-up, delayed presses and coast, with both attempt counts.
+      const liningUp = STREAM_STITCH && pathPartial && hasProg && progPhase === 0
+      // Every path of a solve has to hold the streamed leg flown since it
+      // started (or in flight): the search may have gone another way since,
+      // and nothing connects the body to it. A partial without it is not
+      // installed; a whole path is dropped and a solve made from the body - in
+      // the air, the flight kept alone and the solve made from its landing
+      // (startSolve clears the landing; a path never holds its own start cell).
+      const streamedHeld = streamedLanding
+      if (STREAM_STITCH) {
+        // (a streamed leg of this solve in flight, its program spent or not; a live program of the executor's own in flight is FLIGHT_TRIM's)
+        const committed = n0 !== undefined && pathPartial && (n0 as Move & { streamGen?: number }).streamGen === generation &&
+          ((hasProg && progPhase === 1 && progFired) || (bot.entity as { onGround?: boolean }).onGround !== true)
+        const held = committed ? (n0 as Move).cell : streamedLanding
+        if (held !== null && !results.path.some(n => n.cell[0] === held[0] && n.cell[1] === held[1] && n.cell[2] === held[2])) {
+          if (!final) return
+          if (execTraceFile !== null) takeoffNote = 'final-off-landing'
+          // (the goal's growth is per solve: this one succeeded)
+          if (raw.status === 'success') {
+            growFactor = 1
+            growAttempts = 0
+            awaitingChunks = false
+          }
+          streamedLanding = null
+          lastSolveFrom = null
+          if (flying) {
+            path.length = 1
+            pathUpdated = true
+          } else {
+            // (not on along the abandoned branch's legs either: cut before the next one not flown)
+            const k = path.findIndex(n => (n as Move).program !== null && (n as Move).program !== undefined && n !== progNode)
+            if (k >= 0) path.length = k
+            pathUpdated = false
+          }
+          return
+        }
+      }
+      if (final) streamedLanding = null
+      // (a partial's own legs, marked before a carried program lands on one of its nodes: the pipeline's, never the executor's)
+      if (!final && STREAM_STITCH) for (const n of results.path) if ((n as Move).program !== null && (n as Move).program !== undefined) (n as Move & { streamGen?: number }).streamGen = generation
       let flightAt = -1
-      if (flying) {
-        const [fx, fy, fz] = (path[0] as Move).cell
+      if (flying || replaying || liningUp) {
+        const [fx, fy, fz] = (n0 as Move).cell
         flightAt = results.path.findIndex(n => n.cell[0] === fx && n.cell[1] === fy && n.cell[2] === fz)
       }
+      // (a line-up kept only for the same program at the same place)
+      if (liningUp && !flying && !replaying && flightAt >= 0) {
+        const a = (n0 as Move).program as HopProgram
+        const b = (results.path[flightAt] as Move).program
+        if (b === null || b === undefined || !sameProgram(a, b)) flightAt = -1
+      }
+      // (a replay on its run-up the new path does not hold: given up, the new path's from here - nothing is committed yet)
+      const carried = (replaying || liningUp) && flightAt >= 0
       if (flightAt >= 0) results.path.splice(0, flightAt)
-      else {
+      // (a skip-ahead's live program in flight: carried onto the new path's landing node - SKIP_AHEAD)
+      if (flightAt >= 0 && skip !== null && path[0] === skip.target && progNode === skip.target && progPhase === 1 && results.path.length > 0) {
+        const landing = results.path[0] as Move
+        landing.program = skip.target.program
+        progNode = landing
+        skip.target = landing
+      } else if (carried && results.path.length > 0) {
+        const landing = results.path[0] as Move
+        landing.program = (n0 as Move).program
+        // (a streamed leg carried stays one; the executor's own program carried never becomes one)
+        const g = (n0 as Move & { streamGen?: number }).streamGen
+        if (g !== undefined) (landing as Move & { streamGen?: number }).streamGen = g
+        progNode = landing
+        if (linedInstalled === n0) linedInstalled = landing
+        if (restSearchedAt !== null && restSearchedAt.node === n0) restSearchedAt = { ...restSearchedAt, node: landing }
+        if (takeoffSearched === n0) takeoffSearched = landing
+        if (linedSearched === n0) linedSearched = landing
+        // (a chain node's flight is the chain's: CHAIN_KERNEL)
+        if (chainNode === n0) chainNode = landing
+      }
+      // (a path holding the streamed leg the body came down from: on from after it, not back to its node)
+      if (flightAt < 0 && !flying && STREAM_STITCH && streamedHeld !== null) {
+        const k = results.path.findIndex(n => n.cell[0] === streamedHeld[0] && n.cell[1] === streamedHeld[1] && n.cell[2] === streamedHeld[2])
+        if (k >= 0) results.path.splice(0, k + 1)
+      }
+      if (flightAt >= 0) {
+        // (spliced above)
+      } else if (flying && FLIGHT_TRIM) {
+        // Taken up from where the flight comes down, not from the body in the
+        // air: the node nearest a body still over the take-off may lie behind
+        // the landing (arena mcc-8-2, a streamed path 3.5 blocks back from a
+        // live program's landing: 70 ticks stood at it, then the futility reset).
+        const n0 = path[0]
+        const pr = progNode === n0 && progPhase === 1 ? n0.program : null
+        // (a region program's own place: beside a pane rail its cell is three places)
+        const land = pr !== null && pr !== undefined
+          ? (pr.land !== undefined ? new Vec3(pr.land.x, pr.land.y, pr.land.z) : new Vec3(pr.tx + 0.5, pr.ty, pr.tz + 0.5))
+          : new Vec3(n0.x, n0.y, n0.z)
+        pathFromPlayer(results.path, land)
+        results.path.unshift(n0)
+      } else {
         pathFromPlayer(results.path)
         if (flying) results.path.unshift(path[0])
       }
@@ -1423,7 +1697,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         const grounded = (bot.entity as { onGround?: boolean }).onGround === true
         // (a committed flight keeps its landing; a body in the air for any
         // other reason is judged from its first node, never its fall)
-        const from = flying || !grounded ? 1 : 0
+        const from = flying || carried || !grounded ? 1 : 0
         let prevY = from === 0 ? bot.entity.position.y : results.path[0].y
         for (let i = from; i < results.path.length; i++) {
           const n = results.path[i]
@@ -1483,14 +1757,20 @@ export function createPathfinder (options: PathfinderOptions = {}) {
           lastNodeArrival = lastNodeTime
         }
       }
+      const firstOfSolve = pathGen !== generation
       path = results.path
       pathPartial = !final
+      pathGen = generation
       // A fresh path's first jump takes off from the cell the solve started
       // in, so that is the "node just retired" the creep anchors on — the
       // body itself may be overhanging that cell's lip (a give-up leaves it
       // there), and anchoring on the column under its centre would creep it
-      // forward into the gap.
-      prevRetired = { x: lastSolveStart.x + 0.5, y: lastSolveStart.y, z: lastSolveStart.z + 0.5 }
+      // forward into the gap. Not for a later path of the same solve with the
+      // body legs on from that start (streamed legs): what it last retired stands.
+      if (!STREAM_STITCH || firstOfSolve || prevRetired === null ||
+          Math.hypot(bot.entity.position.x - (lastSolveStart.x + 0.5), bot.entity.position.z - (lastSolveStart.z + 0.5)) <= 1.2) {
+        prevRetired = { x: lastSolveStart.x + 0.5, y: lastSolveStart.y, z: lastSolveStart.z + 0.5, cell: [lastSolveStart.x, lastSolveStart.y, lastSolveStart.z] }
+      }
       if (final) {
         pathUpdated = true
         // A freshly installed COMPLETE path deserves a full futility window:
@@ -1543,6 +1823,8 @@ export function createPathfinder (options: PathfinderOptions = {}) {
 
     function startSolve (): void {
       if (!stateGoal || !stateMovements) return
+      // (a solve from where the body is: the streamed leg behind it is no test of its path - STREAM_STITCH)
+      streamedLanding = null
       try {
         stateMovements.assertSupported()
       } catch (error) {
@@ -1870,27 +2152,28 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       return `${a.cell[0]},${a.cell[1]},${a.cell[2]}>${b.cell[0]},${b.cell[1]},${b.cell[2]}`
     }
 
-    function pathFromPlayer (thePath: Move[]): void {
+    /** `from`: where the path is taken up from - the body, or (a path come in mid-flight without the landing) the landing. */
+    function pathFromPlayer (thePath: Move[], from: Vec3 = bot.entity.position): void {
       if (thePath.length === 0) return
       let minI = 0
       let minDistance = 1000
       for (let i = 0; i < thePath.length; i++) {
         const node = thePath[i]
         if (node.toBreak.length !== 0 || node.toPlace.length !== 0) break
-        const dist = bot.entity.position.distanceSquared(node)
+        const dist = from.distanceSquared(node)
         if (dist < minDistance) {
           minDistance = dist
           minI = i
         }
       }
       const n1 = thePath[minI]
-      const dx = n1.x - bot.entity.position.x
-      const dy = n1.y - bot.entity.position.y
-      const dz = n1.z - bot.entity.position.z
+      const dx = n1.x - from.x
+      const dy = n1.y - from.y
+      const dz = n1.z - from.z
       const reached = Math.abs(dx) <= 0.35 && Math.abs(dz) <= 0.35 && Math.abs(dy) < 1
       if (minI + 1 < thePath.length && n1.toBreak.length === 0 && n1.toPlace.length === 0) {
         const n2 = thePath[minI + 1]
-        const d2 = bot.entity.position.distanceSquared(n2)
+        const d2 = from.distanceSquared(n2)
         const d12 = n1.distanceSquared(n2)
         minI += d12 > d2 || reached ? 1 : 0
       }
@@ -2001,6 +2284,8 @@ export function createPathfinder (options: PathfinderOptions = {}) {
     function fullStop (): void {
       hopHold = false
       kernelHop = false
+      // (queued line-up presses were verified for the momentum the stop takes away)
+      progPress = null
       cutTarget = null
       clearWedge()
       // (in the air: the flight goes on to touchdown, then the stop - see coastHold)
@@ -2134,9 +2419,11 @@ export function createPathfinder (options: PathfinderOptions = {}) {
      * treat as impassable above 100; an exclusion area would have forced
      * the JS solver and switched the corner cut off for the whole route.
      */
-    function banTakeoff (node: { x: number, y: number, z: number }): void {
+    function banTakeoff (node: { x: number, y: number, z: number, cell?: readonly [number, number, number] }): void {
+      // (the planner's cell: a neo's node hangs up to 0.65 off it, a slab's half a block under it)
+      const c = node.cell
       bannedCells.set(
-        `${Math.floor(node.x)},${Math.floor(node.y + 0.001)},${Math.floor(node.z)}`,
+        c !== undefined ? `${c[0]},${c[1]},${c[2]}` : `${Math.floor(node.x)},${Math.floor(node.y + 0.001)},${Math.floor(node.z)}`,
         performance.now() + BAN_MS)
     }
 
@@ -2352,6 +2639,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       kernelHop = false
       progNode = null
       progPhase = 0
+      streamedLanding = null
       basin = null
       bounceNode = null
       bounceRisen = false
@@ -2668,6 +2956,9 @@ export function createPathfinder (options: PathfinderOptions = {}) {
     // snapped away → replan immediately from the corrected position.
     bot.on('forcedMove' as never, (() => {
       lastForcedMoveAt = performance.now()
+      forcedAtTick = physTicks
+      // (a corrected body is not the one queued line-up presses were found for)
+      progPress = null
       if (path.length === 0) return
       // (a deep flight or its basin: the per-tick verdict decides, from the corrected body)
       if (deepHeld()) return
@@ -2723,6 +3014,28 @@ export function createPathfinder (options: PathfinderOptions = {}) {
      * as vanilla tests it) against each cell's hazard volume — fire the
      * whole cell, lava up to its fluid height.
      */
+    /**
+     * A fire, lava or cobweb cell in the 3x3 columns round the body's, from the
+     * cell under its feet to its head's: what a coast of a few tenths could
+     * reach (PARTIAL_END_COAST - holdsOn sees neither fire nor lava: a coast
+     * into them still "holds").
+     */
+    function hazardAround (): boolean {
+      const p = bot.entity.position
+      const bx = Math.floor(p.x)
+      const by = Math.floor(p.y + 0.001)
+      const bz = Math.floor(p.z)
+      for (let x = bx - 1; x <= bx + 1; x++) {
+        for (let z = bz - 1; z <= bz + 1; z++) {
+          for (let y = by - 1; y <= by + 1; y++) {
+            const n = (bot.blockAt(new Vec3(x, y, z), false) as { name?: string } | null)?.name
+            if (n === 'fire' || n === 'soul_fire' || n === 'lava' || n === 'cobweb') return true
+          }
+        }
+      }
+      return false
+    }
+
     function hazardContacts (): Array<[number, number, number]> {
       const pos = bot.entity.position
       const hw = (bot.physics as unknown as { playerHalfWidth?: number }).playerHalfWidth ?? 0.3
@@ -2838,6 +3151,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
     }
 
     function monitorMovementInner (): void {
+      if (skip !== null && (path.length === 0 || path[0] !== skip.target)) skip = null
       // A support hold's brake (holdSupport) is for its own tick: the no-path
       // branch sets neither key and would hold it.
       if (holdKeyed) {
@@ -2853,6 +3167,10 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         gaitStrafed = false
         bot.setControlState('left', false)
       }
+      // A kernel hop's flight ends on the ground, whichever branch takes that
+      // tick: left set, a later flight replayed the old tape and lost the air
+      // control (a grounded take-off tick sets it again, gaitDrive).
+      if (kernelHop && (bot.entity as { onGround?: boolean }).onGround === true) kernelHop = false
       // A flight coasted on from a reset (coastHold): the stop at touchdown,
       // or on whatever ends it; a path installed meanwhile drives instead.
       if (coastHold) {
@@ -3393,7 +3711,13 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         // arrived at next point
         lastNodeTime = performance.now()
         lastNodeArrival = lastNodeTime
-        prevRetired = { x: nextPoint.x, y: nextPoint.y, z: nextPoint.z }
+        prevRetired = { x: nextPoint.x, y: nextPoint.y, z: nextPoint.z, cell: (nextPoint as Move).cell }
+        // (a streamed leg flown: STREAM_STITCH. Only a leg the pipeline streamed
+        // in THIS solve: a live program the executor found on a partial is the
+        // body's own way, held to it the pipeline's other way was refused
+        // whole, arena mcc-8-2: 27 ticks of re-solve; an old solve's leg would
+        // bind the new solve, whose path never holds its own start cell)
+        if (pathPartial && (nextPoint as Move & { streamGen?: number }).streamGen === solveGeneration) streamedLanding = (nextPoint as Move).cell
         path.shift()
         // The target itself just retired: the nodes beyond it are not
         // "behind" anything, and the retirement rule above must not measure
@@ -3408,6 +3732,21 @@ export function createPathfinder (options: PathfinderOptions = {}) {
             cancelActiveSolve()
             bot.emit('goal_reached' as never, stateGoal as never)
             stateGoal = null
+          }
+          // (a partial run out, its solve still on, the body down: let go and coast,
+          // where the coast with no keys is verified to stay on the support at its
+          // level - no step down off the node the next path leaves from; else the
+          // stop - PARTIAL_END_COAST)
+          const ent = bot.entity as { onGround?: boolean, isInWater?: boolean, isInLava?: boolean }
+          // (never beside fire, lava or a cobweb: a coast there is no stop - the stop's snap keeps the body in its cell)
+          if (PARTIAL_END_COAST && stateGoal !== null && pathPartial && solveInFlight() && physics.holdsOn !== undefined &&
+              ent.onGround === true && ent.isInWater !== true && ent.isInLava !== true && !hazardAround()) {
+            hopHold = false
+            kernelHop = false
+            cutTarget = null
+            clearWedge()
+            bot.clearControlStates()
+            if (physics.holdsOn(null, undefined, 1, PARTIAL_COAST_DROP)) return
           }
           fullStop()
           return
@@ -3448,12 +3787,26 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         // landing's too, until the ground, water or a ladder takes it.
         // (More than a tick can fall is a teleport.)
         const drop = prevTickY - p.y
+        // (moved further than a tick can: a teleport - the fall, and a settle
+        // owed to the last landing, end there; the server put the body anew.
+        // Arena opk-9 stood 7 ticks at its start for opk-7's hurt landing)
+        // (within one physics tick only: the ticks a solve stands empty skip
+        // this block, and a body that ran on meanwhile is no teleport)
+        // (a server position since the last tick seen: a move past a tick's
+        // reach is that teleport even across a gap - arena opk-8 raced after
+        // mcc-7-2 stood 8 ticks settling a "61-block fall" at its start)
+        const forced = forcedAtTick > prevTickAt
+        const stale = physTicks - prevTickAt > 1 && !forced
+        const teleported = prevTickPos !== null && !stale && Math.hypot(p.x - prevTickPos.x, p.z - prevTickPos.z) > MAX_TICK_DROP
+        if (teleported) landSettle = 0
         prevTickY = p.y
         prevTickPos = p.clone()
+        prevTickAt = physTicks
         if (spared > 0) spared--
-        // (water and a climbable take the fall with them: caughtNow off the ground is one or the other)
-        if ((caughtNow && !grounded) || drop > MAX_TICK_DROP) fallen = 0
-        else if (drop > 0 && (!grounded || fallen > 0)) fallen += drop
+        // (water and a climbable take the fall with them: caughtNow off the ground is one or the other;
+        // a drop over ticks this block did not see is fallen, not a teleport)
+        if ((caughtNow && !grounded) || (drop > MAX_TICK_DROP && !stale) || teleported) fallen = 0
+        else if (drop > 0 && (!grounded || fallen > 0 || stale)) fallen += drop
         if (grounded) {
           if (fallen > SAFE_FALL) {
             const under = simKindOf((bot.blockAt(p.offset(0, -0.2, 0)) as { name?: string } | null)?.name ?? '', false)
@@ -3529,6 +3882,46 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       // A program the body cannot fly from where it is (lost off its region,
       // a start across a gap): replan from here, PROG_LOST_TRIES times from
       // about one rest - a complete path resets the futility clock.
+      // A take-off lost and replanned without a ban (chain-lost, lined-lost):
+      // the plan may route back to the very same edge (a hop back, the chain
+      // again), every arrival restarting the futility clock that used to ban
+      // it. Counted by edge across replans; the second loss bans the landing.
+      const lostReplan = (branch: string): boolean => {
+        const from = prevRetired?.cell
+        const to = (nextPoint as Move).cell
+        const key = `${from !== undefined ? `${from[0]},${from[1]},${from[2]}` : `${Math.floor(p.x)},${Math.floor(p.y + 0.001)},${Math.floor(p.z)}`}>${to[0]},${to[1]},${to[2]}`
+        if (lostEdges.size > 512) lostEdges.clear()
+        const n = (lostEdges.get(key) ?? 0) + 1
+        lostEdges.set(key, n)
+        if (n >= 2) banTakeoff(nextPoint)
+        return replanLost(p, branch)
+      }
+      // At rest on a chain's stone with no flight (CHAIN_LOST): the lined
+      // search first, from the stone's own stands - a program flown from a
+      // line-up there, or its verdict (every family out, nothing lands) a
+      // replan; a search its budget cut is no verdict, and the old ways go on.
+      const chainLost = (): boolean => {
+        if (linedSearched === nextPoint || physics.hopLinedUp === undefined) return lostReplan('chain-lost')
+        linedSearched = nextPoint
+        const lined = physics.hopLinedUp((nextPoint as Move).cell, TAKEOFF_LINED_TICKS)
+        takeoffNote += ' | ' + (physics.hopNote ?? '')
+        if (lined !== null) {
+          ;(nextPoint as Move).program = lined
+          linedInstalled = nextPoint
+          progNode = null
+          jumpStillTicks = 0
+          lastNodeTime = performance.now()
+          bot.setControlState('forward', false)
+          bot.setControlState('back', false)
+          bot.setControlState('jump', false)
+          bot.setControlState('sprint', false)
+          bot.setControlState('sneak', true)
+          execBranch = 'takeoff-lined'
+          futile(swimming)
+          return true
+        }
+        return physics.hopExhausted === true && lostReplan('chain-lost')
+      }
       const replanLost = (at: Vec3, branch: string, keepKeys = false): boolean => {
         const again = progLostAt !== null && Math.abs(at.x - progLostAt.x) < PROG_LIVE_NEAR &&
           Math.abs(at.z - progLostAt.z) < PROG_LIVE_NEAR && Math.abs(at.y - progLostAt.y) < 0.5
@@ -3558,6 +3951,107 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         replayProgramTick(prog, p)
         execBranch = 'prog'
         futile(swimming)
+        return true
+      }
+      // (a skip found: the nodes before its target retired, its program the target's own live one)
+      const installSkip = (sk: { program: HopProgram, cut: number }): void => {
+        const removed = path.splice(0, sk.cut)
+        nextPoint = path[0]
+        skip = { target: nextPoint, removed, planned: nextPoint.program }
+        lastNodeTime = performance.now()
+        kernelLed = false
+        takeoffLive(sk.program)
+        execBranch = 'skip'
+      }
+      // Skip-ahead (SKIP_AHEAD): past the gait's stood node, straight to the
+      // node its planned program leaves for - installed as that node's own
+      // live program. True if it took the tick.
+      const trySkip = (drive: GaitDrive, gp: ReadonlyArray<unknown>): boolean => {
+        if (!SKIP_AHEAD || !kernelTakeoff || physics.skipAhead === undefined || gp !== path || pathPartial ||
+            stateMovements.exclusionAreasStep.length > 0 || drive.cut === undefined || drive.cut < 1 || drive.cut >= path.length) return false
+        const m = path[drive.cut]
+        if (skipFailed.has(m)) return false
+        const tries = skipTries.get(m) ?? 0
+        if (tries >= SKIP_TRIES) return false
+        const v = bot.entity.velocity
+        const atRest = Math.hypot(v.x, v.z) < 0.01
+        const freshRest = atRest && !(Math.abs(p.x - skipRestX) <= 0.005 && Math.abs(p.z - skipRestZ) <= 0.005)
+        if (landedTicksAgo > 1 && !freshRest) return false
+        if (atRest) { skipRestX = p.x; skipRestZ = p.z }
+        if (cachedLut !== null) physics.setShapeTables?.(cachedLut)
+        const sk = physics.skipAhead(path, drive)
+        if (physics.skipSearched === true) skipTries.set(m, tries + 1)
+        if (physics.skipSearched === true) takeoffNote = physics.hopNote ?? ''
+        if (sk === null) return false
+        installSkip(sk)
+        return true
+      }
+      // Neo lookahead (NEO_AHEAD): the first neo on the next nodes not yet
+      // judged, from the node before it - one search a tick at most. Refused:
+      // banned, and the plan replanned while the body walks on. True if it
+      // asked for a replan.
+      const neoAhead = (): boolean => {
+        if (!NEO_AHEAD || !kernelTakeoff || physics.hopFromCell === undefined || pathPartial || stateMovements.exclusionAreasStep.length > 0) return false
+        for (let k = 1; k < Math.min(path.length, NEO_AHEAD_NODES + 1); k++) {
+          const n = path[k]
+          if (n.parkour !== true || n.wOff === 0 || n.program !== null && n.program !== undefined) continue
+          const from = path[k - 1]
+          const key = `${from.cell[0]},${from.cell[1]},${from.cell[2]}>${n.cell[0]},${n.cell[1]},${n.cell[2]}`
+          // (judged already: a refused edge the replan brought back anyway is left to the arrival, never replanned again)
+          if (neoChecked.has(key)) continue
+          if (neoChecked.size > 512) neoChecked.clear()
+          if (cachedLut !== null) physics.setShapeTables?.(cachedLut)
+          const found = physics.hopFromCell(from.cell, n.cell, TAKEOFF_LINED_TICKS)
+          if (execTraceFile !== null) takeoffNote += `${takeoffNote !== '' ? ' | ' : ''}ahead ${physics.hopNote ?? ''}`
+          neoChecked.set(key, found !== null || physics.hopExhausted !== true)
+          if (found === null && physics.hopExhausted === true) {
+            banTakeoff(n)
+            softReplan('neo-refused')
+            return true
+          }
+          return false
+        }
+        return false
+      }
+      // Skip-ahead over walk nodes (SKIP_WALK): on a touchdown or a fresh
+      // rest, past the walk aside to the next jump. True if it took the tick.
+      const trySkipWalk = (gp: ReadonlyArray<unknown>): boolean => {
+        if (!SKIP_WALK || !kernelTakeoff || physics.skipWalk === undefined || gp !== path || pathPartial ||
+            stateMovements.exclusionAreasStep.length > 0 || path.length < 2) return false
+        const v = bot.entity.velocity
+        const atRest = Math.hypot(v.x, v.z) < 0.01
+        const freshRest = atRest && !(Math.abs(p.x - walkRestX) <= 0.005 && Math.abs(p.z - walkRestZ) <= 0.005)
+        if (landedTicksAgo > 1 && !freshRest) return false
+        if (atRest) { walkRestX = p.x; walkRestZ = p.z }
+        if (cachedLut !== null) physics.setShapeTables?.(cachedLut)
+        const asked: { m: Move | null } = { m: null }
+        const sk = physics.skipWalk(path, m => {
+          asked.m = m as Move
+          return !skipFailed.has(m as Move) && (skipTries.get(m as Move) ?? 0) < SKIP_TRIES
+        })
+        if (physics.skipSearched === true && asked.m !== null) {
+          skipTries.set(asked.m, (skipTries.get(asked.m) ?? 0) + 1)
+          takeoffNote = physics.hopNote ?? ''
+        }
+        if (sk === null) return false
+        installSkip(sk)
+        return true
+      }
+      // Skip-ahead at a neo (SKIP_NEO): past the neo whose live program was
+      // just found (`t0` ticks), straight to the node after. True if it took the tick.
+      const trySkipNeo = (t0: number, rest: boolean): boolean => {
+        if (!SKIP_NEO || physics.skipNeo === undefined || pathPartial || stateMovements.exclusionAreasStep.length > 0 || path.length < 2) return false
+        const m = path[1]
+        if (skipFailed.has(m)) return false
+        const tries = skipTries.get(m) ?? 0
+        if (tries >= SKIP_TRIES) return false
+        const sk = physics.skipNeo(path, t0, rest)
+        if (physics.skipSearched === true) {
+          skipTries.set(m, tries + 1)
+          takeoffNote += ' | ' + (physics.hopNote ?? '')
+        }
+        if (sk === null) return false
+        installSkip(sk)
         return true
       }
       // Physics-verified hop (allowParkourPhysics, hopOracle.ts): the node
@@ -3595,6 +4089,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
           progRestZ = Infinity
           progPress = null
           progPresses = 0
+          progMovingTries = 0
         }
         cutTarget = null
         hopHold = false
@@ -3691,6 +4186,17 @@ export function createPathfinder (options: PathfinderOptions = {}) {
             bot.setControlState('forward', true)
             futile(swimming)
           }
+          const pressNext = (): boolean => {
+            if (progPress === null) return false
+            if (progPress.delay > 0) {
+              progPress.delay--
+              letGo()
+              return true
+            }
+            if (progPress.i >= progPress.yaws.length) return false
+            pressAt(progPress.yaws[progPress.i++])
+            return true
+          }
           // At a rest near a precision plan's start: the plan re-anchored here,
           // else the exact line-up's presses (before any search - a beam chain
           // is never re-found live, a pivot is no live family). True if it
@@ -3707,8 +4213,8 @@ export function createPathfinder (options: PathfinderOptions = {}) {
             const lu = physics.hopLineUp?.(prog as HopProgram, LINEUP_TICKS) ?? null
             takeoffNote += ` | ${physics.hopNote ?? ''}`
             if (lu === null) return false
-            progPress = { yaws: lu.yaws, i: 1 }
-            pressAt(lu.yaws[0])
+            progPress = { yaws: lu.yaws, i: 0, delay: lu.delay ?? 0 }
+            if (!pressNext()) letGo()
             return true
           }
           // (a rest not tried yet: decided before exact() marks it tried, so the
@@ -3716,10 +4222,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
           const freshRest = atRest && Math.hypot(p.x - progRestX, p.z - progRestZ) > 0.005
           if (progPress !== null) {
             // the presses, one a tick, then let go (sneaking) to the kernel's rest
-            if (progPress.i < progPress.yaws.length) {
-              pressAt(progPress.yaws[progPress.i++])
-              return
-            }
+            if (pressNext()) return
             if (grounded && !atRest) {
               letGo()
               return
@@ -3755,10 +4258,42 @@ export function createPathfinder (options: PathfinderOptions = {}) {
               // (held to the program's place, HopProgram.land: beside a pane
               // rail the node is three places, and a live program to the
               // nearest one strands the next take-off behind the pane)
-              live = physics.hopFrom?.((nextPoint as Move).cell, beamPlan && newRest ? TAKEOFF_REST_BEAM_TICKS : TAKEOFF_SEARCH_TICKS, prog.land, nextLegCell()) ?? null
+              // (a kick or pivot plan searched in its own family first, on a budget of its own: physics.ts SEED_FAMILY)
+              const seed = SEED_FAMILY ? seedFamilies(prog) : undefined
+              live = physics.hopFrom?.((nextPoint as Move).cell, beamPlan && newRest ? TAKEOFF_REST_BEAM_TICKS : TAKEOFF_SEARCH_TICKS, prog.land, nextLegCell(), true, seed, true, prog) ?? null
               takeoffNote += (takeoffNote !== '' ? ' | ' : '') + (physics.hopNote ?? '')
+              // (slower than the plan with its line-up, on the way to its start: the line-up - PROG_LIVE_PLAN)
+              if (live !== null && PROG_LIVE_PLAN && !precise && d > PROG_LINEUP_TOL &&
+                  live.ticks > prog.ticks + Math.ceil(d / PROG_LINEUP_SPEED) + PROG_LINEUP_SETTLE + PROG_LIVE_SLACK) {
+                takeoffNote += ` | plan ${prog.ticks}t+lineup`
+                live = null
+              }
             }
             if (takeoffLive(live)) return
+          }
+          // (moving, near the start: the plan itself from here, if it flies no slower than after the line-up - PROG_MOVE_ANCHOR)
+          if (PROG_MOVE_ANCHOR && kernelTakeoff && grounded && !atRest && !futileChain && prog.climb !== true && prog.deep !== true && d <= PROG_FAR_START) {
+            if (cachedLut !== null) physics.setShapeTables?.(cachedLut)
+            const live = physics.hopAnchored?.((nextPoint as Move).cell, prog) ?? null
+            const fits = live !== null && live.ticks <= prog.ticks + Math.ceil(d / PROG_LINEUP_SPEED) + PROG_LINEUP_SETTLE
+            if (live !== null && execTraceFile !== null) takeoffNote += `${takeoffNote !== '' ? ' | ' : ''}moving ${physics.hopNote ?? ''}${fits ? '' : ' slower'}`
+            if (fits && takeoffLive(live)) return
+          }
+          // mcc-7-2's chain is checked only after a verified glide, never
+          // launched moving. A miss spends neither a rest nor its press tries.
+          // (after the moving anchor: a plan that flies from the moving body needs no line-up)
+          if (MOVING_LINEUP && precise && kernelTakeoff && grounded && !atRest && progMovingTries === 0 &&
+              prog.climb !== true && prog.deep !== true) {
+            if (cachedLut !== null) physics.setShapeTables?.(cachedLut)
+            const moving = { reach: PROG_EXACT_REACH, tried: false }
+            const lu = physics.hopLineUp?.(prog, LINEUP_TICKS, moving) ?? null
+            if (moving.tried) progMovingTries++
+            if (lu !== null && moving.tried) {
+              takeoffNote = physics.hopNote ?? ''
+              progPress = { yaws: lu.yaws, i: 0, delay: lu.delay ?? 0 }
+              if (!pressNext()) letGo()
+              return
+            }
           }
           if (precise && atRest && d <= lineTol && (!kernelTakeoff || Math.hypot(p.x - progRestX, p.z - progRestZ) <= 0.005)) {
             spent = true // lined up, tried from this very rest: the plan does not hold
@@ -3805,6 +4340,28 @@ export function createPathfinder (options: PathfinderOptions = {}) {
             bot.setControlState('sprint', false)
             bot.setControlState('sneak', sneakZone)
             execBranch = 'prog-lineup'
+            // Never off the support by the line-up's keys and the coast after
+            // them (PROG_LINEUP_BRAKE): a body come down on a thin take-off
+            // with its speed in it is braked against that speed, sneak off
+            // (prismarine's edge guard reads cells: a 3/16 panel's is no
+            // guard), held as long as the brake keeps it on; a start at the
+            // body's level only (a line-up never drops to its start).
+            if (PROG_LINEUP_BRAKE && grounded && physics.holdsOn !== undefined && Math.abs(prog.sy - p.y) <= 0.6 &&
+                Math.hypot(v.x, v.z) >= HOLD_STILL && !physics.holdsOn(null)) {
+              const yaw0 = bot.entity.yaw
+              bot.look(Math.atan2(-v.x, -v.z), 0, true)
+              if (physics.holdsOn({ back: true, sneak: false }, undefined, PROG_BRAKE_TICKS)) {
+                bot.setControlState('forward', false)
+                bot.setControlState('back', true)
+                bot.setControlState('sneak', false)
+                // (let go at the next tick's start whatever comes: a reset that keeps the keys must not hold it)
+                holdKeyed = true
+                execBranch = 'prog-brake'
+              } else {
+                bot.look(yaw0, 0, true)
+                if (holdSupport()) execBranch = 'hold'
+              }
+            }
             futile(swimming)
             return
           }
@@ -3854,8 +4411,10 @@ export function createPathfinder (options: PathfinderOptions = {}) {
             }
           }
           // a beam program touches down and goes on (its legs): spent only
-          // once its controls have run out short of the landing
-          if (prog.seq !== undefined && progTick > (prog.seq.length >> 1) + PROG_JUMP_GRACE) spent = true
+          // once its controls have run out short of the landing - or past the
+          // landing it was verified to (a live or re-anchored one holds its
+          // last control on, as HopOracle.advance flew it)
+          if (prog.seq !== undefined && progTick > Math.max(prog.seq.length >> 1, prog.ticks) + PROG_JUMP_GRACE) spent = true
         }
         // A deep bounce (HopProgram.deep: any miss of it a lethal fall): the
         // rest of it flown in the kernel from the body as it is, every tick.
@@ -3881,6 +4440,34 @@ export function createPathfinder (options: PathfinderOptions = {}) {
             lastNodeTime = performance.now()
             return
           }
+        }
+        if (spent && skip !== null && skip.target === nextPoint) {
+          const sk = skip
+          skip = null
+          skipFailed.add(sk.target)
+          if (!progFired && grounded) {
+            // a skip that never took off: undone - the nodes and the plan's
+            // program back, braked on the edge guard (it may stand on a post)
+            sk.target.program = sk.planned ?? null
+            path.unshift(...sk.removed)
+            progNode = null
+            progPhase = 0
+            // (a neo's take-off was marked searched at its rest: searched again)
+            takeoffSearched = null
+            takeoffSearchedAtRest = false
+            bot.setControlState('forward', false)
+            bot.setControlState('back', false)
+            bot.setControlState('left', false)
+            bot.setControlState('right', false)
+            bot.setControlState('jump', false)
+            bot.setControlState('sprint', false)
+            bot.setControlState('sneak', true)
+            holdSupport()
+            execBranch = 'skip-undo'
+            lastNodeTime = performance.now()
+            return
+          }
+          // (flown and lost: as any live program lost below)
         }
         if (spent) {
           (nextPoint as Move).program = null
@@ -3945,6 +4532,31 @@ export function createPathfinder (options: PathfinderOptions = {}) {
           hopHold = false
           const ent = bot.entity as { onGround?: boolean }
           const onStone = Math.floor(p.x) === chainVia.x && Math.floor(p.z) === chainVia.z && p.y < chainVia.y + 1
+          // The exact kernel first (CHAIN_KERNEL): the flight from the body
+          // as it is; onto a stone the plan goes straight on from, the one
+          // whose touchdown leaves the quickest next leg.
+          if (CHAIN_KERNEL && kernelTakeoff && ent.onGround === true && !swimming && takeoffSearched !== nextPoint) {
+            const v = bot.entity.velocity
+            const restNow = Math.hypot(v.x, v.z) < 0.01
+            takeoffSearched = nextPoint
+            takeoffSearchedAtRest = restNow
+            if (restNow) restSearchedAt = { node: nextPoint, x: p.x, z: p.z }
+            if (cachedLut !== null) physics.setShapeTables?.(cachedLut)
+            const n1 = path[1] as Move | undefined
+            let live: HopProgram | null = null
+            takeoffNote = ''
+            if (n1 !== undefined && n1.chain === true && physics.hopChain !== undefined) {
+              live = physics.hopChain((nextPoint as Move).cell, n1.cell, CHAIN_PICK_BUDGET, (path[2] as Move | undefined)?.chain === true)
+              takeoffNote = physics.hopNote ?? ''
+            }
+            if (live === null) {
+              live = physics.hopFrom?.((nextPoint as Move).cell, TAKEOFF_SEARCH_TICKS, undefined, nextLegCell()) ?? null
+              takeoffNote += (takeoffNote !== '' ? ' | ' : '') + (physics.hopNote ?? '')
+            }
+            // (the kernel's flight is the chain's: no settle back onto the stone if it comes down off the node)
+            if (takeoffLive(live)) { chainFired = true; return }
+            if (restNow && CHAIN_LOST && chainLost()) return
+          }
           if (bot.entity.velocity.y > 0.3 && ent.onGround !== true) {
             chainFired = true
           } else if (ent.onGround === true && onStone) {
@@ -4765,8 +5377,13 @@ export function createPathfinder (options: PathfinderOptions = {}) {
           takeoffSearched = nextPoint
           takeoffSearchedAtRest = speed < 0.01
           if (cachedLut !== null) physics.setShapeTables?.(cachedLut)
-          const live = physics.hopFrom?.((nextPoint as Move).cell, TAKEOFF_SEARCH_TICKS, undefined, nextLegCell()) ?? null
+          // (the kick where the families find nothing: a neo landed flat on its
+          // pillar's face, arena mcc-6-2 - kick 17t, where the brake, the rest
+          // search and the lined line-up took 24 ticks: physics.ts SEED_FAMILY)
+          const live = physics.hopFrom?.((nextPoint as Move).cell, TAKEOFF_SEARCH_TICKS, undefined, nextLegCell(), true, SEED_FAMILY ? NEO_SEED : undefined, false) ?? null
           takeoffNote = physics.hopNote ?? ''
+          // (past it, when one flight to the node after is quicker: SKIP_NEO)
+          if (live !== null && trySkipNeo(live.ticks, speed < 0.01)) return
           if (takeoffLive(live)) return
         }
         if (neo && speed >= 0.01) {
@@ -4811,8 +5428,9 @@ export function createPathfinder (options: PathfinderOptions = {}) {
             if (cachedLut !== null) physics.setShapeTables?.(cachedLut)
             const restNow = speed < 0.01
             if (restNow) restSearchedAt = { node: nextPoint, x: p.x, z: p.z }
-            const live = physics.hopFrom?.((nextPoint as Move).cell, restNow ? TAKEOFF_REST_TICKS : TAKEOFF_SEARCH_TICKS, undefined, nextLegCell()) ?? null
+            const live = physics.hopFrom?.((nextPoint as Move).cell, restNow ? TAKEOFF_REST_TICKS : TAKEOFF_SEARCH_TICKS, undefined, nextLegCell(), true, SEED_FAMILY && neo ? NEO_SEED : undefined, false) ?? null
             takeoffNote = physics.hopNote ?? ''
+            if (neo && live !== null && trySkipNeo(live.ticks, restNow)) return
             if (takeoffLive(live)) return
           }
           // (once per node, whether or not the live search ran this tick)
@@ -4841,7 +5459,51 @@ export function createPathfinder (options: PathfinderOptions = {}) {
             // now — the landing banned, a re-solve — rather than after the
             // old search and the run-ups reach the same verdict (8-1's strip
             // past a post: 78 ticks of them before the lip wait gave it up).
-            if (physics.hopExhausted === true && prevRetired !== null &&
+            if (LINED_GIVEUP && kernelTakeoff) {
+              // (a search that ran out of budget is no verdict: the old ways go on, the clock bans)
+              if (physics.hopExhausted !== true) linedOpen = nextPoint
+              else {
+                // The verdict is the cell the body stands on; a run-back leaves
+                // that a cell off the plan's take-off (tenways-ladder, five of
+                // them, 36 ticks of old search each): the take-off's own verdict.
+                // (judged from the cell the search flew from: at a lip the body's
+                // centre is over the gap and that cell is still the take-off's)
+                const pc = prevRetired?.cell
+                const lf = physics.linedFrom ?? null
+                let judged = pc !== undefined && lf !== null
+                  ? lf[0] === pc[0] && lf[1] === pc[1] && lf[2] === pc[2]
+                  : prevRetired !== null && Math.floor(prevRetired.x) === Math.floor(p.x) && Math.floor(prevRetired.z) === Math.floor(p.z)
+                if (!judged && prevRetired !== null && pc !== undefined && physics.hopFromCell !== undefined &&
+                    Math.abs(prevRetired.x - p.x) <= LINED_NEAR && Math.abs(prevRetired.z - p.z) <= LINED_NEAR) {
+                  const own = physics.hopFromCell(pc, (nextPoint as Move).cell, TAKEOFF_LINED_TICKS, true)
+                  takeoffNote += ' | ' + (physics.hopNote ?? '')
+                  if (own !== null) {
+                    ;(nextPoint as Move).program = own
+                    linedInstalled = nextPoint
+                    progNode = null
+                    jumpStillTicks = 0
+                    lastNodeTime = performance.now()
+                    bot.setControlState('forward', false)
+                    bot.setControlState('back', false)
+                    bot.setControlState('jump', false)
+                    bot.setControlState('sprint', false)
+                    bot.setControlState('sneak', true)
+                    execBranch = 'takeoff-lined'
+                    futile(swimming)
+                    return
+                  }
+                  judged = physics.hopExhausted === true
+                }
+                if (judged) {
+                  banTakeoff(nextPoint)
+                  execBranch = 'giveup'
+                  resetPath('stuck', true)
+                  return
+                }
+                // (off it: the verdict is on the body's own cell, a replan from here - banned the second time)
+                if (lostReplan('lined-lost')) return
+              }
+            } else if (physics.hopExhausted === true && prevRetired !== null &&
                 Math.floor(prevRetired.x) === Math.floor(p.x) && Math.floor(prevRetired.z) === Math.floor(p.z)) {
               banTakeoff(nextPoint)
               execBranch = 'giveup'
@@ -4849,6 +5511,13 @@ export function createPathfinder (options: PathfinderOptions = {}) {
               return
             }
           }
+          // The old search, where the lined one gave no verdict (no stand to
+          // fly from or to, or its budget out). Past a verdict its grid is the
+          // yaw family's own: in 42 traced races its 877 ticks found nothing.
+          if (LINED_GIVEUP && kernelTakeoff && linedOpen !== nextPoint) {
+            jumpStillTicks = 0
+            jumpSolveFailedNode = nextPoint
+          } else {
           const found = physics.solveJump(nextPoint, SCRIPT_BUDGET)
           if (found === undefined) {
             // searching: hold still (the search is from exactly here)
@@ -4870,6 +5539,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
             jumpScriptTick = 0
             jumpScriptAir = 0
             lastNodeTime = performance.now()
+          }
           }
         }
       } else {
@@ -5073,8 +5743,12 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         physics.wholeFall = wholeFall
         physics.gaitStrafe = stateMovements.allowStrafe
         physics.gaitLandRetire = stateMovements.allowLandingRetire
+        // (a neo a few nodes on, judged before the body gets there: NEO_AHEAD)
+        neoAhead()
         const drive = physics.gaitDrive(gatePath)
         kernelLed = drive.kind !== 'none'
+        // (past the stood node, when a flight straight to the program's node is quicker: SKIP_AHEAD)
+        if (kernelLed && (trySkip(drive, gatePath) || trySkipWalk(gatePath))) return
         if (kernelLed) {
           hopHold = drive.kind === 'hop'
           kernelHop = hopHold
@@ -5286,6 +5960,8 @@ export function createPathfinder (options: PathfinderOptions = {}) {
           if (live === null) live = physics.hopFrom?.((nextPoint as Move).cell, TAKEOFF_SEARCH_TICKS, undefined, nextLegCell()) ?? null
           takeoffNote = physics.hopNote ?? ''
           if (takeoffLive(live)) return
+          // (at rest on a chain's stone with no flight: CHAIN_LOST)
+          if (restNow && CHAIN_LOST && (nextPoint as Move).chain === true && chainLost()) return
         }
         // Improvement: creep to the takeoff CORNER before a standing parkour
         // jump. The sims above test jump-now from the CURRENT position; a
@@ -5717,6 +6393,8 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       futile(swimming)
     }
 
+    // (counted before the tick body runs: the teleport test's one-tick gap)
+    bot.on('physicsTick', () => { physTicks++ })
     bot.on('physicsTick', monitorMovement)
 
     // Onto slime (improvement): a touchdown on a slime block is made with

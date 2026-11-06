@@ -36,6 +36,8 @@ const GATE: u8 = 16;
 const DOOR_CLOSED: u8 = 32;
 const DOOR_OPEN: u8 = 64;
 const GATE_OPEN: u8 = 128;
+/// Extended: what entering a cell beside a hazard costs (mirror of moveGen.ts HAZARD_NEAR_COST).
+const HAZARD_NEAR_COST: f64 = 0.01;
 const PASSABLE_WHEN_OPEN: u8 = DOOR_OPEN | GATE_OPEN;
 
 // LutSpecial bytes (bubble columns, vines, slime — see types.ts).
@@ -711,6 +713,12 @@ struct SolverState {
     pending_aim: u8,
     /// generate(): the node's head+1 lid lies inside its support panel's strip (lid_in_strip).
     lid_here: bool,
+    /// Moves never generated, (from cell, to cell) pairs (mirror of SnapshotView.bannedEdges).
+    banned_edges: Vec<i32>,
+    /// hazard_near's answers by cell: 0 not asked, 1 clear, 2 beside a hazard (reset each solve).
+    near_hazard: Vec<u8>,
+    /// generate(): the node's cell index when a banned edge leaves it, else -1 (push_out skips those moves).
+    banned_from: i32,
     /// Set by parkour_ext_target for the landing it is about to push.
     pending_mom: u8,
     /// Momentum of the node being expanded (mirror of MoveGen.momIn).
@@ -818,6 +826,9 @@ impl SolverState {
             pending_via: -1,
             pending_aim: 0,
             lid_here: false,
+            banned_edges: Vec::new(),
+            near_hazard: Vec::new(),
+            banned_from: -1,
             pending_mom: MOM_NONE,
             mom_in: MOM_NONE,
             mom_dx: 0,
@@ -1200,6 +1211,47 @@ impl SolverState {
         }
     }
 
+    /// cell_index for a neighbour test: -1 outside, the boundary flag untouched (mirror of moveGen.ts cellIndexQuiet).
+    fn cell_index_quiet(&self, x: i32, y: i32, z: i32) -> i32 {
+        let lx = x - self.x0;
+        let ly = y - self.y0;
+        let lz = z - self.z0;
+        if lx < 0 || lx >= self.w || ly < 0 || ly >= self.h || lz < 0 || lz >= self.l {
+            return -1;
+        }
+        (ly * self.l + lz) * self.w + lx
+    }
+
+    /// A hazard cell: no collision box, never entered (mirror of moveGen.ts hazardAt).
+    fn hazard_at(&self, x: i32, y: i32, z: i32) -> bool {
+        let idx = self.cell_index_quiet(x, y, z);
+        if idx < 0 {
+            return false;
+        }
+        (self.flags[idx as usize] & (SAFE | PHYSICAL | DOOR_OPEN | GATE_OPEN)) == 0 && (self.heights[idx as usize] & 63) == 0
+    }
+
+    /// Is a cell beside a hazard (mirror of moveGen.ts hazardNear), kept per cell.
+    fn hazard_near(&mut self, x: i32, y: i32, z: i32, idx: i32) -> bool {
+        let v = self.near_hazard[idx as usize];
+        if v != 0 {
+            return v == 2;
+        }
+        let mut near = false;
+        'scan: for dy in 0..=1 {
+            for dz in -1..=1 {
+                for dx in -1..=1 {
+                    if (dx != 0 || dz != 0) && self.hazard_at(x + dx, y + dy, z + dz) {
+                        near = true;
+                        break 'scan;
+                    }
+                }
+            }
+        }
+        self.near_hazard[idx as usize] = if near { 2 } else { 1 };
+        near
+    }
+
     /// The height byte is packed — bits 6–7 carry the top-catch class.
     #[inline]
     fn height_at(&mut self, x: i32, y: i32, z: i32) -> f64 {
@@ -1348,12 +1400,25 @@ impl SolverState {
         }
     }
 
-    fn push_out(&mut self, x: i32, y: i32, z: i32, cost: f64, meta: u8) {
+    fn push_out(&mut self, x: i32, y: i32, z: i32, mut cost: f64, meta: u8) {
         let mom = self.pending_mom;
         self.pending_mom = MOM_NONE;
         let idx = self.cell_index(x, y, z);
         if idx < 0 {
             return;
+        }
+        if self.banned_from >= 0 && self.edge_banned(idx) {
+            // (a banned edge: dropped whole, its pending fields with it)
+            self.pending_via = -1;
+            self.pending_aim = 0;
+            if !self.move_breaks.is_empty() {
+                self.move_breaks = Vec::new();
+            }
+            return;
+        }
+        // Extended: a cell beside a hazard, a tie-breaker dearer (mirror of moveGen.ts)
+        if self.ext_on() && self.hazard_near(x, y, z, idx) {
+            cost += HAZARD_NEAR_COST;
         }
         let i = self.out.count;
         self.out.count += 1;
@@ -1684,6 +1749,16 @@ impl SolverState {
         }
         // A thin floor at the target feet cell is same-level ground, not a +1 hop.
         let yo: i32 = if (f_c & PHYSICAL) != 0 && !self.is_thin_floor(f_c) { 1 } else { 0 };
+        // Extended: never diagonally past a hazard's corner (mirror of moveGen.ts).
+        if self.ext_on() {
+            let mut hy = y;
+            while hy <= y + yo + 1 {
+                if self.hazard_at(x, hy, z + dz) || self.hazard_at(x + dx, hy, z) {
+                    return;
+                }
+                hy += 1;
+            }
+        }
         let h_0 = self.height_at(x, y - 1, z);
 
         let mut cost1 = 0.0;
@@ -3240,8 +3315,39 @@ impl SolverState {
         self.push_out(x, y - 1, z, cost, 0);
     }
 
+    /// Is the move from this node's cell (banned_from) to cell index `to` banned? (mirror of MoveGen.edgeBanned)
+    fn edge_banned(&self, to: i32) -> bool {
+        let e = &self.banned_edges;
+        let mut k = 0;
+        while k + 1 < e.len() {
+            if e[k] == self.banned_from && e[k + 1] == to {
+                return true;
+            }
+            k += 2;
+        }
+        false
+    }
+
     fn generate(&mut self, x: i32, y: i32, z: i32, mom: u8) {
         self.out.count = 0;
+        self.banned_from = -1;
+        if !self.banned_edges.is_empty() {
+            // (the node's own cell, read without cell_index's boundary flag)
+            let lx = x - self.x0;
+            let ly = y - self.y0;
+            let lz = z - self.z0;
+            if lx >= 0 && lx < self.w && ly >= 0 && ly < self.h && lz >= 0 && lz < self.l {
+                let from = (ly * self.l + lz) * self.w + lx;
+                let mut k = 0;
+                while k + 1 < self.banned_edges.len() {
+                    if self.banned_edges[k] == from {
+                        self.banned_from = from;
+                        break;
+                    }
+                    k += 2;
+                }
+            }
+        }
         self.mom_in = if self.momentum { mom } else { MOM_NONE };
         if self.mom_in != MOM_NONE {
             self.mom_dx = momentum_dx(self.mom_in);
@@ -3588,6 +3694,8 @@ pub unsafe extern "C" fn solve_init(params: *const u8) -> i32 {
     let entity_count = read_u32(params, &mut off) as usize;
     let ext_ptr = read_u32(params, &mut off) as *const u8;
     let ext_len = read_u32(params, &mut off) as usize;
+    let banned_ptr = read_u32(params, &mut off) as *const u8;
+    let banned_count = read_u32(params, &mut off) as usize;
 
     st.cfg = Config {
         allow_sprinting: cfg_bits & 1 != 0,
@@ -3622,6 +3730,14 @@ pub unsafe extern "C" fn solve_init(params: *const u8) -> i32 {
     }
     if !st.special.is_empty() && st.special.len() != n {
         return 4; // stale special grid from a different snapshot
+    }
+
+    st.near_hazard.clear();
+    st.near_hazard.resize(n, 0);
+    st.banned_edges.clear();
+    if banned_count > 0 {
+        let pairs = core::slice::from_raw_parts(banned_ptr as *const i32, banned_count * 2);
+        st.banned_edges.extend_from_slice(pairs);
     }
 
     st.entity_keys.clear();
