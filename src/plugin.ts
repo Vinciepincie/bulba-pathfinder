@@ -2303,6 +2303,9 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         if (climbHold) bot.setControlState('sneak', true)
       }
 
+      // These profiles release controls above and let normal physics settle the body.
+      if (stateMovements.allowStopSnap === false) return
+
       // Force horizontal velocity to 0 (otherwise inertia can move us too far)
       bot.entity.velocity.x = 0
       bot.entity.velocity.z = 0
