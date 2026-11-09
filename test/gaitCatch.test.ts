@@ -4,7 +4,7 @@ import { mcData, Block, AIR, STONE } from './helpers/voxelWorld.js'
 import { buildLut } from '../src/lut.js'
 import { simTables, newBody, copyBody, PlayerSim } from '../src/playerSim.js'
 import type { SimBody, SimControl } from '../src/playerSim.js'
-import { gaitSearch } from '../src/gaitSearch.js'
+import { gaitSearch, CLIMB_HOLD_ENABLED } from '../src/gaitSearch.js'
 import type { GaitNode } from '../src/gaitSearch.js'
 
 const lut = buildLut({ registry: mcData, version: mcData.version.minecraftVersion } as never, {
@@ -88,11 +88,42 @@ describe('gaitSearch: ladder catch landings', () => {
     // the catch branch: into the wall (+z), sneaking; the node's level when the search said
     let t = caught
     for (; t < 80 && b.y < 4 - 0.01; t++) {
-      c.hx = 0; c.hz = 1; c.jump = false; c.sprint = false; c.sneak = true
+      c.hx = 0; c.hz = 1; c.jump = CLIMB_HOLD_ENABLED; c.sprint = false; c.sneak = !CLIMB_HOLD_ENABLED || b.vy < 0
       k.step(b, c)
     }
     expect(Math.abs(t - predicted)).to.be.at.most(1)
   })
+
+  for (const [name, state, backed] of [
+    ['ladder', LADDER_N, true],
+    ['wall vine', mcData.blocksByName.vine.minStateId as number, true],
+    ['free vine', mcData.blocksByName.weeping_vines_plant.minStateId as number, false]
+  ] as const) {
+    it(`holds a falling ${name} catch before wall contact`, () => {
+      const k = world(put => {
+        for (let y = 1; y <= 5; y++) {
+          put(0, y, 0, state)
+          if (backed) put(0, y, 1)
+        }
+      })
+      const b = newBody(0.5, 2.2, 0.4)
+      b.vy = -0.225
+      const slide = copyBody(newBody(0, 0, 0), b)
+      const hold = copyBody(newBody(0, 0, 0), b)
+      const c: SimControl = { forward: true, back: false, left: false, right: false, jump: true, sprint: false, sneak: true, hx: 0, hz: 1 }
+      k.step(slide, { ...c, sneak: false })
+      k.step(hold, { ...c, jump: false })
+      k.step(b, c)
+      expect(b.collidedH).to.equal(false)
+      expect(slide.y).to.be.closeTo(2.05, 1e-6)
+      expect(hold.y).to.equal(2.2)
+      expect(hold.vy).to.be.closeTo(-0.0784, 1e-6)
+      expect(b.y).to.equal(2.2)
+      expect(b.vy).to.be.closeTo(0.1176, 1e-6)
+      k.step(b, c)
+      expect(b.y).to.be.closeTo(2.3176, 1e-6)
+    })
+  }
 
   it('a ladder out of reach gives no verdict', () => {
     const k = scene(4)

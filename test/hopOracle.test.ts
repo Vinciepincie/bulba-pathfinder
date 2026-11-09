@@ -7,9 +7,9 @@
 import { expect } from 'chai'
 import { mcData, Block, AIR, STONE, SLIME, OAK_FENCE_DRY, SOUL_SAND } from './helpers/voxelWorld.js'
 import { buildLut } from '../src/lut.js'
-import { simTables, newBody } from '../src/playerSim.js'
+import { simTables, newBody, SIM, isVanillaJump, setVanillaJump } from '../src/playerSim.js'
 import type { PlayerSim, SimBody, SimControl, SimWorld } from '../src/playerSim.js'
-import { HopOracle, ROBUST_NUDGE, LIVE_NUDGE, LAND_OVERLAP, LOOK_STEP, F_JUMP, sneakLanding, LANE_KICK_TICKS } from '../src/hopOracle.js'
+import { HopOracle, ROBUST_NUDGE, LIVE_NUDGE, LAND_OVERLAP, LOOK_STEP, F_JUMP, sneakLanding, LANE_KICK_TICKS, LIVE_PREFIX, LIVE_PREFIX_TICKS, BONK_FIRE, jumpRearmed, F_FWD, F_SPRINT, REGION_SETTLE } from '../src/hopOracle.js'
 import type { HopProgram } from '../src/hopOracle.js'
 import { vantages, dropTakeoffs, frontierSources, streamablePrefix } from '../src/hopPipeline.js'
 import type { RawPathNode } from '../src/types.js'
@@ -90,13 +90,13 @@ function floor (xs: [number, number], zs: [number, number]): Array<[number, numb
 }
 
 /** Every program must be the flight it claims: from scratch, the same ticks, on its node, from nudged starts too (verify()). */
-function expectFlies (o: HopOracle, p: HopProgram): void {
+function expectFlies (o: HopOracle, p: HopProgram, offsets?: ReadonlyArray<readonly [number, number]>): void {
   expect(o.fly(p), 'from scratch').to.equal(p.ticks)
   expect(o.verify(p), 'robust').to.equal(p.ticks)
   // a single flight, not a chain, holds from nudged starts all the way down
   if (p.legs !== true) {
     const n = p.start !== undefined || p.seq !== undefined ? LIVE_NUDGE : ROBUST_NUDGE
-    for (const [nx, nz] of [[n, 0], [-n, 0], [0, n], [0, -n]]) {
+    for (const [nx, nz] of offsets ?? [[n, 0], [-n, 0], [0, n], [0, -n]]) {
       expect(o.fly(p, nx, nz), `nudged ${nx},${nz}`).to.be.greaterThan(0)
     }
   }
@@ -107,6 +107,157 @@ describe('HopOracle', function () {
 
   // a three-block gap: take-off z ≤ 1, landing z ≥ 5
   const gap = [...floor([-2, 2], [-4, 1]), ...floor([-2, 2], [5, 8])]
+
+  describe('bonked take-offs', () => {
+    type Flight = { b: SimBody, t: number, fired: boolean, air: number, rebounds: number, yaw: number, leg: number, top: number }
+    type FlightOracle = { ctl: SimControl, tickFlight: (f: Flight, p: HopProgram, track: number[] | null) => number }
+    const roof = floor([-2, 2], [-4, 0]).map(([x, , z]): [number, number, number] => [x, 3, z])
+    const solid = [...floor([-2, 2], [-4, 0]), ...floor([-2, 2], [3, 8]), ...roof]
+    const body = (): SimBody => Object.assign(newBody(0.5, 1, 0.5), { onGround: true, vy: -0.08 * SIM.airdrag })
+    const flight = (b: SimBody): Flight => ({ b: { ...b }, t: 0, fired: false, air: 0, rebounds: 0, yaw: NaN, leg: 0, top: b.y })
+    const program = (b: SimBody): HopProgram => {
+      const h = { fixed: true, x: 0, z: 1 }
+      return { sx: b.x, sy: b.y, sz: b.z, start: b, run: h, jumpAt: 0, air1: h, turnAir: Infinity,
+        air2: h, sprint: true, ticks: 0, tx: 0, ty: 1, tz: 4, family: 'straight' }
+    }
+    function tick (o: HopOracle, f: Flight, p: HopProgram, jump: boolean): number {
+      const i = o as unknown as FlightOracle
+      Object.assign(i.ctl, { hx: 0, hz: 1, forward: false, back: false, left: false, right: false, sprint: false, sneak: false, jump })
+      return i.tickFlight(f, p, null)
+    }
+
+    it('recognises a re-arm, not an inherited cooldown or a decrement', () => {
+      expect(jumpRearmed(0, 10)).to.equal(BONK_FIRE)
+      expect(jumpRearmed(1, 10)).to.equal(BONK_FIRE)
+      expect(jumpRearmed(10, 10)).to.equal(false)
+      expect(jumpRearmed(11, 10)).to.equal(false)
+      expect(jumpRearmed(2, 1)).to.equal(false)
+      expect(jumpRearmed(undefined, 10)).to.equal(false)
+      expect(jumpRearmed(0, undefined)).to.equal(false)
+    })
+
+    it('recognises the impulse after a bonk and honours the held-jump cooldown', () => {
+      const o = oracleOver(solid, true)
+      const b = body()
+      b.jumpTicks = 2
+      const p = program(b)
+      const f = flight(b)
+      tick(o, f, p, true)
+      expect(f.b.jumpTicks).to.equal(1)
+      expect(f.fired).to.equal(false)
+      tick(o, f, p, true)
+      expect(f.b.jumpTicks).to.equal(SIM.autojumpCooldown)
+      expect(f.b.y).to.be.closeTo(3 - 1.80001, 1e-12)
+      expect(f.b.vy).to.equal(-SIM.gravity * SIM.airdrag)
+      expect(f.b.onGround).to.equal(false)
+      expect(f.fired).to.equal(BONK_FIRE)
+      expect(f.air).to.equal(0)
+      tick(o, f, p, false)
+      expect(f.b.jumpTicks).to.equal(0)
+      expect(f.b.onGround).to.equal(false)
+      tick(o, f, p, false)
+      expect(f.b.onGround).to.equal(true)
+      expect(f.b.y).to.equal(1)
+    })
+
+    it('finds and replays a live bonk over a two-wide gap, grid or not', function () {
+      if (!BONK_FIRE) this.skip()
+      for (const grid of [true, false]) {
+        const o = oracleOver(solid, grid)
+        // climb2's low roof, with synthetic carried speed at the lip.
+        const b = Object.assign(body(), { z: 1.18, vz: 0.93 })
+        const p = o.hopFrom(b, [0, 1, 4], performance.now() + 20000)
+        expect(p).to.not.equal(null)
+        const q = p as HopProgram
+        expect(q.jumpAt).to.equal(0)
+        expectFlies(o, q)
+        const seq: HopProgram = { ...program(b), family: 'beam', legs: true,
+          seq: [Math.PI, F_FWD | F_SPRINT | F_JUMP, Math.PI, F_FWD | F_SPRINT] }
+        seq.ticks = o.fly(seq)
+        expect(seq.ticks).to.be.greaterThan(0)
+        expectFlies(o, seq)
+      }
+    })
+
+    it('restores the missed bonk with PF_BONK_FIRE=0', () => {
+      const o = oracleOver(solid, true)
+      const p = program(Object.assign(body(), { z: 1.18, vz: 0.93 }))
+      expect(o.fly(p)).to.equal(BONK_FIRE ? 3 : -1)
+    })
+
+    it('keeps the open-sky fired tick and air counter identical to the velocity rule', () => {
+      const o = oracleOver(floor([-2, 2], [-4, 8]), true)
+      const b = body()
+      const p = { ...program(b), jumpAt: 2 }
+      const f = flight(b)
+      let oldFired = false
+      let oldAir = 0
+      for (let t = 0; t < 5; t++) {
+        tick(o, f, p, t >= p.jumpAt && !f.fired)
+        if (!oldFired) oldFired = f.b.vy > 0.3 || (!f.b.onGround && f.b.vy < -0.3)
+        else oldAir++
+        expect(f.fired).to.equal(oldFired)
+        expect(f.air).to.equal(oldAir)
+        if (t === p.jumpAt) {
+          expect(f.fired).to.equal(true)
+          expect(f.t).to.equal(3)
+          expect(f.air).to.equal(0)
+        }
+      }
+    })
+
+    it('registers honey impulses and preserves both slime rebound jump rules', () => {
+      const honey = stateOf('honey_block', {})
+      const h = oracleOver([], true, [[0, 0, 0, honey], [0, -1, 0, honey]])
+      const b = Object.assign(body(), { y: 15 / 16 })
+      const f = flight(b)
+      tick(h, f, program(b), true)
+      expect(f.b.vy).to.be.closeTo((SIM.jumpVelocity * 0.4 - SIM.gravity) * SIM.airdrag, 1e-12)
+      expect(f.b.jumpTicks).to.equal(SIM.autojumpCooldown)
+      expect(f.fired).to.equal(BONK_FIRE)
+      const saved = isVanillaJump()
+      try {
+        for (const vanilla of [false, true]) {
+          setVanillaJump(vanilla)
+          const o = oracleOver([], true, [[0, 0, 0, SLIME]])
+          const b = Object.assign(body(), { vy: 0.9 })
+          const f = flight(b)
+          tick(o, f, program(b), true)
+          expect(f.b.vy).to.be.closeTo(((vanilla ? 0.9 : SIM.jumpVelocity) - SIM.gravity) * SIM.airdrag, 1e-12)
+          expect(f.b.jumpTicks).to.equal(SIM.autojumpCooldown)
+          expect(f.fired).to.equal(true)
+          expect(f.air).to.equal(0)
+        }
+      } finally { setVanillaJump(saved) }
+    })
+
+    it('ends a touch-and-go flight pinned under a roof with jump held (FLIGHT_CAP)', function () {
+      if (process.env.PF_FLIGHT_CAP === '0') this.skip()
+      this.timeout(10000)
+      const o = oracleOver(solid, true)
+      const b = body()
+      // (jumping on the spot under the roof: every bonk re-fires, every landing starts a leg - no leg limit is ever hit)
+      const seq: HopProgram = { ...program(b), tz: 6, family: 'beam', legs: true, seq: [NaN, F_JUMP] }
+      expect(o.fly(seq)).to.equal(-1)
+    })
+
+    it('re-arms each touch-and-go leg after a bonked touchdown', function () {
+      if (!BONK_FIRE) this.skip()
+      const o = oracleOver(solid, true)
+      const b = body()
+      const p = { ...program(b), legs: true }
+      const f = flight(b)
+      tick(o, f, p, true)
+      tick(o, f, p, false)
+      tick(o, f, p, false)
+      expect(f.leg).to.equal(3)
+      expect(f.fired).to.equal(false)
+      tick(o, f, p, true)
+      expect(f.fired).to.equal(true)
+      expect(f.air).to.equal(0)
+      expect(f.leg).to.equal(3)
+    })
+  })
 
   it('finds a jump over a gap that flies the same from scratch, grid or not', () => {
     for (const grid of [true, false]) {
@@ -144,6 +295,149 @@ describe('HopOracle', function () {
     expect(q.start).to.not.equal(undefined)
     expect(q.start?.vz).to.equal(0.18)
     expectFlies(o, q)
+  })
+
+  describe('live ground prefixes', () => {
+    type PrefixOracle = {
+      sim: PlayerSim
+      requiredNudges: (p: HopProgram, n: number) => Array<[number, number]>
+      prefixBudget: { end: number, deadline: number } | null
+    }
+    const inspect = (o: HopOracle): PrefixOracle => o as unknown as PrefixOracle
+
+    function fixture (thin = false, grid = true): { o: HopOracle, b: SimBody, target: [number, number, number] } {
+      // mcc-6-2: the three-block face and its return obstruct the flush launch.
+      const solid: Array<[number, number, number]> = [[3, 0, -2]]
+      for (const [x, z] of [[-1, -1], [0, -1], [1, -1], [1, -2]]) {
+        for (let y = 0; y <= 4; y++) solid.push([x, y, z])
+      }
+      if (!thin) solid.push([0, 0, 0])
+      const o = thin
+        ? oracleOver(solid.map(([x, y, z]): [number, number, number] => [z, y, x]), grid, [[0, 0, 0, TRAPDOOR_LEDGE]])
+        : oracleOver(solid, grid)
+      const b = thin ? newBody(3 / 16 + o.halfWidth - 0.012, 1, 0.26) : newBody(0.26, 1, o.halfWidth)
+      b.onGround = true
+      b.vy = -0.0784
+      b.collidedH = true
+      b.collidedV = true
+      b.jumpTicks = 3
+      return { o, b, target: thin ? [-2, 1, 3] : [3, 1, -2] }
+    }
+
+    function counted<T> (o: HopOracle, run: () => T, after?: (b: SimBody, c: SimControl) => void): { value: T, steps: number } {
+      const sim = inspect(o).sim
+      const step = sim.step
+      let steps = 0
+      sim.step = (b, c): void => { steps++; step.call(sim, b, c); after?.(b, c) }
+      try { return { value: run(), steps } } finally { sim.step = step }
+    }
+
+    it('retreats from a pillar face and flies the retained original-start twins', function () {
+      if (!LIVE_PREFIX || process.env.PF_LIVE_NUDGE_SAFE === '0') this.skip()
+      const yaw0 = 0.3
+      const n = LIVE_NUDGE
+      const retained: Array<[number, number]> = [[n, 0], [-n, 0], [0, n]]
+      for (const grid of [true, false]) {
+        const plain = fixture(false, grid)
+        plain.o.tickLimit = 200_000
+        expect(plain.o.hopFrom(plain.b, plain.target, Infinity, yaw0,
+          undefined, undefined, true, ['kick'], 150_000, false), 'ordinary rest search').to.equal(null)
+        const { o, b, target } = fixture(false, grid)
+        const before = { ...b }
+        const ticks = o.ticksFlown
+        const found = counted(o, () => o.hopPrefix(b, target, Infinity, yaw0))
+        expect(found.steps).to.be.at.most(LIVE_PREFIX_TICKS)
+        expect(o.ticksFlown - ticks, 'every kernel step charged once').to.equal(found.steps)
+        expect(found.value).to.not.equal(null)
+        const p = found.value as HopProgram
+        expect(b).to.deep.equal(before)
+        expect(p.start).to.deep.equal(before)
+        expect(p.start).to.not.equal(b)
+        expect([p.sx, p.sy, p.sz, p.yaw0]).to.deep.equal([b.x, b.y, b.z, yaw0])
+        expect(p.seq).to.equal(undefined)
+        expect(p.legs).to.not.equal(true)
+        const prefix = p.groundPrefix!
+        expect(prefix.length).to.be.within(1, 4)
+        expect(p.jumpAt).to.be.at.least(prefix.length)
+        expect(inspect(o).requiredNudges(p, n)).to.deep.equal(retained)
+        const sim = inspect(o).sim
+        for (const [nx, nz] of [[0, 0], ...retained]) {
+          const q = { ...b, x: b.x + nx, z: b.z + nz }
+          let yaw = yaw0
+          for (const press of prefix) {
+            yaw += Math.round((press.yaw - yaw) / LOOK_STEP) * LOOK_STEP
+            const c: SimControl = {
+              forward: true, back: false, left: false, right: false, jump: false,
+              sprint: press.sprint, sneak: press.sneak,
+              hx: -Math.sin(Math.PI - yaw), hz: Math.cos(Math.PI - yaw)
+            }
+            sim.step(q, c)
+            expect(q.onGround, `grounded ${nx},${nz}`).to.equal(true)
+            expect(sim.carried(q), `carried ${nx},${nz}`).to.equal(true)
+            expect(q.y).to.equal(b.y)
+            expect(q.inLiquid).to.equal(false)
+            expect(sim.collides(q)).to.equal(false)
+          }
+        }
+        expectFlies(o, p, retained)
+      }
+    })
+
+    it('rejects a retreat off a thin support even while onGround stays set', function () {
+      if (!LIVE_PREFIX) this.skip()
+      const { o, b, target } = fixture(true)
+      const sim = inspect(o).sim
+      const n = LIVE_NUDGE
+      for (const [nx, nz] of [[0, 0], [n, 0], [-n, 0], [0, n], [0, -n]]) {
+        expect(sim.carried({ ...b, x: b.x + nx, z: b.z + nz })).to.equal(true)
+      }
+      const before = { ...b }
+      let lostSupport = false
+      const found = counted(o, () => o.hopPrefix(b, target, Infinity, 0.3), (q, c) => {
+        if (c.forward && !c.jump && q.onGround && !sim.carried(q)) lostSupport = true
+      })
+      expect(found.value).to.equal(null)
+      expect(lostSupport).to.equal(true)
+      expect(found.steps).to.be.at.most(LIVE_PREFIX_TICKS)
+      expect(o.ticksFlown).to.equal(found.steps)
+      expect(b).to.deep.equal(before)
+    })
+
+    it('returns null at exhaustion without exceeding even a one-tick allowance', () => {
+      for (const spent of [0, 1]) {
+        const { o, b, target } = fixture()
+        o.tickLimit = 1
+        o.ticksFlown = spent
+        const found = counted(o, () => o.hopPrefix(b, target, Infinity, 0.3))
+        expect(found.value).to.equal(null)
+        expect(found.steps).to.be.at.most(LIVE_PREFIX ? 1 - spent : 0)
+        expect(o.ticksFlown - spent).to.equal(found.steps)
+        expect(inspect(o).prefixBudget).to.equal(null)
+      }
+    })
+
+    it('discards a candidate whose original-start verification exhausts the allowance', function () {
+      if (!LIVE_PREFIX || process.env.PF_LIVE_NUDGE_SAFE === '0') this.skip()
+      const { o, b, target } = fixture()
+      const fly = o.fly
+      let verifying = false
+      o.fly = (p, nx = 0, nz = 0, track = null): number => {
+        if (!verifying) {
+          verifying = true
+          expect(inspect(o).prefixBudget).to.not.equal(null)
+          inspect(o).prefixBudget!.end = o.ticksFlown + 1
+        }
+        return fly.call(o, p, nx, nz, track)
+      }
+      try {
+        const found = counted(o, () => o.hopPrefix(b, target, Infinity, 0.3))
+        expect(verifying).to.equal(true)
+        expect(found.value).to.equal(null)
+        expect(found.steps).to.be.at.most(LIVE_PREFIX_TICKS)
+        expect(o.ticksFlown).to.equal(found.steps)
+        expect(inspect(o).prefixBudget).to.equal(null)
+      } finally { o.fly = fly }
+    })
   })
 
   describe('wall-safe live nudges', () => {
@@ -718,6 +1012,29 @@ describe('HopOracle', function () {
       places.add(o.besideRest([0, 2, 0], rest!) ? (rest!.z > 0.5 ? 'south' : 'north') : 'top')
     }
     expect([...places].sort(), 'onto the top and over the rail').to.deep.equal(['south', 'top'])
+    // (a flight down on the rail's top, for the floor past it: its ticks run on to that floor, the executor's arrival - REGION_SETTLE)
+    const priced = o as unknown as { goLanding: boolean, touch: SimBody | null }
+    let sawOff = false
+    for (const e of edges) {
+      const p = e.program
+      const td = newBody(0, 0, 0)
+      priced.goLanding = true
+      priced.touch = td
+      const touched = o.fly(p)
+      priced.touch = null
+      priced.goLanding = false
+      const off = Math.abs(td.y - p.land!.y) >= 0.5
+      if (off) sawOff = true
+      // (the next leg leaves from the arrival the price means, not the rail's top)
+      const arrived = newBody(0, 0, 0)
+      priced.touch = arrived
+      o.fly(p)
+      priced.touch = null
+      if (off && REGION_SETTLE) expect(Math.abs(arrived.y - p.land!.y), 'arrival body at its level').to.be.lessThan(0.5)
+      if (off && REGION_SETTLE) expect(p.ticks, 'its settle priced').to.be.greaterThan(touched)
+      else expect(p.ticks, 'its touchdown').to.equal(touched)
+    }
+    expect(sawOff, 'one of them touches the rail first').to.equal(true)
   })
 
   it('offers the ledges over slime the search reached as drop take-offs, nearest the slime first', () => {

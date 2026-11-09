@@ -162,6 +162,8 @@ export const HOP_MAX_DIP = 0.5
  * holding the node buys nothing and costs the momentum the next move wants.
  */
 export const PARKOUR_LAND_DY = 0.5
+/** A parkour node passed from high over it where ground goes on beyond it, as the executor retires it (Search.holeBeyond); PF_GAIT_GROUND_PASS=0: always held. */
+const GAIT_GROUND_PASS = typeof process === 'undefined' || process.env.PF_GAIT_GROUND_PASS !== '0'
 
 /**
  * Ticks on the ground a schedule may wait before a hop over ground that runs
@@ -287,6 +289,9 @@ const ROUND_BAND = 0.61
 const HAZARD_SCAN = 12
 /** PF_GAIT_ROUND=0 bisects the second policy. */
 const GAIT_ROUND = typeof process === 'undefined' || process.env.PF_GAIT_ROUND !== '0'
+// climb2's two policies need not fly the same tree twice: check every ground
+// step, including the scout's, before reusing the plain search.
+const GAIT_REUSE = typeof process === 'undefined' || process.env.PF_GAIT_REUSE !== '0'
 /** The strafe fallback (gaitSearch): how many ticks sooner the search without the strafe must be; PF_STRAFE_FALLBACK=0 bisects. */
 const STRAFE_MARGIN = 1
 const STRAFE_FALLBACK = typeof process === 'undefined' || process.env.PF_STRAFE_FALLBACK !== '0'
@@ -314,6 +319,8 @@ const LADDER_RISE = (SIM.ladderClimbSpeed - SIM.gravity) * SIM.airdrag
 const WALL_SIDES: ReadonlyArray<readonly [number, number]> = [[1, 0], [-1, 0], [0, 1], [0, -1]]
 /** PF_GAIT_CATCH=0 bisects the catch landing. */
 export const GAIT_CATCH = typeof process === 'undefined' || process.env.PF_GAIT_CATCH !== '0'
+/** mcc-4-1/5-3: hold catches before wall contact, in the executor and its schedules. */
+export const CLIMB_HOLD_ENABLED = typeof process === 'undefined' || process.env.PF_CLIMB_HOLD !== '0'
 /** A body at a schedule's end has stopped below this speed, and is given this many ticks to (Search.stops). */
 const STOP_SPEED = 0.05
 const STOP_TICKS = 8
@@ -407,7 +414,11 @@ export function kAim (c: SimControl, b: SimBody, px: number, pz: number): void {
 }
 
 /** Which policy the last decision took (per PhysicsSim): the rounding one is kept until the plain one beats it by ROUND_MARGIN. */
-export interface GaitPick { round: boolean }
+export interface GaitPick {
+  round: boolean
+  /** False repeats the rounding search for differential checks. */
+  reuse?: boolean
+}
 
 class Search {
   /**
@@ -420,6 +431,8 @@ class Search {
    * hops pinned against the pillar face.
    */
   roundMode = false
+  /** Still identical at every rounding opportunity visited by the plain search. */
+  roundSame = false
   private best = Infinity
   private work = 0
   /** The work the phase being searched may reach, and whether it got there. */
@@ -869,7 +882,7 @@ class Search {
     for (let t = 0; t < GAIT_BUDGET; t++) {
       if (b.y >= goal.y - CATCH_LEVEL) return true
       if (!this.k.onClimbable(b) || b.inLiquid || (b.onGround && b.y < goal.y - CATCH_LEVEL)) return false
-      c.forward = true; c.back = false; c.left = false; c.jump = false; c.sprint = false; c.sneak = true
+      c.forward = true; c.back = false; c.left = false; c.jump = CLIMB_HOLD_ENABLED; c.sprint = false; c.sneak = !CLIMB_HOLD_ENABLED || b.vy < 0
       this.climbHeading(b, goal)
       this.k.step(b, c)
       this.work++
@@ -908,9 +921,10 @@ class Search {
       c.forward = true
       c.back = false
       c.left = false
-      c.jump = false
+      c.jump = CLIMB_HOLD_ENABLED
       c.sprint = false
-      c.sneak = true
+      // (only while falling: it stops the first slide, and rising it only weakens the steering; plugin.ts climb hold)
+      c.sneak = !CLIMB_HOLD_ENABLED || h.vy < 0
       this.climbHeading(h, goal)
       y0 = h.y
       this.k.step(h, c)
@@ -1067,6 +1081,32 @@ class Search {
   }
 
   /**
+   * Ground beyond parkour node `n` along the body's motion (plugin.ts
+   * holeBeyond, its probes and inset): the executor retires such a node from
+   * high over it, so a schedule holding it steers back at a node already
+   * gone (arena mcc-7-1: a flight turned round over a two-block walkway).
+   */
+  private holeBeyond (n: GaitNode, b: SimBody): boolean {
+    let ux = b.vx
+    let uz = b.vz
+    let len = Math.hypot(ux, uz)
+    if (len < 0.05) {
+      ux = n.x - b.x
+      uz = n.z - b.z
+      len = Math.hypot(ux, uz)
+      if (len < 1e-6) return false
+    }
+    ux /= len
+    uz /= len
+    for (let d = 1; d <= 2; d++) {
+      const x = n.x + ux * d
+      const z = n.z + uz * d
+      if (!this.k.boxHits(x, n.y, z, -PROBE_INSET, PROBE_INSET) && !this.k.boxHits(x, n.y - 0.55, z, -PROBE_INSET, PROBE_INSET)) return true
+    }
+    return false
+  }
+
+  /**
    * Nodes passed by body `b` from index `i` on, as the executor retires them
    * (plugin.ts, the arrival loop): inside the arrival box (`dy` its height)
    * or down on the leg to the next node, past it (onLegPast);
@@ -1081,7 +1121,8 @@ class Search {
       const n = this.path[i]
       const boxed = Math.abs(n.x - b.x) <= 0.35 && Math.abs(n.z - b.z) <= 0.35 && Math.abs(n.y - b.y) < dy
       if (n.parkour === true) {
-        if (!(boxed && b.y - n.y <= PARKOUR_LAND_DY) && !(landing && this.cameDownPast(b, i))) break
+        if (!(boxed && (b.y - n.y <= PARKOUR_LAND_DY || (GAIT_GROUND_PASS && i < this.index && !this.holeBeyond(n, b)))) &&
+            !(landing && this.cameDownPast(b, i))) break
       } else if (!boxed && !(b.onGround && i + 1 < this.path.length && Math.abs(n.y - b.y) < dy && onLegPast(b.x, b.z, n, this.path[i + 1]))) break
       // (the path's end is arrived at: down, and in the node's own cell — a goal is a cell, and a box round a node off its centre is two)
       if (this.last && i === this.index && (!b.onGround || Math.floor(b.x) !== Math.floor(n.x) || Math.floor(b.z) !== Math.floor(n.z))) break
@@ -1179,7 +1220,7 @@ class Search {
     // (the rounding policy: round the first box in the way, if its corner
     // lies within ROUND_CORRIDOR of the leg the body is on)
     let rounded = false
-    if (this.roundMode && !air && this.roundCorner(b, nodeDx, nodeDz, n.y, this.round)) {
+    if ((this.roundMode || this.roundSame) && !air && this.roundCorner(b, nodeDx, nodeDz, n.y, this.round)) {
       const px = b.x + this.round.dx
       const pz = b.z + this.round.dz
       const pv = i > 0 ? this.path[Math.min(i, this.path.length) - 1] : null
@@ -1192,9 +1233,13 @@ class Search {
         ok = Math.hypot(pv.x + ax * tt - px, pv.z + az * tt - pz) <= ROUND_CORRIDOR
       }
       if (ok) {
-        h.dx = this.round.dx
-        h.dz = this.round.dz
-        rounded = true
+        if (this.roundMode) {
+          h.dx = this.round.dx
+          h.dz = this.round.dz
+          rounded = true
+        } else {
+          this.roundSame = false
+        }
       }
     }
     // (one gathering of the boxes round the body for all the probes; none
@@ -1671,8 +1716,15 @@ export function kWalkable (k: PlayerSim, from: { x: number, y: number, z: number
  * with neither, the kernel has no way there and the tick is someone else's.
  */
 function policySearch (k: PlayerSim, b0: SimBody, path: ReadonlyArray<GaitNode>, goal: GaitGoal, pick?: GaitPick): GaitResult {
-  const a = new Search(k, path, goal).run(b0)
+  const s1 = new Search(k, path, goal)
+  // (climb2: no rounded corner met in the plain search - the rounding one would fly the same tree; GAIT_REUSE)
+  s1.roundSame = GAIT_REUSE && GAIT_ROUND && pick !== undefined && pick.reuse !== false
+  const a = s1.run(b0)
   if (pick === undefined || !GAIT_ROUND) return a
+  if (s1.roundSame) {
+    pick.round = pick.round && Math.min(a.hop, a.run) !== Infinity
+    return a
+  }
   // (and the rounding policy: taken where it is ROUND_MARGIN sooner, kept
   // once taken until the plain one is ROUND_MARGIN sooner — no flapping)
   const s2 = new Search(k, path, goal)

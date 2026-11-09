@@ -10,7 +10,7 @@ import { buildLut } from '../src/lut.js'
 import { simTables, newBody, copyBody, PlayerSim } from '../src/playerSim.js'
 import type { SimBody, SimControl } from '../src/playerSim.js'
 import { gaitSearch, kWalkable, onLegPast, fallAim, strafeYaw, EASE_NEVER } from '../src/gaitSearch.js'
-import type { GaitNode } from '../src/gaitSearch.js'
+import type { GaitNode, GaitGoal, GaitResult } from '../src/gaitSearch.js'
 
 const lut = buildLut({ registry: mcData, version: mcData.version.minecraftVersion } as never, {
   lutFingerprint: () => 'gait', climbables: new Set(), carpets: new Set(), blocksToAvoid: new Set(),
@@ -166,10 +166,78 @@ function drive (k: PlayerSim, b0: SimBody, path: GaitNode[], strafe = false): { 
   return { b, ticks: 400, jumps, at: i, fell: false, lost: true }
 }
 
+/** Compare every returned fact except work, and the sticky policy, with both searches run. */
+function compareReuse (k: PlayerSim, b: SimBody, path: GaitNode[], goal: GaitGoal, round: boolean): [GaitResult, GaitResult] {
+  const fullPick = { round, reuse: false }
+  const full = gaitSearch(k, b, path, goal, fullPick)
+  const pick = { round }
+  const kept = gaitSearch(k, b, path, goal, pick)
+  expect({ ...kept, work: 0 }).to.deep.equal({ ...full, work: 0 })
+  expect(pick.round).to.equal(fullPick.round)
+  return [kept, full]
+}
+
 describe('gaitSearch', function () {
   this.timeout(30000)
 
   const open = world(put => { for (let x = -3; x <= 3; x++) for (let z = -4; z <= 44; z++) put(x, 0, z) })
+
+  it('reuses the equivalent second policy for ground and hop verdicts', () => {
+    const cases = [
+      { b: body(0.5, 1, 1.5, 0, 0.28), path: line(2, 2), goal: { index: 0, last: true }, run: true },
+      { b: body(0.5, 1, 0.5, 0, 0.28), path: line(1, 30), goal: { index: 8, last: false }, run: false }
+    ]
+    const reuse = process.env.PF_GAIT_REUSE !== '0' && process.env.PF_GAIT_ROUND !== '0'
+    for (const c of cases) for (const round of [false, true]) {
+      const [kept, full] = compareReuse(open, c.b, c.path, c.goal, round)
+      expect(kept.run !== Infinity).to.equal(c.run)
+      expect(full.work).to.be.greaterThan(0)
+      expect(kept.work).to.equal(reuse ? full.work / 2 : full.work)
+    }
+  })
+
+  it('rechecks later ground steps and changed blocks, including a boxless hazard', () => {
+    for (const state of [STONE, mcData.blocksByName.fire.minStateId as number]) {
+      const k = world(put => {
+        for (let x = -3; x <= 3; x++) for (let z = -4; z <= 16; z++) put(x, 0, z)
+      })
+      const grid = k.world.grid!
+      grid.serial = 1
+      grid.stamps = new Int32Array(grid.states.length).fill(grid.serial)
+      const path = line(1, 8).map(n => ({ ...n, x: 0.9 }))
+      const b = body(0.9, 1, 0.5)
+      b.jumpTicks = 100
+      const goal = { index: path.length - 1, last: true }
+      compareReuse(k, b, path, goal, false)
+      const at = (y: number): number => ((y - grid.y0) * grid.l + 4 - grid.z0) * grid.w + 1 - grid.x0
+      grid.states[at(1)] = state
+      if (state === STONE) grid.states[at(2)] = state
+      grid.serial++
+      grid.stamps.fill(grid.serial)
+      for (const round of [false, true]) {
+        const [kept, full] = compareReuse(k, b, path, goal, round)
+        expect(kept.work).to.equal(full.work)
+      }
+    }
+  })
+
+  it('compares changed bodies and strafe policies with a fresh full search', () => {
+    const path = line(1, 12)
+    for (const x of [0.5, 0.5000000000000001]) for (const strafe of [false, true]) {
+      for (const round of [false, true]) {
+        compareReuse(open, body(x, 1, 0.5, 0, 0.28), path, { index: 8, last: false, strafe }, round)
+      }
+    }
+  })
+
+  it('clears the sticky policy when both equivalent searches have no schedule', () => {
+    const k = world(() => {})
+    const [kept, full] = compareReuse(k, body(0.5, 1, 0.5), line(1, 2), { index: 1, last: true }, true)
+    expect(kept.hop).to.equal(Infinity)
+    expect(kept.run).to.equal(Infinity)
+    const reuse = process.env.PF_GAIT_REUSE !== '0' && process.env.PF_GAIT_ROUND !== '0'
+    expect(kept.work).to.equal(reuse ? full.work / 2 : full.work)
+  })
 
   it('hops over open ground, and sooner there than the feet get', () => {
     const path = line(1, 30)
@@ -197,6 +265,46 @@ describe('gaitSearch', function () {
     expect(b.onGround).to.equal(true)
     expect(b.z).to.be.greaterThan(4)
     expect(Math.abs(b.x - 0.5)).to.be.lessThan(0.05)
+  })
+
+  it('passes an intermediate parkour node high where the floor goes on (mcc-7-1)', () => {
+    const path = line(0, 10)
+    path[0] = { ...path[0], parkour: true, walked: true }
+    const b = body(0.5, 1, -0.27, 0, 0.04)
+    const r = gaitSearch(open, b, path, { index: 8, last: false })
+    expect(r.hop).to.be.lessThan(Infinity)
+    expect(r.flight.length).to.be.greaterThan(3)
+    // (the flight never turns back at the node behind it)
+    const forward = -Math.cos(r.flight[3])
+    if (process.env.PF_GAIT_GROUND_PASS === '0') return
+    expect(forward).to.be.greaterThan(0.9)
+  })
+
+  it('still holds an intermediate parkour node over a shelf with a gap beyond', () => {
+    const k = world(put => {
+      for (let x = -3; x <= 3; x++) {
+        for (let z = -4; z <= 0; z++) put(x, 0, z)
+        for (let z = 3; z <= 44; z++) put(x, 0, z)
+      }
+    })
+    const path: GaitNode[] = [
+      { x: 0.5, y: 1, z: 0.5, parkour: true, walked: true },
+      { x: 0.5, y: 1, z: 3.5, parkour: true },
+      ...line(4, 10)
+    ]
+    const r = gaitSearch(k, body(0.5, 1, -0.27, 0, 0.04), path, { index: 3, last: false })
+    expect(r.hop === Infinity && r.run === Infinity).to.equal(false)
+  })
+
+  it('still arrives at a parkour window end on the ground in its own cell', () => {
+    const path = line(1, 5)
+    path[path.length - 1] = { ...path[path.length - 1], parkour: true, walked: true }
+    const b = body(0.5, 1, 0.5, 0, 0.28)
+    const d = drive(open, b, path)
+    expect(d.fell).to.equal(false)
+    expect(d.at).to.equal(path.length)
+    expect(d.b.onGround).to.equal(true)
+    expect(Math.floor(d.b.z)).to.equal(5)
   })
 
   it('hands a tick on the ground over as it was run', () => {

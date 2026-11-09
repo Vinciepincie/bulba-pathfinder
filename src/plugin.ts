@@ -37,8 +37,8 @@ import type { Box } from './snapshot.js'
 import { serializeGoal, goalNeedsRaycast, descriptorTargets } from './goalSerde.js'
 import { TAKEOFF_STAND, TAKEOFF_NARROW_MARGIN, CHAIN_TAKEOFF_FRACTION } from './parkourEnvelope.js'
 import { CATCH_HALF, topCatchClass } from './shapes.js'
-import { headingDir, programHeading, sneakLanding, F_FWD, F_SPRINT, F_JUMP, LAND_OVERLAP, CLIMB_ON_SLACK, BEAM_DEPTH, ONE_FLIGHT_REACH } from './hopOracle.js'
-import { HOP_TURN_COS, PARKOUR_LAND_DY } from './gaitSearch.js'
+import { headingDir, programHeading, sneakLanding, F_FWD, F_SPRINT, F_JUMP, LAND_OVERLAP, CLIMB_ON_SLACK, BEAM_DEPTH, ONE_FLIGHT_REACH, LIVE_PREFIX, jumpRearmed, STAY_TICKS, REGION_SETTLE, FLIGHT_CAP, FLIGHT_TICKS_MAX } from './hopOracle.js'
+import { HOP_TURN_COS, PARKOUR_LAND_DY, CLIMB_HOLD_ENABLED } from './gaitSearch.js'
 import { landingHurts, fallDamagePoints, SAFE_FALL } from './fallDamage.js'
 import { simKindOf } from './playerSim.js'
 import { sideStandoff, wallSlide, againstWall as wallAhead, SPRINT_WALL_MARGIN, STEP_UP_MIN, WALK_STEP_REACH } from './wallSteer.js'
@@ -322,6 +322,21 @@ const FLIGHT_TRIM = process.env.PF_FLIGHT_TRIM !== '0'
 const PARTIAL_END_COAST = process.env.PF_PARTIAL_END_COAST !== '0'
 /** The most a partial's end coast may come down (PARTIAL_END_COAST): none, a node's level kept. */
 const PARTIAL_COAST_DROP = 0.01
+/**
+ * A server teleport while the first solve of a goal is still thinking (no
+ * path yet) farther than FORCED_IDLE_REACH from its start: solved again from
+ * the corrected body, not handed a path from where it was. PF_FORCED_IDLE_REPLAN=0 off.
+ */
+const FORCED_IDLE_REPLAN = process.env.PF_FORCED_IDLE_REPLAN !== '0'
+const FORCED_IDLE_REACH = 2
+/** A take-off's lost counts (lostReplan) are a goal's own: a new fixed goal starts them over. PF_LOST_PER_GOAL=0: kept for the bot's life. */
+const LOST_PER_GOAL = process.env.PF_LOST_PER_GOAL !== '0'
+// mcc-6-2's retreat gets one correction retry; repeated lagbacks must not buy a search each tick.
+const PREFIX_RETRY_CAP = process.env.PF_PREFIX_RETRY_CAP !== '0'
+// (off-path corrections reset to fresh solves, with fresh marks: a goal's own bound on the 80k search)
+const PREFIX_GOAL_MAX = 8
+/** A correction off the path lets go of the movement keys: the old path's forward and jump drove the corrected body blind through the re-solve. PF_FORCED_RELEASE=0: kept. */
+const FORCED_RELEASE = process.env.PF_FORCED_RELEASE !== '0'
 /** A neo's live searches try the kick where the live families find nothing (physics.ts SEED_FAMILY). */
 const NEO_SEED: ReadonlyArray<'kick' | 'pivot'> = ['kick']
 const LINED_NEAR = 1.5
@@ -722,6 +737,8 @@ export function createPathfinder (options: PathfinderOptions = {}) {
     let progPhase = 0
     let progTick = 0
     let progFired = false
+    let progDrivenAt = -1
+    let progJumpTicks: number | undefined
     let progAir = 0
     let progRebounds = 0
     /**
@@ -738,6 +755,15 @@ export function createPathfinder (options: PathfinderOptions = {}) {
     let progPress: { yaws: number[], i: number, delay: number } | null = null
     let progPresses = 0
     let progMovingTries = 0
+    /** Ticks a region program has settled after a touchdown off its place's level (REGION_SETTLE). */
+    let progSettle = 0
+    /** The climb hold pressed the keys on the last tick that wrote any: they are its to let go of (releaseClimbHold). */
+    let climbKeysHeld = false
+    /** ...and within a tick, on the one before it (no branch has written yet). */
+    let climbHeldPrev = false
+    /** Prefix searches of this goal (PREFIX_GOAL_MAX), and the plan a found one replaced. */
+    let prefixGoalCount = 0
+    const prefixPlan = new WeakMap<Move, HopProgram>()
     /** Region programs lost in a row from about one rest, and that rest (PROG_LOST_TRIES). */
     let progLostCount = 0
     let progLostAt: { x: number, y: number, z: number } | null = null
@@ -824,6 +850,9 @@ export function createPathfinder (options: PathfinderOptions = {}) {
     let finalEdges: Set<string> | null = null
     /** Where the neo branch last searched a take-off from rest: the program branch does not repeat it from the same spot. */
     let restSearchedAt: { node: unknown, x: number, z: number } | null = null
+    /** mcc-6-2's neo and program branches share the one attempt to make room. */
+    const prefixSearched = new WeakSet<Move>()
+    const prefixRetried = new WeakSet<Move>()
     /** The node the corner cut is steering at, held until reached or invalid. */
     let cutTarget: Move | null = null
     /** Anchor of the cut line (slides along it each grounded tick); the line is cutFrom → cutTarget. */
@@ -858,6 +887,8 @@ export function createPathfinder (options: PathfinderOptions = {}) {
     /** Momentum chain, latched per node: has the re-jump left the stone? */
     let chainNode: Move | null = null
     let chainFired = false
+    let chainDrivenAt = -1
+    let chainJumpTicks: number | undefined
     /** Run-up back-off, one attempt per parkour node (see the creep branch). */
     /** Run-up line-up state (see the creep branch): node, attempts used, phase (0 idle, 1 backing, 2 sprinting in), ticks in phase. */
     let runUpNode: Move | null = null
@@ -1651,6 +1682,8 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         progNode = landing
         if (linedInstalled === n0) linedInstalled = landing
         if (restSearchedAt !== null && restSearchedAt.node === n0) restSearchedAt = { ...restSearchedAt, node: landing }
+        if (prefixSearched.has(n0 as Move)) prefixSearched.add(landing)
+        if (PREFIX_RETRY_CAP && prefixRetried.has(n0 as Move)) prefixRetried.add(landing)
         if (takeoffSearched === n0) takeoffSearched = landing
         if (linedSearched === n0) linedSearched = landing
         // (a chain node's flight is the chain's: CHAIN_KERNEL)
@@ -1758,6 +1791,17 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         }
       }
       const firstOfSolve = pathGen !== generation
+      // (mcc-6-2: a failed retreat has no program to carry; the same solve's
+      // new Move for its cell must not buy another prefix search)
+      if (LIVE_PREFIX && !firstOfSolve && n0 !== undefined &&
+          (prefixSearched.has(n0) || (PREFIX_RETRY_CAP && prefixRetried.has(n0)))) {
+        const [x, y, z] = n0.cell
+        for (const n of results.path) {
+          if (n.cell[0] !== x || n.cell[1] !== y || n.cell[2] !== z) continue
+          if (prefixSearched.has(n0)) prefixSearched.add(n as Move)
+          if (PREFIX_RETRY_CAP && prefixRetried.has(n0)) prefixRetried.add(n as Move)
+        }
+      }
       path = results.path
       pathPartial = !final
       pathGen = generation
@@ -2281,7 +2325,38 @@ export function createPathfinder (options: PathfinderOptions = {}) {
 
     // ── stop / reset machinery (upstream ports + hardened cancel) ────────
 
+    /**
+     * The climb hold's forward + jump, let go once their path is gone. A correction
+     * off the ladder, or a terminal result, leaves no branch to press them again, and
+     * the bot would walk and jump on through the solve. Sneak only where it hangs.
+     */
+    function releaseClimbHold (): void {
+      if (!CLIMB_HOLD_ENABLED || (!climbKeysHeld && !climbHeldPrev)) return
+      climbKeysHeld = false
+      climbHeldPrev = false
+      bot.setControlState('jump', false)
+      bot.setControlState('forward', false)
+      const feet = bot.blockAt(bot.entity.position) as BlockLike | null
+      bot.setControlState('sneak', (bot.entity as { onGround?: boolean }).onGround !== true && feet !== null && climbableIds.has(feet.type))
+    }
+
+    /** A ground prefix not yet taken off holds only from its verified start: a pause or a correction drops it, for a search from the body as it is then. */
+    function dropUnfiredPrefix (): void {
+      if (!LIVE_PREFIX || path.length === 0 || progNode !== path[0] || progPhase !== 1 || progFired) return
+      const n = path[0] as Move
+      if (n.program === null || n.program === undefined || n.program.groundPrefix === undefined) return
+      // (a planned node gets its plan back; a live hint is cleared as any stale live program is)
+      n.program = prefixPlan.get(n) ?? null
+      progNode = null
+      progPhase = 0
+      if (!PREFIX_RETRY_CAP || !prefixRetried.has(n)) {
+        prefixSearched.delete(n)
+        if (PREFIX_RETRY_CAP) prefixRetried.add(n)
+      }
+    }
+
     function fullStop (): void {
+      dropUnfiredPrefix()
       hopHold = false
       kernelHop = false
       // (queued line-up presses were verified for the momentum the stop takes away)
@@ -2302,6 +2377,9 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         climbHold = (bot.entity as { onGround?: boolean }).onGround !== true && feet !== null && climbableIds.has(feet.type)
         if (climbHold) bot.setControlState('sneak', true)
       }
+
+      // These profiles release controls above and let normal physics settle the body.
+      if (stateMovements.allowStopSnap === false) return
 
       // Force horizontal velocity to 0 (otherwise inertia can move us too far)
       bot.entity.velocity.x = 0
@@ -2494,8 +2572,32 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       bot.setControlState('sneak', false)
     }
 
+    // climb2's bonk has no rise. Wait for these keys to have a physics tick;
+    // an eager drive on the same body must not count the preceding jump.
+    function jumpRearmedSince (tick: number, before: number | undefined): boolean {
+      return tick >= 0 && physTicks === tick + 1 && jumpRearmed(before,
+        (bot as unknown as { jumpTicks?: number }).jumpTicks,
+        (bot.physics as unknown as { autojumpCooldown?: number }).autojumpCooldown)
+    }
+
     /** One replayed tick of control program `prog`: HopOracle.advance's controls, by the replay's counters. */
     function replayProgramTick (prog: HopProgram, p: Vec3): void {
+      progDrivenAt = physTicks
+      progJumpTicks = (bot as unknown as { jumpTicks?: number }).jumpTicks
+      // mcc-6-2: the retreat's walking/sneaking keys end before the suffix's jump.
+      const prefix = LIVE_PREFIX ? prog.groundPrefix?.[progTick] : undefined
+      if (prefix !== undefined) {
+        bot.look(prefix.yaw, 0, true)
+        bot.setControlState('forward', true)
+        bot.setControlState('back', false)
+        bot.setControlState('left', false)
+        bot.setControlState('right', false)
+        bot.setControlState('jump', false)
+        bot.setControlState('sprint', prefix.sprint)
+        bot.setControlState('sneak', prefix.sneak)
+        progTick++
+        return
+      }
       // onto a slime top: sneak on the touchdown tick, the oracle's own rule
       const ent = bot.entity as { onGround?: boolean }
       const hw = (bot.physics as unknown as { playerHalfWidth?: number }).playerHalfWidth ?? 0.3
@@ -2639,6 +2741,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       kernelHop = false
       progNode = null
       progPhase = 0
+      progSettle = 0
       streamedLanding = null
       basin = null
       bounceNode = null
@@ -2669,6 +2772,8 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       lockUseBlock.release()
       stateMovements.clearCollisionIndex()
       if (clearStates && !coastIfFlying()) bot.clearControlStates()
+      // (keys kept: the climb hold's are still let go of - it would climb on past the plan, or walk off a corrected body)
+      else if (!clearStates) releaseClimbHold()
       if (stopPathing) internalStop()
     }
 
@@ -2696,6 +2801,9 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       dynamicGoal = dynamic
       goalSetTime = performance.now()
       goalSetAt = goalSetTime
+      // (a trading bot's next trip is not the last one's replans: one old loss and one new banned a landing for two minutes)
+      if (LOST_PER_GOAL && !dynamic) lostEdges.clear()
+      if (!dynamic) prefixGoalCount = 0
       firstDriveLogged = false
       growFactor = 1
       growAttempts = 0
@@ -2954,12 +3062,24 @@ export function createPathfinder (options: PathfinderOptions = {}) {
     // node until the 3.5s futility timer). On a server position correction:
     // still near the path → splice to the closest node and keep walking;
     // snapped away → replan immediately from the corrected position.
+    bot.on('death' as never, (() => { releaseClimbHold() }) as never)
+
     bot.on('forcedMove' as never, (() => {
       lastForcedMoveAt = performance.now()
       forcedAtTick = physTicks
       // (a corrected body is not the one queued line-up presses were found for)
       progPress = null
-      if (path.length === 0) return
+      dropUnfiredPrefix()
+      if (path.length === 0) {
+        // (thinking with no path, teleported away from the solve's start: its
+        // path would start where the body no longer is - solved again from here)
+        const at = bot.entity.position
+        if (FORCED_IDLE_REPLAN && solveInFlight() && stateGoal !== null && pathGen !== activeSolveGeneration &&
+            (Math.hypot(at.x - (lastSolveStart.x + 0.5), at.z - (lastSolveStart.z + 0.5)) > FORCED_IDLE_REACH || Math.abs(at.y - lastSolveStart.y) > FORCED_IDLE_REACH)) {
+          resetPath('forced_move', false)
+        }
+        return
+      }
       // (a deep flight or its basin: the per-tick verdict decides, from the corrected body)
       if (deepHeld()) return
       const at = bot.entity.position.floored()
@@ -2983,6 +3103,14 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         }
       } else {
         resetPath('forced_move', false)
+        if (FORCED_RELEASE) {
+          bot.setControlState('forward', false)
+          bot.setControlState('back', false)
+          bot.setControlState('left', false)
+          bot.setControlState('right', false)
+          bot.setControlState('jump', false)
+          bot.setControlState('sprint', false)
+        }
       }
     }) as never)
 
@@ -3139,11 +3267,15 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       if (inTick) return
       inTick = true
       const t0 = performance.now()
+      // (whoever writes this tick owns the keys after it: the climb hold only if it runs again)
+      climbHeldPrev = climbKeysHeld
+      climbKeysHeld = false
       try {
         physics.beginTick?.()
         geometry.beginTick()
         monitorMovementInner()
       } finally {
+        climbHeldPrev = false
         geometry.endTick()
         inTick = false
         lastTickMs = performance.now() - t0
@@ -3312,6 +3444,8 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         // think budget). Every re-solve therefore started from a worse place
         // than the last one, which is how a stall in a pool turns into a
         // drowning.
+        // (no path left to climb: a terminal result never passed through resetPath)
+        releaseClimbHold()
         if ((bot.entity as { isInWater?: boolean }).isInWater === true) {
           bot.setControlState('jump', true)
         }
@@ -3943,6 +4077,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         progFired = false
         progAir = 0
         progRebounds = 0
+        progSettle = 0
         jumpStillTicks = 0
         lastNodeTime = performance.now()
         cutTarget = null
@@ -3952,6 +4087,26 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         execBranch = 'prog'
         futile(swimming)
         return true
+      }
+      // mcc-6-2: spend the retreat once, from the rest the live search just refused.
+      // (`onClimb` passed in: the program branch calls this before `climbing` is declared further down - a TDZ throw)
+      const tryPrefix = (hint: HopProgram | undefined, onClimb: boolean, maxTicks = Infinity): boolean => {
+        const n = nextPoint as Move
+        const v = bot.entity.velocity
+        if (!LIVE_PREFIX || !kernelTakeoff || physics.hopPrefix === undefined || prefixSearched.has(n) ||
+            (bot.entity as { onGround?: boolean }).onGround !== true || Math.hypot(v.x, v.z) >= 0.01 ||
+            onClimb || swimming || n.chain === true || hint?.seq !== undefined || hint?.legs === true ||
+            hint?.climb === true || hint?.deep === true || hint?.bounces !== undefined) return false
+        if (PREFIX_RETRY_CAP && prefixGoalCount >= PREFIX_GOAL_MAX) return false
+        prefixGoalCount++
+        prefixSearched.add(n)
+        if (cachedLut !== null) physics.setShapeTables?.(cachedLut)
+        let live = physics.hopPrefix(n.cell, hint?.land, hint)
+        takeoffNote += (takeoffNote !== '' ? ' | ' : '') + (physics.hopNote ?? '')
+        // (no slower than the plan with its line-up: the bound PROG_LIVE_PLAN holds a live program to)
+        if (live !== null && live.ticks > maxTicks) { takeoffNote += ' | slower'; live = null }
+        if (live !== null && hint !== undefined) prefixPlan.set(n, hint)
+        return takeoffLive(live)
       }
       // (a skip found: the nodes before its target retired, its program the target's own live one)
       const installSkip = (sk: { program: HopProgram, cut: number }): void => {
@@ -4090,6 +4245,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
           progPress = null
           progPresses = 0
           progMovingTries = 0
+          progSettle = 0
         }
         cutTarget = null
         hopHold = false
@@ -4112,9 +4268,11 @@ export function createPathfinder (options: PathfinderOptions = {}) {
               bot.setControlState('back', false)
               bot.setControlState('left', false)
               bot.setControlState('right', false)
-              bot.setControlState('jump', false)
+              // (jump climbs without wall contact, sneak stops the first slide: CLIMB_HOLD, as Search.climb flies it)
+              bot.setControlState('jump', CLIMB_HOLD_ENABLED)
+              climbKeysHeld = true
               bot.setControlState('sprint', false)
-              bot.setControlState('sneak', false)
+              bot.setControlState('sneak', CLIMB_HOLD_ENABLED && bot.entity.velocity.y < 0)
               execBranch = 'prog-climb'
               futile(swimming)
               return
@@ -4270,6 +4428,8 @@ export function createPathfinder (options: PathfinderOptions = {}) {
               }
             }
             if (takeoffLive(live)) return
+            // (the same bound as the live search's, PROG_LIVE_PLAN: a retreat no slower than the plan with its line-up)
+            if (atRest && tryPrefix(prog, false, PROG_LIVE_PLAN && !precise && d > PROG_LINEUP_TOL ? prog.ticks + Math.ceil(d / PROG_LINEUP_SPEED) + PROG_LINEUP_SETTLE + PROG_LIVE_SLACK : Infinity)) return
           }
           // (moving, near the start: the plan itself from here, if it flies no slower than after the line-up - PROG_MOVE_ANCHOR)
           if (PROG_MOVE_ANCHOR && kernelTakeoff && grounded && !atRest && !futileChain && prog.climb !== true && prog.deep !== true && d <= PROG_FAR_START) {
@@ -4373,6 +4533,8 @@ export function createPathfinder (options: PathfinderOptions = {}) {
           // (not beside a thin block, an under landing: the column's centre is the block)
           if (progFired && grounded && path.length === 1 && bot.entity.velocity.y <= 0.05 &&
               (prog.land === undefined || prog.land.y >= prog.ty - 0.5) &&
+              // (a region landing off its place's level settles first: REGION_SETTLE)
+              (!REGION_SETTLE || prog.seq !== undefined || ((progSettle === 0 || progSettle >= STAY_TICKS) && (prog.land === undefined || Math.abs(p.y - prog.land.y) < 0.5))) &&
               Math.abs(p.x - prog.tx - 0.5) < 0.8 - LAND_OVERLAP && Math.abs(p.z - prog.tz - 0.5) < 0.8 - LAND_OVERLAP &&
               p.y >= prog.ty - 1.001 && p.y < prog.ty + 1) {
             bot.look(Math.atan2(-(prog.tx + 0.5 - p.x), -(prog.tz + 0.5 - p.z)), 0, true)
@@ -4398,15 +4560,53 @@ export function createPathfinder (options: PathfinderOptions = {}) {
             // (HopOracle.tickFlight: off a climbable, the body leaving it is the take-off)
             const feetB = prog.climb === true && !grounded ? bot.blockAt(p) as BlockLike | null : null
             const onClimb = feetB !== null && (climbableIds.has(feetB.type))
-            if (vy > 0.3 || (!grounded && vy < -0.3) || (prog.climb === true && !grounded && !onClimb)) progFired = true
+            if (vy > 0.3 || (!grounded && vy < -0.3) || (prog.climb === true && !grounded && !onClimb) ||
+                (progTick > 0 && !onClimb && jumpRearmedSince(progDrivenAt, progJumpTicks))) progFired = true
             else if (prog.seq === undefined && progTick > (prog.jumpOnLeave === true ? prog.ticks : prog.jumpAt) + PROG_JUMP_GRACE && !onClimb) spent = true
             // (a leave program with no kernel to tell the latched tick: never replayed blind)
             else if (prog.jumpOnLeave === true && (physics.latchedNow?.() ?? null) === null) spent = true
           } else if (prog.seq === undefined) {
             progAir++
-            if (grounded) {
+            // (a region settle once begun runs on as HopOracle.stays flies it - no keys, sneaking - airborne
+            // too, off the stair top it touched first, until the arrival retires the node or STAY_TICKS run out)
+            if (REGION_SETTLE && progSettle > 0) {
+              // (spent only on the ground, where a region program's loss replans: airborne it would go to the gates)
+              if (progSettle >= STAY_TICKS && grounded) spent = true
+              else {
+                if (progSettle < STAY_TICKS) progSettle++
+                bot.setControlState('forward', false)
+                bot.setControlState('back', false)
+                bot.setControlState('left', false)
+                bot.setControlState('right', false)
+                bot.setControlState('jump', false)
+                bot.setControlState('sprint', false)
+                bot.setControlState('sneak', true)
+                execBranch = 'prog-region-settle'
+                futile(swimming)
+                return
+              }
+            } else if (grounded) {
               const under = bot.blockAt(p.offset(0, -0.2, 0)) as { name?: string } | null
               if (bot.entity.velocity.y > 0.05 && under !== null && under.name === 'slime_block') progRebounds++
+              // (a region program down over its column off its place's level - a stair top, a rail - settles
+              // into its place as HopOracle.stays verified it: no keys, sneaking, STAY_TICKS; the arrival
+              // check retires it there. mcc-6-1: a bonk on the spot slid off the stair top it touched first)
+              // (never a deep program: its deepVerdict flies the program on, not a settle)
+              else if (REGION_SETTLE && prog.land !== undefined && prog.deep !== true && progSettle < STAY_TICKS && Math.abs(p.y - prog.land.y) >= 0.5 &&
+                  p.y >= prog.ty - 1.001 && p.y < prog.ty + 1 &&
+                  Math.abs(p.x - prog.tx - 0.5) < 0.8 - LAND_OVERLAP && Math.abs(p.z - prog.tz - 0.5) < 0.8 - LAND_OVERLAP) {
+                progSettle++
+                bot.setControlState('forward', false)
+                bot.setControlState('back', false)
+                bot.setControlState('left', false)
+                bot.setControlState('right', false)
+                bot.setControlState('jump', false)
+                bot.setControlState('sprint', false)
+                bot.setControlState('sneak', true)
+                execBranch = 'prog-region-settle'
+                futile(swimming)
+                return
+              }
               else spent = true
             }
           }
@@ -4415,6 +4615,8 @@ export function createPathfinder (options: PathfinderOptions = {}) {
           // landing it was verified to (a live or re-anchored one holds its
           // last control on, as HopOracle.advance flew it)
           if (prog.seq !== undefined && progTick > Math.max(prog.seq.length >> 1, prog.ticks) + PROG_JUMP_GRACE) spent = true
+          // (no replay runs for ever: off course, pressing a wrong ladder, it refreshed the futility clock every tick - FLIGHT_CAP)
+          if (FLIGHT_CAP && progTick > FLIGHT_TICKS_MAX) spent = true
         }
         // A deep bounce (HopProgram.deep: any miss of it a lethal fall): the
         // rest of it flown in the kernel from the body as it is, every tick.
@@ -4526,6 +4728,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         if (chainNode !== nextPoint) {
           chainNode = nextPoint
           chainFired = false
+          chainDrivenAt = -1
         }
         if (!chainFired) {
           cutTarget = null
@@ -4557,7 +4760,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
             if (takeoffLive(live)) { chainFired = true; return }
             if (restNow && CHAIN_LOST && chainLost()) return
           }
-          if (bot.entity.velocity.y > 0.3 && ent.onGround !== true) {
+          if ((bot.entity.velocity.y > 0.3 && ent.onGround !== true) || jumpRearmedSince(chainDrivenAt, chainJumpTicks)) {
             chainFired = true
           } else if (ent.onGround === true && onStone) {
             execBranch = 'chain'
@@ -4569,6 +4772,8 @@ export function createPathfinder (options: PathfinderOptions = {}) {
             if (!physics.canSprintJump(path)) {
               chainFired = true
             } else {
+            chainDrivenAt = physTicks
+            chainJumpTicks = (bot as unknown as { jumpTicks?: number }).jumpTicks
             bot.look(Math.atan2(-dx, -dz), 0)
             bot.setControlState('forward', true)
             bot.setControlState('sprint', true)
@@ -5140,6 +5345,8 @@ export function createPathfinder (options: PathfinderOptions = {}) {
               // step held low enough to pass.
               const press = p.y < nextPoint.y - 0.05
               if (fits && hang) {
+                // (no outward lean to stop the climb past the node: the rounded heading's wall contact is what
+                // keeps mcc-4-3 hanging under its beam - without it the body fell 40 blocks off the ladder)
                 dx = latX / lat + (press ? wall[0] * CLIMB_PRESS : 0)
                 dz = latZ / lat + (press ? wall[1] * CLIMB_PRESS : 0)
                 climbing = true
@@ -5196,6 +5403,59 @@ export function createPathfinder (options: PathfinderOptions = {}) {
             traverse = true
             descend = true
           }
+        }
+      }
+
+      // mcc-4-1/5-3: choosing a climb heading did not keep the gates from
+      // dropping both keys. Hold upward catches as Search.climb flies them,
+      // before an old flight or a gate can take the keys again.
+      if (CLIMB_HOLD_ENABLED && !swimming && !descend && nextPoint.y > p.y + 0.01 &&
+          (bot.entity as { onGround?: boolean }).onGround !== true) {
+        const feet = bot.blockAt(p) as BlockLike | null
+        const sameColumn = Math.floor(nextPoint.x) === Math.floor(p.x) && Math.floor(nextPoint.z) === Math.floor(p.z)
+        // (the climb is the plan when this column holds the next node, the node
+        // just retired - the kernel's catch, retired on its first caught tick -
+        // or the node after; a verified flight only passing through a vine on
+        // its way to another column keeps its controls)
+        const inFeetColumn = (n: { x: number, z: number } | null | undefined): boolean =>
+          n !== null && n !== undefined && Math.floor(n.x) === Math.floor(p.x) && Math.floor(n.z) === Math.floor(p.z)
+        const planned = sameColumn || inFeetColumn(prevRetired) || inFeetColumn(path[1])
+        const flightOwned = kernelHop || biasFlight || jumpScript !== null
+        if (feet !== null && climbableIds.has(feet.type) && (planned || !flightOwned)) {
+          const sideways = traverse && !sameColumn
+          let hx = sameColumn ? nodeDx : dx
+          let hz = sameColumn ? nodeDz : dz
+          const wall = sameColumn ? climbWall(feet, p) : null
+          if (wall !== null) {
+            const v = bot.entity.velocity
+            const ax = wall[1] !== 0 ? 1 : 0
+            const az = wall[0] !== 0 ? 1 : 0
+            const along = (Math.floor(p.x) + 0.5 - p.x) * ax + (Math.floor(p.z) + 0.5 - p.z) * az - (v.x * ax + v.z * az) * CLIMB_DRIFT
+            hx = wall[0]
+            hz = wall[1]
+            if (Math.abs(along) > CLIMB_HOLD) {
+              hx += ax * Math.sign(along)
+              hz += az * Math.sign(along)
+            }
+          }
+          if (Math.hypot(hx, hz) > 1e-9) bot.look(Math.atan2(-hx, -hz), 0, true)
+          kernelHop = false
+          hopHold = false
+          biasFlight = false
+          jumpScript = null
+          bot.setControlState('forward', true)
+          bot.setControlState('back', false)
+          bot.setControlState('left', false)
+          bot.setControlState('right', false)
+          bot.setControlState('jump', true)
+          climbKeysHeld = true
+          bot.setControlState('sprint', false)
+          // A falling catch must not slide; once rising, sneak only cuts the steering to 30% (tenways-slime-way:
+          // a catch arriving at 0.14 b/t drifted out of its ladder's cell). mcc-3-1's transfers keep their pace.
+          bot.setControlState('sneak', !sideways && bot.entity.velocity.y < 0)
+          execBranch = sideways ? 'traverse' : 'catch'
+          futile(swimming)
+          return
         }
       }
 
@@ -5385,6 +5645,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
           // (past it, when one flight to the node after is quicker: SKIP_NEO)
           if (live !== null && trySkipNeo(live.ticks, speed < 0.01)) return
           if (takeoffLive(live)) return
+          if (tryPrefix(undefined, climbing)) return
         }
         if (neo && speed >= 0.01) {
           bot.setControlState('forward', false)
@@ -5433,6 +5694,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
             if (neo && live !== null && trySkipNeo(live.ticks, restNow)) return
             if (takeoffLive(live)) return
           }
+          if (neo && tryPrefix(undefined, climbing)) return
           // (once per node, whether or not the live search ran this tick)
           if (kernelTakeoff && linedSearched !== nextPoint) {
             linedSearched = nextPoint
@@ -6502,7 +6764,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
           +lastTickMs.toFixed(2),
           takeoffNote !== ''
             ? takeoffNote
-            : execBranch === 'sprint' || execBranch === 'hop'
+            : execBranch === 'sprint' || execBranch === 'hop' || execBranch === 'krun'
             ? `${(physics as { hopRefusal?: string }).hopRefusal ?? ''}${(physics as { hopJumpNote?: string }).hopJumpNote ? ':' + (physics as { hopJumpNote?: string }).hopJumpNote : ''}`
             : ''
         ]))

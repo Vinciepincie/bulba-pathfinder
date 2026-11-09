@@ -13,7 +13,7 @@ import { gaitSearch, kWalkable, GRAZE_YAW, HOP_MAX_DIP, EASE_NEVER, GAIT_CATCH, 
 import type { GaitNode, GaitPick } from './gaitSearch.js'
 import type { GaitDrive } from './types.js'
 import type { BlockLut } from './lut.js'
-import { HopOracle, ONE_FLIGHT_REACH, LANE_KICK_TICKS } from './hopOracle.js'
+import { HopOracle, ONE_FLIGHT_REACH, LANE_KICK_TICKS, LIVE_PREFIX, LIVE_PREFIX_TICKS } from './hopOracle.js'
 import type { HopProgram } from './hopOracle.js'
 
 /** prismarine-physics' sprinting modifier id (index.js physics.sprintingUUID). */
@@ -1430,6 +1430,19 @@ export class PhysicsSim {
     const found = o.hopFrom(this.kBodyNow(), [cell[0], cell[1], cell[2]], t0 + (budgetTicks + seedTicks + laneTicks) / LIVE_FLOOR_TICKS_PER_MS, this.bot.entity.yaw, land,
       next !== undefined ? [next[0], next[1], next[2]] : undefined, beam, seed, seedTicks, seedFirst, hint)
     this.hopNote = `from ${found !== null ? `${found.family} ${found.ticks}t` : 'none'}${seedTicks > 0 ? ` +${seed!.join('+')}` : ''} ${(performance.now() - t0).toFixed(0)}ms ${Math.round(o.ticksFlown / 1000)}k`
+    return found
+  }
+
+  /** mcc-6-2's flush rest needs room before the jump; one allowance covers the whole maneuver. */
+  hopPrefix (cell: readonly [number, number, number], land?: { x: number, y: number, z: number }, hint?: HopProgram): HopProgram | null {
+    if (!LIVE_PREFIX) return null
+    const t0 = performance.now()
+    const o = this.liveOracle()
+    if (o === null) { this.hopNote = 'n/a'; return null }
+    o.tickLimit = LIVE_PREFIX_TICKS
+    const found = o.hopPrefix(this.kBodyNow(), [cell[0], cell[1], cell[2]], t0 + LIVE_PREFIX_TICKS / LIVE_FLOOR_TICKS_PER_MS,
+      this.bot.entity.yaw, land, hint)
+    this.hopNote = `prefix ${found !== null ? `${found.family} ${found.ticks}t` : 'none'} ${(performance.now() - t0).toFixed(0)}ms ${Math.round(o.ticksFlown / 1000)}k`
     return found
   }
 

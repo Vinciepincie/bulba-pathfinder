@@ -92,6 +92,8 @@ export class Movements {
    * more.
    */
   allowSprintHop: boolean
+  /** When false, stopping releases controls without snapping position or zeroing momentum. */
+  allowStopSnap: boolean
   /**
    * Improvement (opt-in, needs allowSprintHop): hop through LOW-headroom
    * ground instead of walking round or under it — a tunnel, an overhang, a
@@ -224,6 +226,7 @@ export class Movements {
     this.allowParkourPhysics = false // improvement, opt-in (physics-verified hops where the search fails)
     this.allowSprinting = true
     this.allowSprintHop = false // improvement, opt-in (executor gait only)
+    this.allowStopSnap = true // retain existing stop behavior unless explicitly disabled
     this.allowLowCeilingHop = false // improvement, opt-in (executor gait only)
     this.allowCornerCut = true // improvement, on (executor steering only; plan unchanged)
     this.allowRunUp = false // improvement, opt-in (executor take-off only)

@@ -1291,12 +1291,47 @@ off. The solver cores agree: the JS core in the worker
 counts, within 0.1 s, the Rust search 3-10x faster where the search itself
 dominates.
 
-Known limits: mcc-1-1 is impossible in the arena's copy (its command blocks
-were stripped: the gap needs 10.3 blocks of carry, a best jump gives about
-8); the ice routes (7-1, 7-2) need a chain that keeps its heading and speed
+Known limits: mcc-1-1 is impossible as built (the gap needs 10.3 blocks of
+carry, a best jump gives about 8; the original map has the same gap, and its
+command blocks only do particles, sounds and checkpoints); the ice routes (7-1, 7-2) need a chain that keeps its heading and speed
 through zig-zagging pads, which the beam does not find yet; 3-1 (a drop onto
 slime whose rebound threads two offset slots onto a ladder) and 6-1 (neos off
 one-wide stairs round floating pillars onto 2/16 rails) are not solved.
 A flat walk node a block away can still get a sprint jump
 (climb2's diagonal corner: the landing only settles back, 25 ticks on the
 raised block beside it, the same in the previous build).
+
+## Batch of 2026-11-08
+
+All-60 ABBA t42 against every switch below off: 613.87 -> 609.15 s, 59 arrive in
+every pass. Each is `PF_<NAME>=0` to switch off.
+
+- `CLIMB_HOLD`: a body on a climbable with its next node above holds jump from the
+  first tick, sneak only while falling (it stops the first 0.15 slide; rising it only
+  cuts the steering to 30%). Executor and `Search.climb`/`climbsUp` alike. Yields to a
+  verified flight passing through unless this column holds the next, the just retired
+  or the following node. The keys are the hold's to release (`releaseClimbHold`).
+- `GAIT_REUSE`: the rounding policy's Search is skipped when the plain one met no
+  corner it would round: the same tree, decision-identical.
+- `GAIT_GROUND_PASS`: the gait passes a parkour node from high over it where ground goes
+  on beyond it, as the executor retires it (mcc-7-1). Costs mcc-6-3 about 0.15 s: a run
+  now wins a marginal choice over a hop (gaitSearch `bound`, any gain with a jump ahead).
+- `LIVE_PREFIX`: up to 4 ground ticks, then one jump, from a flush rest (mcc-6-2), 80k
+  ticks a search. `PREFIX_RETRY_CAP`: one retry per node after a correction, 8 per goal.
+- `BONK_FIRE`: a jump is a take-off when the kernel re-armed its cooldown, bonked or not;
+  the oracle could never fly a take-off under a 2-high ceiling. `FLIGHT_CAP`: 600 ticks
+  for any flight, oracle and replay (touch-and-go legs restart their own limits).
+- `REGION_SETTLE`: a region program down off its place's level settles there as
+  `stays` verified, no keys, sneaking; its `ticks` run to that arrival, so a 3t bonk
+  onto a stair top (11 to its place) no longer beats a 7t walk-off (mcc-6-1).
+- Safety: `REBOUND_CAP` (a boxed-in rebound-jump flight looped for ever), `TOUCH_WET`
+  (a touchdown taken without a stay could end in lava), `FORCED_IDLE_REPLAN`,
+  `FORCED_RELEASE` (a correction off the path let go of the keys), `LOST_PER_GOAL`.
+
+Tried and removed: an outward lean to make the hanging traverse let go above its node.
+The rounded heading's wall contact is what keeps mcc-4-3 hanging under its beam; without
+it the body fell 40 blocks. Do not add it back.
+
+Not done: `work/codex/lostfresh.patch` (a fresh solve after a lost program; the arena
+cannot exercise it). mcc-8-2 stays bimodal, 7.6 or 8.75 s: a flight just past a node's
+box does not retire it, slows towards it, and the planned jump no longer fits.

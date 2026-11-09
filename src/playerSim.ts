@@ -446,6 +446,11 @@ export class PlayerSim {
     return this.onLadder(b)
   }
 
+  /** Would the next step stop the body (step(): a liquid, or a hazard)? For a touchdown taken without stepping on (HopOracle.goLanding). */
+  touchesWet (b: SimBody): boolean {
+    return this.touchesLiquid(b) || (KERNEL_HAZARD && this.touchesHazard(b))
+  }
+
   /** index.js getWaterInBB/isMaterialInBB, reduced to "does the body touch a liquid cell". */
   private touchesLiquid (b: SimBody): boolean {
     const hw = this.halfWidth

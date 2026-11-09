@@ -437,6 +437,8 @@ export interface PhysicsLike {
   latchedNow? (): boolean | null
   /** Optional: a control program to this planner node from rest at a stand point of the body's node (physics.ts hopLinedUp). */
   hopLinedUp? (cell: readonly [number, number, number], budgetTicks: number): import('./hopOracle.js').HopProgram | null
+  /** A short ground retreat, then one jump, from a flush rest (PhysicsSim.hopPrefix, PF_LIVE_PREFIX). */
+  hopPrefix? (cell: readonly [number, number, number], land?: { x: number, y: number, z: number }, hint?: import('./hopOracle.js').HopProgram): import('./hopOracle.js').HopProgram | null
   /** Optional: a planned program re-anchored at the body as it is, if it still lands (physics.ts hopAnchored). */
   hopAnchored? (cell: readonly [number, number, number], prog: import('./hopOracle.js').HopProgram): import('./hopOracle.js').HopProgram | null
   /** Optional: does the bot's physics keep the faster rise on a jump (vanilla; physics.ts probeVanillaJump)? Sets the kernel's rule. */
