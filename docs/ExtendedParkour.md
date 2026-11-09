@@ -1,602 +1,218 @@
-# Extended parkour (`allowParkourExtended`)
-
-Improvement over upstream mineflayer-pathfinder, whose parkour is
-cardinal-only and same-level-only — as are baritone's and azalea's (checked
-2026-08-19). With the flag on (plus `allowParkour` + `allowSprinting`), the
-solver generates every straightforward sprint-jump a vanilla player can make.
-Nothing is hand-picked: the move set is **computed** from the game's actual
-jump physics.
-
-## The reach envelope (`src/parkourEnvelope.ts`)
-
-`test/helpers/jumpEnvelope.ts` simulates the exact jump the executor performs
-— prismarine-physics, holding forward+sprint+jump — and measures horizontal
-reach per landing height (+1 up, 0, −1 … −8 down) for a **standing** start
-and a **running** start (≥1 walkable cell behind the takeoff; speed saturates
-within a block, measured). The resulting table is pasted as constants;
-`envelope.test.ts` re-derives it on every run and asserts equality, so the
-constants can never drift from the physics. Values include the near-edge
-landing credit (+0.8: a block can be caught by its edge and walked to center)
-minus a 0.3 safety margin against frame-perfect plans the executor sim would
-refuse (a refusal = 3.5s stall + replan).
-
-Standing jumps are measured **from the toe**: when no jump validates yet, the
-executor creeps up to 0.15 blocks toward the gap (hitbox still on the block)
-and keeps re-testing — a player walking to the lip before a standing jump.
-Without the creep the bot froze at the node center and standing reach ended
-at 3.12, refusing the "simple" (3,1) diagonal (the prod 19:25 noPath).
-
-Anchors, all live-verified: standing (toed) reach spans the (2,2) pillar hop
-and (3,1), but not (3,2); running reach covers the classic 4-block jump;
-drops extend reach monotonically (more airtime = more distance — a −4 drop
-carries a running jump ~5.7 blocks). The executor's jump simulation budget is
-45 ticks (upstream: 20) so deep-drop landings plus their run-in fit.
-
-## The generated table (`src/parkourTable.ts`)
-
-Offsets are enumerated, not listed: every integer landing (a, b) with
-2 ≤ distance ≤ 5.66 (matching the deepest default-profile drop). The cost is
-`max(dist + 0.5, octile(a, b))`: euclidean plus a tie-breaking pad, floored at
-the solver's own heuristic. The pad alone is not quite enough at the enumeration limit — the
-octile-minus-euclidean deficit peaks at ~0.082 × major, so (2,6), (3,6), (6,2)
-and (6,3) came out **below** the heuristic by up to 0.035 and made A*
-inadmissible. Flooring those four is preferable to lowering
-`MAX_OFFSET_MAJOR`, which would delete real reach.
-
-**Measured and rejected** (2026-09-18): a second floor at the ~11-tick arc a
-jump takes (3.1 walking blocks), on the theory that a short hop is slower than
-walking round it. The route book said the opposite — basic1 +2.49 s, basic3
-+3.68 s, tunnel1 +1.47 s — because the bot then walked 5-8 blocks round gaps it
-had been crossing in stride. A hop only costs 11 dead ticks when the body has
-to STOP and line up for it; a sprint-hop never stops, and covers more ground
-per tick than sprinting does. Pricing that case means pricing the LINE-UP, not
-the jump. For each offset the
-**swept corridor** is computed by clipping the flight segment against each
-cell rect Minkowski-inflated by the hitbox half-width **minus a 0.15
-corner-nick tolerance**: cells the center line crosses are *line* cells
-(walkable floor there voids the jump — it isn't a gap), edge-clipped cells
-are *corner* cells. The run-up cell is the backward continuation of the
-flight line.
-
-The nick tolerance matters: inflating by `0.3 − 0.15` is exactly "the hitbox
-penetrates the cell by ≥ 0.15 on BOTH axes", so a flight that merely clips a
-block's corner by a few centimetres is no longer treated as a wall. Vanilla
-resolves collisions per axis — a corner nick costs a few centimetres of
-travel on one axis and the player slides on (and aims a hair off-line
-anyway), while any real cut through a block still exceeds the tolerance and
-vetoes. This is what allows diagonal jumps that pass a pillar standing
-right beside the landing block (the prod capture of 2026-08-20). The
-executor's per-tick physics rollout is the backstop: it simulates the actual
-graze before committing the jump.
-
-Each corridor cell also carries **mf**, the minimum feet height (relative to
-the takeoff walk level) while the hitbox overlaps that cell, evaluated on the
-**flight curve** — the tick-by-tick prismarine-physics arc for the takeoff
-class (`FLIGHT_STANDING` / `FLIGHT_RUNNING` in `parkourEnvelope.ts`; the arc
-is target-independent because the executor holds the same controls for every
-jump, and it is unimodal, so the minimum over a swept interval is at an
-endpoint). Corridor rule per cell: body cells (those the vertical range
-`[mf, +head]` passes through) must be passable, and a cell below the body
-vetoes only when its collision top pokes above `mf` (+0.05 grazing
-tolerance, one extra cell probed because fences reach 1.5). Consequences:
-same-level corners near takeoff never veto a drop-jump (the feet are at apex
-over them), and a fence under the apex is legitimately cleared, while the
-same fence right after takeoff still vetoes.
-
-The table is built **once, in JS only**, and shipped to the Rust/wasm core
-inside the solve parameters (~4 KB) — one implementation of the geometry,
-nothing to keep bit-identical by hand (the mf floats are consumed, never
-recomputed, by Rust). The differential suite still pins the two engines to
-identical outputs.
-
-## Landing resolution, per offset
-
-At most one landing per offset — whatever the target column offers first:
-
-- **catch a climbable at flight level** (checked before PHYSICAL: ladders
-  classify as bbox-'block' physical, and grabbing one is real while standing
-  on its thin collision top is not; vines only count with a wall behind,
-  mirroring `moveUp`),
-- **thin floor at flight level** (carpet class: SAFE+PHYSICAL, not
-  climbable): a **same-level** landing — the feet land IN that cell on its
-  sub-block shape, exactly like the air-branch landing below. Treating it as
-  the up variant would put the node one cell up in the air (the prod
-  carpeted-storage-room "No path", 2026-08-20 — same rule applied in
-  `findLanding`/`findExtLanding`/`moveDiagonal`/`moveForward`/`moveJumpUp`),
-- **up (+1)**: the flight-level cell is itself the landing block (rise ≤ 1.2),
-- otherwise scan the column downward: a **physical top** lands on it, a
-  **thin floor** lands in it, shallow **water**
-  (`infiniteLiquidDropdownDistance` honored), a **bubble column** (unlimited —
-  columns catch like water) or a lower **climbable** catches; depth is capped
-  by `maxDropDown`, and the corridor's per-cell mf bound covers the arc
-  dipping under takeoff level near the target.
-
-The landing then passes the envelope: `flightNeeded ≤ J[speed][dyBucket]`,
-where `flightNeeded` is precomputed per offset with PER-AXIS takeoff/landing
-credits (parkourEnvelope.ts): the 0.6-wide hitbox takes off from the block's
-corner (standing: the executor sneaks to the corner overhang, widest axis at
-TAKEOFF_STAND = 0.6 — a 0.2 support patch under the box, which is what keeps
-the executor robust to server corrections on full blocks; running: the rollout delays the jump,
-TAKEOFF_RUN = 0.4 along the line) and catches the landing block's near
-corner (LAND_HALF = 0.8 per axis). A diagonal (3,3) hop therefore needs ~2.26 blocks of flight, not
-the 4.24 center-to-center distance — this is what makes 1x1 pillar courses
-jammable from a standstill, exactly like real players (mcpk.wiki's per-axis
-formula; validated against its tick math: our standing flat J is the wiki's
-2.6234 jam figure). Speed upgrades from standing to running only if the
-run-up cell is walkable at takeoff level. Drop-jumps reach farther than flat
-jumps and up-jumps shorter, exactly like the real game. The corridor's mf
-curves are looked up shifted by the takeoff offset, so cells behind the
-launch point (crossed walking, at ground level) keep their full poke veto.
-
-**Head-hitters**: a blocked head+1 anywhere over the corridor (takeoff
-included) no longer vetoes — it selects the bonked-arc class: J_LOW rows and
-FLIGHT_LOW curves simulated with a solid lid 2 above the feet (the arc bonks
-at +0.2, prismarine-physics collision). +1 landings are impossible there
-(sentinel row), flat hops keep ~0.86 usable flight and drops most of their
-reach — 2-high tunnel gap-hops and drops off ledges under an overhang, like
-real players. The executor needs no change: it holds jump and the per-tick
-rollout simulates the bonk against the real world. Neos remain out of scope
-— the executor only holds jump+sprint+forward; momentum chains are below.
-
-**Graded lids** (the lid model: `lidWalk`, `J_LID8_RUN` / `J_LID13_RUN` /
-`J_LID3_RUN`, `FLIGHT_ROW`). A lid caps the arc at ITS bonk height, not
-always +0.2: a top slab at head+1 at 0.7, a closed top trapdoor at 1.0125, a
-full block a cell higher (3-high headroom) at 1.2. A full-footprint block
-whose boxes all start k/16 up its cell carries a LID byte in the thin table
-(0xF0 | k: slabs, top trapdoors, dripleaf, hoppers, pistons); every thin
-consumer reads it as no footprint (`thinShapeAt`). The rows come from the
-J_RUN generator with the ceiling a parameter (envelope.test.ts re-derives
-them). Then:
-- the take-off's own lid: a thin footprint the body has left by the jump
-  point (a shelf's back, a panel behind; the running point for a running
-  row, `TAKEOFF_RUN`) caps nothing (`thinSpan`); nor does a latched one;
-- a graded lid the body meets only past the take-off window is not a cap: the
-  arc is walked tick by tick (`lidWalk`: the y move at the previous tick's xz,
-  a lid over the body caps it, entering a lid's span above its bonk height is
-  a side collision) over the take-off window (s0 ±0.14), and side-on the jump
-  falls back to the old 0.2 class. The take-off's own lid enters that walk
-  over the take-off cell's head span only (an arc that leaves it before
-  rising to it rises past it, into the lids further on), the corridor's
-  uniform cap over the whole path; the reach rows stay bounded by both;
-- an overhang at flight level over a DROP landing (F2) is walked too, the
-  default row first and a slower take-off whose arc passes under after; on
-  the centre line only (an aimed line under one is a slot dive the walk does
-  not model: arena opk-6, over a 138-block fall).
-Arena opk2-5 becomes a plain A* success (23 nodes; the shelf and top-trapdoor
-jumps, 143 ticks in the kernel gait against 159 through six pipeline
-programs). No momentum chain under any lid.
-
-## Run length, not "standing" vs "running" (`J_RUN`)
-
-The envelope's first model had two takeoff classes: a jam from rest at the
-lip, and a running jump with a walkable cell behind. A recorded human run
-of the arena's parkouradv1 showed that nobody jumps from rest: the player
-sprints across whatever support there is — from its rear overhang to its
-front lip — and jumps at the edge, and the physics brute force reproduced
-every "impossible" hop of that course exactly that way. Even 0.4 blocks of
-run adds half a block of flight; a fence post's ±0.405 support zone gives
-0.81 of run, a head 1.06, a full block 1.38, and each walkable cell behind
-the flight line — level or one step lower — adds one; reach saturates by
-about 2. So the rows are now per **run length before the lip**
-(`RUN_LENGTHS` = 0 … 3, `J_RUN` / `J_LOW_RUN`, derived by
-`measureRunTakeoff`, pinned by the envelope test), the solver sums the
-support's run and the run-up cell, takes the longest measured row not above
-it, and credits the takeoff at the lip; `J_STANDING` is row 0 and
-`J_RUNNING` is what row 2+ used to be. The reach bucket is the REAL rise
-between support tops — a fence stand (feet 0.5 into its node) to a head is a
-flat jump one node cell up — with fractional rises interpolated between the
-integer rows. The executor matches: a parkour jump no gate authorises from
-where the body stands makes it back off to the rear of the support (once
-per node, each step validated by a rollout) and sprint in, the delayed-jump
-rollout picking the tick.
-
-The rows carry a 0.1-block safety margin (`ENVELOPE_SAFETY_MARGIN`);
-`Movements.parkourSafetyMargin` re-tunes it, and the arena's `--risky`
-sets 0 to plan the frame-tight jumps a practised player makes. What stays
-out of the model at any margin: run-ups from a cell BESIDE the takeoff (a
-90° turn at the lip), landing on a stair's low step for extra airtime, and
-jumps with a brute-force window under 1% — on parkouradv1 that is the
-stair-peak (0,5), the 5-fence → 2-fence (3,−3,5) and the pillar-top →
-beam (1,5).
-
-## Narrow supports: fence tops, heads, pots (`topCatchClass`)
-
-Upstream classifies fences and walls (collision top > 1) as *not physical*
-— right for walking, wrong for landing: a fence post is a real stand, feet
-0.5 into the cell above it. With the flag on, the **tall-stand** class
-(not passable, not physical, top > 1) is a landing everywhere a physical top
-is: drop scans, the extended landing scan, the flight-level up-variant, and
-`moveJumpUp` (rise ≤ 1.2 from the takeoff support, so a post is jumpable
-only from another post or a half-step; the head needs the cell above the
-usual pair). A post sunk one below the floor (top 0.5 above it) is simply
-walked onto.
-
-What a narrow top costs is **catch credit**. The height byte carries a
-2-bit `topCatchClass` (shapes.ts): the largest centered square inside the
-**union** of the top faces within step height of the collision top — 0
-full/wide (slabs, stairs, chests), 1 the 0.25-half class (heads, wall posts),
-2 the 0.125-half class (fence posts, flower pots), 3 nothing (a ladder's 3/16
-edge).
-
-The union, not each face alone: an upside-down (`half=top`) stair is two boxes
-that TILE its cell, and its top is as flat and as full as a slab's, but
-measured one box at a time neither box holds a centred square and the stair
-came out class 3 — a fence post. That cost it every landing credit the top can
-actually catch, and it barred aimed lines (which need a full top at the end
-they move), which is why courses built out of upside-down stairs — the arena's
-Six Rings — could not be entered at all. A fence keeps its class either way:
-its arms sit half a block under the post, so the union is a cross, and the
-largest centred square inside a cross is still the post. The envelope credits generalise
-from the full-block constants: takeoff = min(0.6, half + 0.28) — on a post
-the creep goes to two centimetres inside the overhang limit half + 0.3 (there
-is no other takeoff on a 1x1 top; "jump exactly from the corner"), a full
-block keeps the 0.6 patch (crediting its lip re-planned the route book over
-marginal jumps the executor then fell off) and landing = half + 0.3 (near-edge catch; 0.5 + 0.3 is the 0.8
-above).
-Full-block ends still take the precomputed `fnStand`/`fnRun` bit for bit;
-a narrow end recomputes `flightNeeded` in the solver with the reduced
-credits (sqrt of a sum, never `hypot`, so the wasm core rounds identically).
-Running takeoffs need a class-0 takeoff and run-up cell — nothing narrower
-hosts a run-up. The executor caps its corner creep with the same credit,
-read from the live block's shapes: without it the sneak guard parks the body
-at a post's edge short of the full-block creep target and the jump never
-fires.
-
-Two consequences worth knowing when authoring a course: a post-to-post
-(3,1)+1 needs 2.26 blocks of flight against 1.69 usable from a standstill —
-legal between full blocks, on posts only as a momentum chain — and a
-(2,2)+1 from a post onto a head needs 1.60. `hopMath.ts` in the arena
-scratch folder prints the numbers.
-
-## Off-centre narrow supports (`carryCode`)
-
-The class model puts a narrow support's carrying width symmetrically round
-the CELL centre, which a post, a head or a pot is. An open trapdoor's panel
-is a 3/16 strip at the cell's EDGE, a ladder's top its wall-side strip, a
-connected pane a 2/16 LINE through the middle: credited as centred posts they
-offered a creep the panel cannot give on one side and refused a whole cell of
-run on the other. `shapes.ts carryCode` classifies those shapes once per
-state (special byte, bits 5-7: edge panel W/E/N/S, line along x/z; 0 = the
-class model, so every centred support is unchanged), and `parkourExtTarget`
-credits take-off front/back and the landing per SIDE on the major axis
-(`carrySide`: full, none, or the class). The executor measures its creep and
-its lip from the real top faces (`geometry.supportFaces`), aims an off-centre
-support at the middle of its carrying face, and never sprint-hops onto a
-narrow support.
-
-Two more rules keep wall-mounted trapdoor LEDGES honest (arena `mcc-2-2`,
-walked the way a player does it: along each ledge to its end, a small hop
-across the corner to the next). A diagonal step between two carry-coded
-supports is a walk only where their faces carry a common body position
-(`carryTouch`: round the outer corner of one wall they meet, across the inner
-corner between two walls they are 0.8 apart) — otherwise it is emitted as a
-HOP (`META_PARKOUR`, +0.5) and the executor jumps it. And a diagonal jump
-whose minor axis (or, for a pure diagonal, either axis) leaves the panel's
-empty side crosses the strip's 3/16 width: no creep, no run-up cell, no lip
-take-off, no chain, and `OFF_PANEL_MARGIN` of flight in hand. A jump whose
-MAJOR axis leaves the empty side is the ordinary one off a ledge and keeps
-its credits.
-
-## Which end an aimed line may move
-
-An aimed line (below) stands the body off its cell's centre at the take-off,
-at the landing, or both. An end it moves needs a **full top** under it — a
-post, a pane or an edge panel has nothing beside its centre to stand on or
-land on. The test is per END, not per line: `pOff ≠ 0` demands a class-0,
-carry-0 take-off and `qOff ≠ 0` a class-0 landing, so a line that only moves
-the take-off may still land on a pane post, and one that only moves the
-landing may leave from one. `AIM_P0_MASK` (the variants with `pOff === 0`) is
-what a narrow take-off narrows the candidate set to before any of them is
-evaluated, so a course of posts and heads pays almost nothing for lines it
-cannot use.
-
-## Shifted flight lines (`META_SHIFT_*`, `Move.takeoff`)
-
-A pillar at the corner of the flight line refuses the jump (corridor pass);
-a player takes the same jump from one side of the block. Every table entry
-carries four VARIANTS — the same offset flown parallel to the centre line,
-`LATERAL_SHIFT_SMALL` (0.2: the body flush with its own cell at both ends)
-and `LATERAL_SHIFT` (0.35) to either side — swept with the full hitbox less
-5 cm, no corner-nick allowance. `extTarget` tries them ONLY where a corridor
-pass refused the centred line (never for reach or floor, so open ground pays
-nothing), only between full-block ends, never as a momentum chain, and
-prices them +0.5 / +1. The side travels in the meta byte in WORLD space
-(the perpendicular (-dz, dx) of the flight direction; the table's side flips
-with one mirrored axis, not two). `postProcessPath` moves the landing aim by
-the offset and records the same offset on the previous node's block as
-`Move.takeoff`; the executor walks the body onto that line first (`shift`
-branch, sneaking once close, to within `SHIFT_LINE_TOL`) and the creep,
-run-up and jump gates then work from there. Not covered: lines that are not
-parallel (take-off and landing shifted differently) and mid-air turns — the
-arena's Tuning Forks and the later Lateral Leaps need those.
-
-## Ladders: entry, catch, transfer, and the top edge
-
-A ladder cell is entered cardinally from an adjacent stand (`moveForward`
-with no floor under the target — the ladder catches), caught by a jump at
-or below flight level (already), caught by a plain drop (`findLanding`),
-and **transferred** from: `climbTransfers` steps from one climbable cell to
-an adjacent one — along a wall or diagonally round a pillar corner — one
-up, level or one down, with one open corner column to sweep through. That
-is how a spiral of ladders on a 1x1 pillar is climbed: press into the corner
-at the top of one ladder, drift round onto the next (prismarine-physics
-climbs on held jump, and the executor's ordinary rollouts drive it). Cost
-octile + |dy| + 0.5, admissible.
-
-No extended jump is generated FROM a climbable cell (a hanging body has no
-footing to jam from; upstream's flat-cost cardinal parkour stays superseded
-there too), and nothing jumps ONTO a ladder's top edge (`moveJumpUp` and the
-diagonal): a ladder classifies as physical, so a +1 hop between the top
-edges of two ladders priced like a block hop — and a plan the executor
-cannot fly. Climbing over the lip at the top of a ladder (`moveUp` to the
-cell above, then off it) is unchanged.
-
-A ladder's TOP EDGE is a take-off (`parkourExtTarget`, `ladderTop`; the
-veto that stood here predated `carryCode`, which now prices the 3/16 strip
-per side). Modelled as what it is, a standing jump from the strip against
-the wall: no run cell behind and no back credit (`run = front`), no momentum
-lip, no rise (a +1 from the strip was never shown to fly), a diagonal
-credited per axis — the full run along the strip, nothing across it — not
-the panel rule's nothing on both, and `LADDER_TOP_COST` 2 for the climb-out
-and the settle on the strip (8-12 ticks measured between catch and
-standing). A cardinal catch jump from it gives back the catch over-credit
-(`LADDER_CATCH_OVERCREDIT` 0.3: climbability is tested at the body centre,
-so a catch needs the centre inside the cell, 0.5 from its middle, not
-LAND_HALF's 0.8), and the TIGHT pass returns it: a frame-perfect catch is
-offered at TIGHT_COST only where nothing else gets through. Ladder-hop
-courses are nothing but these: the Ten Ways ladder room (17 cells, its last
-hop 10 in 15k take-offs) and mcc-5-3's six single-block ladders over a void,
-which plan ladder by ladder (the 13% legs, not a 0.4% skip of one).
-
-A ladder that starts at HEAD height (no rung in the feet cell) is entered by
-a jump straight up into it (`moveUp`, extended repertoire only; the executor's
-`jumpinto` branch faces the ladder's wall and jumps). Along a ladder WALL
-under a ceiling the executor keeps the node inside the ladder's cell instead
-of on its top, and traverses hanging: the step is split into an along-wall
-and an into-wall part (`climbWall` reads the wall side from the ladder's
-shape), the body moves sideways only where it fits and has a rung to hang
-from, presses only while below the node, and lets go to descend. A final
-node on a ladder is held until the body is within `CLIMB_FINISH_DY` of it.
-
-**A ladder one above the take-off** (`extTarget`'s +1 catch,
-`UP_CATCH_CREDIT`). A ladder hung one cell above the take-off's feet over
-open air is caught by a +1 jump through its open face: an extra candidate
-beside the column's own landing, credited 0.45 at the cell face (the body's
-CENTRE must be in the ladder's cell - climbability is tested at
-floor(position) - not LAND_HALF's 0.8, which made a catch the physics never
-lands on parkouradv1). The plain creep/run envelope only: no lip take-off,
-no chain, no tight pass; never across the plank's own side; and only over a
-planner landing in the column (the net a missed catch falls onto, the same
-landing the ordinary drop into that column uses). Arena opk2-1's moss pillar
-to the one-cell ladder over the next (the oracle flies it straight 5t); over
-the 60 routes it emits one other edge (a weeping vine on paradise3-l49, an
-equal-cost permutation).
-
-## Lava beside a landing (`lavaFlanked`)
-
-No airborne landing (`parkourExtTarget`, `moveParkourForward`) has lava in
-any of the 8 cells round it at feet or head height. A jump comes down within
-LAND_HALF of its node — 0.3 past the cell's edge — so a 1-wide ledge between
-two lava cells is a landing the body survives only from a 0.4-wide window:
-arena opk-9 killed the bot on it whenever it came down 0.1 off centre. Lava
-is LIQUID without SAFE (water is SAFE); out-of-box cells are no hazard; walks
-are untouched. Both cores, bit for bit.
-
-## A lid inside the take-off strip (`lidInStrip`, `leavesLid`)
-
-A trapdoor ladder (arena mcc-8-3: open birch trapdoors in a period-3 spiral
-up a shaft) puts the same plate three up over every plate: a lid 0.2 over
-the head of a body standing on the strip, and every jump from it is the
-head-hitter class (`lowTakeoff`, J_LOW_RUN rows, no +1 landing) - the shaft
-was never planned. But the tick the body's box comes off the strip, the
-ground flag still holds (the Y move runs first, against the strip it is
-leaving: vanilla collideWithShapes, prismarine and the kernel alike), and a
-jump pressed then rises 1.2-1.25 unclipped. So where the lid's thin
-footprint lies inside the support panel's (an edge panel, carry 1-4), a jump
-whose step leaves the strip - across its open side, or off its end into no
-level support - flies the full arc (`low` relaxed), and a jump-up across
-the open side waives the head cell (META_PARKOUR: the executor's live
-take-off search runs). A chain's landing-tick re-jump is still bonked (it
-is always on the strip). The window is one tick: the oracle's `leave`
-family jumps on the event, not a tick count (PhysicsHops.md). A whole-world
-scan of the arena finds 36 such nodes, all in that shaft.
-
-## Floors that are none (`lut.ts`, this profile only)
-
-Upstream classifies by the block TYPE's bounding box, and three kinds of
-block it calls a floor or air are not: a big dripleaf tilts under a body
-standing on it and drops it (fully tilted it has no box at all) - never a
-support, so the planner never walks onto a leaf over a pit; a state with no
-collision box (an open fence gate of a wood the openable set does not list,
-an age-0 pitcher crop) carries nothing; and powder snow, "empty", sinks and
-freezes a body - never walked through. Upstream mode keeps its exact
-classification. Not yet: snow layers 2-8 ("empty" to upstream, steps of
-0.125-0.875 to the body), whose node height the planner cannot express as a
-thin floor.
-
-## Momentum chains (`META_CHAIN`, `via`)
-
-A body that lands from a sprint-jump and presses jump again on the landing
-tick keeps its speed, and prismarine-physics says that takeoff out-flies
-even a running start: `J_CHAIN` (measureChainTakeoff, pinned by
-`envelope.test.ts`) gives 2.59 / 3.50 / 4.10 / 4.40 blocks of usable flight
-for +1 / flat / −1 / −2 landings against 2.48 / 3.33 / 3.89 / 4.18 running
-and 1.69 / 2.42 / 2.93 / 3.19 standing. This is how a player crosses a
-course of 1x1 posts where no stand offers a run-up — and why a post-to-post
-(3,1)+1 that no standing jump reaches (2.40 needed) is a real jump when
-the post is entered at speed.
-
-A* has no speed in its state, so the chain is a compound edge: for every
-parkour landing B an expansion produces that is a **stepping stone** — a
-support with no walkable class-0 cell beside it at its own level (any such
-neighbour means B's own expansion has running jumps) and no lid over it —
-every table offset that **continues the first hop's direction** (cos ≥
-`CHAIN_MIN_COS` = 0.85, about 32°, in exact integer arithmetic — a 45° turn
-lost enough momentum on the arena's simple2 to miss a (3,3)) is tried from B with the
-chain row, and the ones B's own standing/running jump could not make become
-edges A → C with B as `via`, priced at the sum of the two hops. Landings
-that ENTER a cell (ladder, water, thin floor) have no landing tick and are
-never chained; nothing is chained under a lid (no bonked chain row was
-measured). The re-jump is credited HALF the stone's standing creep credit
-(`CHAIN_TAKEOFF_FRACTION`) — the executor lands the first hop that far past
-the stone's centre (`Move.aimDx/aimDz`, scaled by the support's catch class
-in `postProcessPath`), which keeps the landing a hitbox inside the edge:
-aiming at the lip itself put the body five centimetres from the edge at
-speed and it slid off — and the corridor uses the running arc.
-
-The executor expands the raw node into the stone (a plain parkour landing)
-followed by the chain node (`Move.expandRaw`). The stone is flown and
-landed like any other parkour node — its hole-beyond hold retires it on the
-touchdown tick — and the chain node's handler then presses jump toward C on
-that same grounded tick with sprint held, but only if the ordinary
-sprint-jump rollout, run from that landing state (so with the landing speed
-in it), says the chained flight lands; a refused re-jump leaves the node to
-the normal gates, a stop rather than a fall. Once the body has left the
-stone the ordinary in-flight handling flies the arc.
-
-Measured on the arena's parkouradv1 course, chained corner jumps reproduce
-the human line through the first fence cluster and across the stair peaks
-in simulation; four 5-centre hops there still fall 0.7–1.2 blocks short of
-the engine even chained, which is either an engine/vanilla gap or a
-technique not yet modelled (a recorded human run decides).
-
-## Momentum in the search (`allowParkourMomentum`)
-
-Opt-in on top of `allowParkourExtended` (`docs/VelocityInSearch.md` has the
-measurements). Off, everything above is the whole model, byte for byte. On:
-
-- **A search node is `(cell, momentum)`.** A parkour landing on a NARROW
-  support (head, pot, post — `topCatchClass ≥ 1`) that does not hurt (rise
-  ≥ −1.75: the 1.25 apex plus that is the 3-block fall vanilla starts hurting
-  at, and with the damage the server sends the client a velocity packet that
-  zeroes its motion on the landing tick) carries its exact primitive flight
-  direction into the node. From that state every table offset within the
-  chain cone (`CHAIN_MIN_COS`) that the support's own run cannot make is
-  tried on the `J_CHAIN` row from the far-side landing point, less the
-  measured turn loss (`CHAIN_TURN_LOSS`, 0.8 per unit cos at the executor's
-  landing-tick cadence), and pushed as `META_CHAIN` with `via` = the node
-  itself. The compound `momentumChains` edge above is the flag-off model;
-  with the flag on it is this, for chains of any length, with no
-  `CHAIN_CAP`. Momentum states live in a sparse secondary region of the
-  solver arena (`solver.ts slotFor`), so memory follows the landings, not the
-  snapshot. A full block carries no momentum: its lip take-off (next) reaches
-  further than a re-jump in every bucket, and a state there only doubled the
-  cell's expansion — measured 1.1–5× visited on the route book, within 5%
-  narrow-only.
-- **Lip take-offs.** The engine resolves the y axis, which sets `onGround`,
-  before a tick's horizontal move, so a jump input on the first airborne tick
-  still fires (vanilla's late jump): a running body leaves from the overhang
-  limit `half + 0.3` plus a tick phase in `[0, 0.28)`, not from the 0.6 creep
-  point. A jump the creep credit refuses is re-judged from the lip at the
-  median phase (`LIP_PHASE`) against the same run row, bounded by a lip
-  corridor (`mfLip`/`mfLowLip` in the table: the running corridor floored by
-  the later, lower rising arc). Every edge the plain model emits keeps its
-  arc and corridor. This is what plans the arena stair `(0,5)` onto its low
-  step and the post-to-post `(3,−3,5)`. The executor needs nothing new for
-  it — the delayed-jump rollout already fires on that tick; the back-off
-  resamples the phase when a run-in falls short.
-
-What the executor learned flying it, all traced on parkouradv1: sit out the
-landing tick (plus the ping) after a damaging fall, so the next decision sees
-the velocity the server actually left; sneak while caught on a ladder
-mid-flight (the body slides down 0.15 a tick and a catch at the lowest cell
-with the wall on the far side slid out before touching it); a spiral-ladder
-transfer climbs to the ladder's standable top edge first and steps from
-there; and the wall-slide standoff never steers toward air.
-
-## Slime bounce (`META_BOUNCE`, `via`)
-
-A drop of `d ≥ 2` onto a slime block is also an edge to every landing the
-rebound reaches: `BOUNCE_APEX[d]` (prismarine-physics, `measureSlimeBounce`
-in the envelope helper, pinned by `envelope.test.ts`) is how high the feet
-come back above the slime after a straight free fall of `d` — 1.30 at 2,
-2.10 at 3, 2.55 at 4, up to 5.16 at 8 — and a support in one of the 12
-columns around the slime with its top above the slime and under the apex
-(ring 1: minus 0.2; ring 2 along a cardinal: minus a whole block for the
-drift) is a landing, if its column and head cells are passable. The edge is
-takeoff → landing with the slime stand cell as `via`, so the search never
-has to know how much fall energy a node arrived with; cost octile + |dy| + 1
-from the takeoff. Slime cells are marked into the special grid only when
-the flag is on (`LutSpecial.SLIME`); the JS worker passes `via` through and
-the wasm result blob carries it after the meta byte.
-
-The executor drives a bounce node in two latched phases: aim at the slime's
-top centre until the rebound has begun (feet at the slime, moving up), then
-at the node — walking, never sprinting (the drop has to land on one block)
-and never sneaking (which cancels the bounce). Landing on slime as a plain
-stepping stone needs nothing: it is a full block, the physics rollouts see
-the micro-bounces, and `onGround` is true on the contact tick.
-
-Not yet modelled: **takeoffs from slime** (slipperiness 0.8 cuts ground
-acceleration to ~0.42× stone's, so a standing jump off a slime block flies
-short of the stone-measured envelope — the same is true of ice). Until the
-envelope carries a slippery-takeoff class, do not author long standing
-jumps that start on slime.
-
-## What the executor adds on top
-
-The table decides what is *reachable*; getting there is the executor's job,
-and on real terrain a planned jump can still refuse to happen. Three
-behaviours cover that, in the order they are tried, and all three exist
-because a route on 2b2t spawn stopped on them:
-
-1. **Turn to make it.** The take-off heading is searched over ±30° (0 first,
-   cached per node) for one that lands the jump — the idea behind
-   [ParkourCalculatorMod](https://github.com/Leg0shii/ParkourCalculatorMod)'s
-   angle solver. A heading that works costs nothing; ground given up has to
-   be walked again, so this comes first. Bounded: if the body has not left the
-   ground within a jump's worth of ticks, the angle was not the problem.
-2. **Go round the open corner.** A diagonal is priced on the cheaper of its
-   two corners, which is only honest if the walker goes *around* that corner;
-   the open one is inserted as a waypoint. Only once wedged on the node —
-   doing it pre-emptively turns a straight climb into a staircase of 1-block
-   sidesteps (measured: +14 blocks and +3.5 s on one route).
-3. **Make room.** A step back or sideways, each simulated first so it cannot
-   become the fall it was avoiding, ONE tick at a time. A fixed four-tick
-   back-off overshoots by an order of magnitude — the clearance a step-up
-   actually needs is ~0.01 blocks once the hitbox-precision fix is in
-   (README) — and shows up as a visible wobble before every jump.
-
-None of these run while the bot is making progress.
-
-## Efficiency
-
-Zero allocation per expansion; all probes are typed-array reads against the
-snapshot. Flag off: no new code runs. Flag on: takeoff gates (liquid, bubble,
-y+2 headroom) are hoisted per node, and each offset opens with a 2-probe
-fast-out (walkable floor on the first line cell — kills virtually every
-open-terrain candidate), so flat ground costs ~2 probes × ~27 offsets per
-direction group; the full corridor checks only run at real gap edges.
-Benchmarks are unchanged with the flag off and the differential fuzz runs at
-the same speed with it on.
-
-## Parity
-
-- Default **off**. The upstream-oracle fuzz (`fuzz.test.ts`) and the prod
-  shadow profile must never enable it — upstream cannot generate these moves,
-  so reachability would diverge (same policy as `useBubbleColumns`).
-- JS and Rust consume the same uploaded table at the same points in move
-  generation (cardinal loop after `moveParkourForward`, diagonal loop after
-  `moveDiagonal`) with identical probe order and float arithmetic — pinned by
-  the wasm↔JS differential in `wasm.test.ts`, including 20 fuzz worlds with
-  the flag on.
-- Rust adds no exclusion-area cost: exclusion areas force the JS solver path
-  (existing divergence, same as every other move).
-- With the flag on the table **supersedes** `moveParkourForward` rather than
-  coexisting with it: that generator is skipped entirely (JS and Rust alike).
-  It charges a flat 1 for a jump covering up to four blocks — cheaper than a
-  single walking step — so beside the table it wins every tie, which means it
-  re-offers at a lower price exactly the jumps the corridor and envelope just
-  vetoed, and lets A* buy distance with jumps (2b2t spawn: a plan costing 74.1
-  against upstream's 76.6 that was 3.5 blocks *longer* to walk, and lost the
-  race it should have won). The flat cost also makes the octile heuristic
-  inadmissible (h = 4 over a cost-1 edge), so the search is not optimal under
-  its own model either.
-
-  Coverage is not a reason to keep it. Over 120 seeded worlds and 108k
-  parkour-bearing nodes it reaches 22.5k targets the table does not, and a
-  prismarine-physics rollout of a sample of those — tried from the cell
-  centre, from the take-off corner, and with one and two blocks of run-up —
-  can fly **1.1%** of them. The rest are jumps the bot cannot make, each one a
-  planned stall. With the flag off it is still the bit-exact upstream port and
-  the differential fuzz pins it. `test/movegen.test.ts` pins the supersession.
+# Extended parkour
+
+`Movements.allowParkourExtended` enables table-based diagonal, long, raised
+and drop jumps, including ladder and liquid catches. It requires
+`allowParkour` and `allowSprinting` and defaults to false. The table replaces
+the upstream cardinal parkour generator while enabled.
+
+The planner uses measured reach and swept collision corridors to find
+candidate jumps cheaply. The executor then checks take-offs against live
+physics. [VelocityInSearch.md](VelocityInSearch.md) explains carried momentum;
+[PhysicsHops.md](PhysicsHops.md) explains the simulated control programs used
+when the table cannot describe a route.
+
+## Reach and run-up
+
+[src/parkourEnvelope.ts](../src/parkourEnvelope.ts) stores horizontal reach
+and flight curves measured with prismarine-physics. Reach is travel from
+the jump point, separate from the support and landing credits. Height
+buckets cover +1, level, and drops through -8 blocks. Deeper drops use the
+last bucket conservatively; `maxDropDown` separately limits landing depth.
+
+`J_RUN` measures runs of 0, 0.4, 0.8, 1.2, 1.6, 2 and 3 blocks before
+take-off. Even a short run matters: at level height, 0.4 blocks of run raises
+the tabulated reach from about 2.52 to 3.07 blocks. Further gains diminish:
+the 0.8-block row reaches about 3.19 and the 3-block row about 3.24. This is
+why a narrow support can provide useful acceleration without a full runway.
+The planner includes the support's usable width and an eligible cell behind
+it, including a step up within 0.6 blocks, then chooses the longest measured
+run no greater than the available distance.
+
+The rows subtract `ENVELOPE_SAFETY_MARGIN = 0.1` blocks for timing
+uncertainty. `Movements.parkourSafetyMargin` adjusts that reserve.
+`allowParkourTight`, true by default, permits a fallback with the reserve
+restored at an extra cost of 6, so comfortable jumps remain preferable.
+These are planning margins, not a promise that every planned jump executes.
+
+Reach uses the actual rise between collision tops, interpolating fractional
+heights between rows. A fence top can therefore be level with a destination
+whose planner node is a cell higher. A bottom stair is caught on its
+full-footprint slab at half-block height before the body walks up its step;
+the lower landing gives the flight more airtime.
+
+## Support and catch geometry
+
+The player is 0.6 blocks wide. On a full support, standing take-off credit
+is 0.6 blocks from the centre on the widest axis. That leaves a 0.2-block
+support patch under the hitbox. The separate running credit is 0.4 along the
+flight line. A full landing supplies 0.8 blocks of catch credit per axis:
+half a block plus the hitbox radius. A diagonal jump must apply these credits
+on each axis, rather than subtracting them once from centre-to-centre distance.
+
+[src/shapes.ts](../src/shapes.ts) classifies narrow supports with
+`topCatchClass`. Its four credited half-widths are 0.5, 0.25, 0.1875 and
+0.125 blocks, for wide tops, heads or wall posts, pots, and fence posts or
+narrower shapes. Take-off credit is `min(0.6, halfWidth + 0.28)` and landing
+credit is `halfWidth + 0.3`. The take-off stays 0.02 inside the overhang limit.
+The executor reads the live support faces to bound its creep.
+
+Classification uses the union of faces within step height of the top.
+Classifying boxes separately loses the full top of an upside-down stair,
+whose boxes tile the cell. Fence arms do not turn a post into a full top:
+their union still leaves only a narrow centred square.
+
+`carryCode` adds direction-dependent credit for edge panels and lines, such
+as open trapdoors, ladder strips and panes. A centred width alone would
+credit space on the empty side and lose usable space along the strip.
+Diagonal walks between panels require a common supported body position;
+otherwise the move is a hop. Crossing a panel's narrow width also removes
+run-up and creep credit and adds a reach reserve.
+
+## Generated corridors and costs
+
+[src/parkourTable.ts](../src/parkourTable.ts) enumerates integer offsets with
+components up to `MAX_OFFSET_MAJOR = 6`, excluding adjacent moves and offsets
+beyond the deepest running reach after support credits. The base cost is
+`max(distance + 0.5, octileDistance)`. The pad prevents jumps replacing
+comparable walks for free; the octile floor keeps an edge from costing less
+than the heuristic's distance over it.
+
+A minimum cost based on a whole jump's airtime is unsuitable for short hops.
+It prices every hop as though the body stops to line up and encourages long
+walking detours. A sprint-hop carries speed through the arc; alignment costs
+belong to the alignment, not to every jump.
+
+Each entry stores cells swept by the flight and minimum feet heights over
+those cells. Cells on the flight line are distinguished from clipped corner
+cells: walkable floor along the line makes a jump unnecessary. Obstacles
+below the body matter only if their tops protrude into the arc, with a small
+grazing allowance. This lets a dropping jump clear a nearby corner or fence
+under its apex without treating the same obstacle near take-off as clear.
+
+The centred sweep uses the 0.3-block hitbox radius minus a 0.15 corner-nick
+tolerance. Vanilla resolves collisions per axis, so a shallow graze can slide
+past a corner. Aimed sweeps use a smaller 0.1 tolerance. Head sweeps use a
+0.29 radius because vertical collision resolves before horizontal movement.
+The executor simulates the actual contact before committing a take-off.
+
+JavaScript builds and caches the geometry once. The WebAssembly host uploads
+the serialized table through `ext_begin`, writes at `ext_ptr`, then calls
+`ext_commit`; subsequent solves use the resident table.
+[rust/src/lib.rs](../rust/src/lib.rs) describes it as approximately 0.7 MB
+serialized. Rust consumes the shared geometry and clearance bounds rather
+than reconstructing them. Older cores without the residency exports use the
+host's per-solve compatibility upload.
+
+## Landing selection
+
+[src/moveGen.ts](../src/moveGen.ts) resolves the target column before checking
+reach. A climbable at flight level is a catch, not a landing on its thin
+collision top. A carpet-like thin floor holds feet inside its cell rather
+than one cell above it. A physical block or tall fence/wall top can be a
+raised landing if its rise is at most 1.2 blocks and headroom permits it.
+Otherwise the scan descends to a physical top, thin floor, usable climbable,
+water or bubble column. Drop limits apply, with the configured liquid-depth
+exception and bubble-column handling.
+
+The extended lookup table rejects big dripleaf as a dependable support,
+removes support from states with no collision boxes, and marks powder snow
+unsafe. A block type's broad classification alone cannot describe these
+states: a leaf can tilt away, an open gate carries nothing, and powder snow
+sinks the body.
+
+Climbable catches and support landings need different credits. In particular,
+a ladder catch needs the body's centre inside the ladder cell. A catch one
+cell above take-off uses a reduced 0.45 credit, must approach through an open
+side, and requires another planner landing below it if the catch is missed.
+
+The extended profile rejects airborne landings flanked by lava at feet or
+head height. Near-edge catch credit would otherwise admit landings whose
+hitboxes overlap the lava. Hazard corner checks and a small neighbouring
+hazard cost also keep equivalent paths farther from fire, lava and cobwebs.
+
+## Ceilings and late take-offs
+
+A ceiling changes the arc instead of simply forbidding the jump. A full
+ceiling two blocks above the feet clips the rise at 0.2 blocks; separate
+`J_LOW_RUN` rows retain short level hops and longer drops but reject +1
+landings. Graded rows model top slabs, top trapdoors and higher full ceilings
+at their own collision heights.
+
+`lidWalk` checks the arc tick by tick over each ceiling span. A lid left
+behind before the body rises into it does not cap the whole flight; entering
+a lid side-on is different from bonking underneath it. A slower take-off can
+sometimes pass below an overhang above a drop landing. Aimed dives under
+that landing overhang are excluded from this table model. The shelf and
+trapdoor geometry on `opk2-5` illustrates why one blanket low-ceiling class
+is insufficient.
+
+A lid confined to an edge support's strip can be left before the jump fires.
+Vertical collision sets `onGround` before horizontal motion, so the flag can
+remain set for the first tick without support. `leavesLid` recognises these
+late take-offs. The physics oracle's `leave` program fires on that event,
+rather than relying on a start-sensitive tick count. Momentum re-jumps under
+lids remain excluded because the table has no measured bonked chain row.
+
+## Aimed lines and neos
+
+A blocked centre line can have a clear route beside it. `AIM_VARIANTS` has
+24 entries represented as `[pOff, qOff, wOff, wFrac]`: lateral take-off and
+landing offsets, an optional waypoint offset, and its fraction along the
+jump. Equal endpoint offsets produce parallel lines; unequal offsets aim
+across the gap. A waypoint bends the route beside a pillar and back behind
+it, describing a neo. These variants are tried when corridor geometry blocks
+the centre line, with extra cost for alignment and steering.
+
+`avoid` and `lineAvoid` masks prune variants as obstacles and floor cells are
+encountered. An endpoint moved off-centre needs a full support top. The
+checks are per endpoint, and `AIM_P0_MASK` restricts narrow take-offs to
+variants with `pOff = 0`.
+
+`META_AIM` marks the move. Its separate aim byte holds a one-based variant
+index in bits 0-6 and the mirrored side in bit 7. `Move.fromRaw` decodes it
+into `pOff`, `qOff` and `wOff`; path post-processing offsets the landing aim
+and records a take-off aim in `Move.takeoff` for straight lines. A neo uses
+a searched run and turn script instead of a fixed take-off point. The
+variants describe candidate geometry, while physics validation decides
+whether the controls can fly it.
+
+## Ladders and slime
+
+Ladders support cardinal entry, airborne and drop catches, and transfers
+between adjacent climbable cells, including around a pillar. A hanging body
+has no standing jump footing. The top strip of a ladder is a separate,
+restricted take-off: standing credit along the strip, no runway or momentum
+lip credit, no raised landing, and an added cost for climbing out and settling.
+A ladder beginning at head height can be entered by jumping up into it.
+
+A slime bounce is a compound edge with the slime stand stored as `via`.
+Measured rebound apex depends on drop height: about 1.30 blocks after a
+2-block fall and 5.16 after an 8-block fall. The table reserves height for
+horizontal drift and considers nearby higher supports. The executor aims at
+the slime until rebound begins, then at the destination, without sneak,
+which would cancel the bounce. More complex and deep rebounds use the
+physics programs described in [PhysicsHops.md](PhysicsHops.md).
+
+## Chaining and execution
+
+A landing-tick re-jump retains more speed than a fresh run on a small support.
+Without momentum state, `momentumChains` represents two hops as a compound
+edge through a stepping stone, with both costs summed and the stone in
+`via`. The continuation must satisfy `CHAIN_MIN_COS = 0.70`, roughly a
+45-degree turn. Catches into water, thin floors or climbables are not ordinary
+grounded re-jumps. Aiming halfway through the stone's standing creep credit
+leaves room to land without sliding off its far edge.
+
+`allowParkourMomentum` carries landing direction in the search instead,
+allowing longer chains and additional lip take-offs. Its state, turn-loss
+model and conservative drop cutoff are described in
+[VelocityInSearch.md](VelocityInSearch.md).
+
+Live rollout gates remain necessary because the table approximates support,
+speed and collision geometry. Their jump simulations allow 45 ticks so deep
+drop landings and the run-in fit. When a jump does not validate, the executor
+can search headings, creep within the support, or, with `allowRunUp`, back
+off and build speed. Recovery steps are simulated individually: a fixed
+multi-tick retreat can overshoot the small clearance a jump actually needs.
+The executor refuses take-offs it cannot validate; world changes and server
+corrections can still invalidate a flight after launch.
