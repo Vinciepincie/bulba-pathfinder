@@ -47,4 +47,8 @@ for (const [variant, out] of [['moduleDir.esm.js', 'esm'], ['moduleDir.cjs.js', 
 mkdirSync(join(root, 'dist/types/runtime'), { recursive: true })
 cpSync(join(root, 'src/runtime/moduleDir.d.ts'), join(root, 'dist/types/runtime/moduleDir.d.ts'))
 
+// TypeScript reads a declaration's format from the nearest package.json, so CommonJS consumers need
+// their own copy under dist/cjs: dist/types sits under the root's "type": "module".
+cpSync(join(root, 'dist/types'), join(root, 'dist/cjs'), { recursive: true })
+
 console.log('[build] dist/esm + dist/cjs + dist/types written')

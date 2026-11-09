@@ -1,5 +1,4 @@
-// Path node — API-identical to mineflayer-pathfinder/lib/move.js. Consumers
-// receive these in path_update results and rely on the Vec3 inheritance.
+// Path results retain Vec3 inheritance for consumer compatibility.
 import { Vec3 } from 'vec3'
 import type { RawPathNode } from './types.js'
 import type { HopProgram } from './hopOracle.js'
@@ -24,46 +23,27 @@ export class Move extends Vec3 {
   toPlace: ToPlaceEntry[]
   parkour: boolean
   hash: string
-  /**
-   * Two-stage moves (extended parkour). Slime bounce: the slime STAND cell to
-   * drop onto first; the rebound then carries the body up to this node.
-   * Momentum chain (`chain`): the executor expands the node into the
-   * stepping-stone landing followed by this node, and re-jumps on the
-   * landing tick. Null / false on every other move. Additive over upstream.
-   */
+  /** Intermediate stand cell for a slime bounce or momentum chain.
+   * A chain expands to two landings and re-jumps on the intermediate landing tick. */
   via: Vec3 | null
   chain: boolean
-  /**
-   * Parkour jump that needs a RUN-UP (planner META_RUN): the standing reach
-   * cannot fly it, so the executor lines up a sprint from the rear of the
-   * support instead of creeping to the lip and jumping from rest.
-   */
+  /** A jump beyond standing reach; the executor builds sprint speed from the support's rear. */
   run = false
-  /** Is the landing support narrower than a full top (a post, a pane, a panel)? Set by the executor when the node comes up; null = not looked at yet. */
+  /** Whether the landing support is narrow; null until the executor checks its shape. */
   narrowLanding: boolean | null = null
-  /**
-   * Aimed flight line (planner META_AIM): signed offsets (blocks) of the
-   * TAKE-OFF point and the LANDING point from their cell centres, along the
-   * world perpendicular (-dz, dx) of the flight direction; 0 = centred.
-   * postProcessPath moves the aim point by `qOff` and sets `takeoff`, `pOff`
-   * beside the previous node's aim, where the executor lines the body up
-   * before the jump.
-   */
+  /** Signed takeoff/landing offsets in blocks along the flight's perpendicular (-dz, dx).
+   * postProcessPath applies `qOff` to the landing and stores `pOff` beside the previous aim. */
   pOff = 0
   qOff = 0
-  /** A NEO (AIM_VARIANTS wOff ≠ 0): the planned line goes out beside a pillar in the way and back in behind it. The executor flies it with a searched jump script (PhysicsSim.solveJump). */
+  /** A curved jump around a pillar, flown with a searched PhysicsSim.solveJump script. */
   wOff = 0
   takeoff: { x: number, z: number } | null = null
-  /**
-   * Aim offset (XZ, blocks) applied after the aim point is set on the
-   * support's top: a momentum-chain stepping stone is landed on its FAR side
-   * so the re-jump starts with the creep credit the planner assumed.
-   */
+  /** XZ aim offset in blocks; lands far across a chain's stepping stone to preserve re-jump reach. */
   aimDx = 0
   aimDz = 0
-  /** Physics-verified hop (allowParkourPhysics): the control program that lands this node; null otherwise. */
+  /** Physics-verified controls for landing this node, or null. */
   program: HopProgram | null = null
-  /** The planner's cell of this node — x/y/z become its aim point in postProcessPath, which may sit on the cell's edge. */
+  /** Original planner cell; postProcessPath changes x/y/z to the support aim point. */
   readonly cell: readonly [number, number, number]
 
   constructor (
@@ -111,12 +91,7 @@ export class Move extends Vec3 {
     return move
   }
 
-  /**
-   * Path form of a raw node: a momentum-chain node becomes its stepping
-   * stone (a plain parkour landing) followed by the node itself, so the
-   * follower lands the first hop like any other and the chain flag on the
-   * second says "press jump on that landing tick".
-   */
+  /** Expand a compound chain into its stepping stone and destination; re-jump on landing. */
   static expandRaw (raw: RawPathNode): Move[] {
     const node = Move.fromRaw(raw)
     if (!node.chain || node.via === null) return [node]
@@ -125,12 +100,8 @@ export class Move extends Vec3 {
     return [stone, node]
   }
 
-  /**
-   * Whole-path form of expandRaw. With momentum in the search
-   * (allowParkourMomentum) a chain node's stone IS the node before it, so
-   * that one is aimed far-side rather than duplicated; a compound chain
-   * (stone folded into `via` only) still expands into stone + node.
-   */
+  /** Expand raw nodes, aiming an existing momentum stepping stone far-side without duplicating it.
+   * A stepping stone stored only in `via` is inserted as a separate landing. */
   static expandRawPath (raws: RawPathNode[]): Move[] {
     const out: Move[] = []
     for (const raw of raws) {
@@ -150,8 +121,7 @@ export class Move extends Vec3 {
     return out
   }
 
-  /** Unit direction of the re-jump off `stone` toward `node`; the executor
-   * scales it by the stone's creep credit once it knows the support's shape. */
+  /** Re-jump unit direction; the executor scales it by the stepping stone's shape-dependent credit. */
   private static aimStone (stone: Move, node: Move): void {
     const dx = node.x - stone.x
     const dz = node.z - stone.z

@@ -1,20 +1,32 @@
-// prismarine-physics climbs the ladder, the vine and scaffolding; vanilla's `climbable` tag also holds the
-// nether vines (1.16) and the cave vines (1.17), and the body climbs them the same. This patches the installed
-// package's isOnLadder to know them. And from 1.21 vanilla's jumpFromGround keeps the faster of the jump and the
-// body's own rise (deltaMovement.y = max(jumpPower, vy), read from the 1.21.11 server: a jump held on a slime
-// rebound keeps the rebound), where prismarine sets the jump's; the patched rule follows the bot's version.
-// Each patch is idempotent (its own mark) and optional: an anchor not found is a warning, never a failed
-// install (the kernel follows whichever jump rule the bot runs: physics.ts probeVanillaJump). Run at install,
-// and by hand after an update of the package.
-//   node scripts/patchPhysics.mjs
+#!/usr/bin/env node
+// Optional. Brings the installed prismarine-physics in line with the game in two places: nether and cave vines
+// are climbable, and from 1.21 a jump keeps the faster of its own speed and the body's rise (a jump held on a
+// slime rebound keeps the rebound). The pathfinder detects both at runtime and works without them.
+// Each patch is idempotent, and an anchor not found is a warning, never a failure. Run it again after updating
+// prismarine-physics.
+//   npx bulba-pathfinder-patch-physics
 import { createRequire } from 'node:module'
-import { readFileSync, writeFileSync } from 'node:fs'
+import { readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 
-const require = createRequire(import.meta.url)
-let file
-try {
-  file = require.resolve('prismarine-physics')
-} catch {
+/** The copy the bot runs is mineflayer's: from the project this was run in, then from this package. */
+function findPhysics () {
+  const froms = [join(process.cwd(), 'noop.js'), import.meta.url]
+  for (const from of froms) {
+    try {
+      return createRequire(createRequire(from).resolve('mineflayer')).resolve('prismarine-physics')
+    } catch {}
+  }
+  for (const from of froms) {
+    try {
+      return createRequire(from).resolve('prismarine-physics')
+    } catch {}
+  }
+  return null
+}
+
+const file = findPhysics()
+if (file === null) {
   console.warn('prismarine-physics: not installed, not patched')
   process.exit(0)
 }
@@ -68,5 +80,8 @@ if (!s.includes(MARK_JUMP)) {
 }
 
 if (!changed) { console.log('prismarine-physics: nothing to patch'); process.exit(0) }
-writeFileSync(file, s)
+// A new file renamed over the old one: pnpm hard-links node_modules into a shared store, and writing in
+// place would patch every project on the machine.
+writeFileSync(file + '.tmp', s)
+renameSync(file + '.tmp', file)
 console.log('prismarine-physics: patched ' + file)

@@ -1,102 +1,51 @@
 import type { Vec3 } from 'vec3'
 
-/**
- * LUT flag bits, one byte per block state id.
- *
- * These mirror the exact pseudo-block classification mineflayer-pathfinder
- * computes per `getBlock()` probe (movements.js), precomputed once per
- * (minecraft version × movements profile) so a probe is a single typed-array
- * read instead of a world hash lookup + object allocation.
- */
-// A plain const object rather than a `const enum` — const enums poison
-// published .d.ts files for consumers compiling with isolatedModules.
+/** Block-state flags, precomputed per Minecraft version and movement profile
+ * so collision probes read a byte without a world lookup or block allocation. */
+// A const object keeps the published types compatible with isolatedModules.
 export const LutFlags = {
-  /**
-   * Walk-through safe: bounding box 'empty' / climbable / carpet type, and
-   * not a blocksToAvoid. NOTE: boundingBox is TYPE-level in prismarine-block
-   * (an open fence gate still reports 'block'), and upstream's classification
-   * inherits that — we mirror it exactly, quirks included.
-   */
+  /** Walk-through safe: empty, climbable or carpet types not in blocksToAvoid.
+   * prismarine-block's type-level boundingBox reports 'block' even for open gates. */
   SAFE: 1 << 0,
   /** Can stand on: bounding box 'block' and not a fence-like type (top > 1). */
   PHYSICAL: 1 << 1,
   LIQUID: 1 << 2,
   CLIMBABLE: 1 << 3,
-  /**
-   * Upstream `openable` (non-iron fence gates) AND this state has collision
-   * shapes (i.e. the gate is closed): traversable via activate when
-   * canOpenDoors. Upstream checks `openable && shapes.length !== 0` at move
-   * time; we bake the shapes check per state.
-   */
+  /** Closed non-iron fence gate with collision shapes; activation makes it
+   * traversable when canOpenDoors is enabled. */
   OPENABLE_GATE: 1 << 4,
-  /**
-   * Improvement over upstream: a CLOSED non-iron door — traversable via
-   * activate when canOpenDoors && canOpenRealDoors (upstream only ever opens
-   * fence gates).
-   */
+  /** Closed non-iron door; traversable by activation when canOpenDoors and canOpenRealDoors are enabled. */
   DOOR_CLOSED: 1 << 5,
-  /**
-   * Improvement over upstream: an OPEN non-iron door — treated as passable
-   * when canOpenDoors && canOpenRealDoors (upstream blocks on it because the
-   * type-level bounding box stays 'block').
-   */
+  /** Open non-iron door; passable when canOpenDoors and canOpenRealDoors are enabled. */
   DOOR_OPEN: 1 << 6,
-  /**
-   * Improvement over upstream: an OPEN non-iron fence gate (no collision
-   * shapes) — passable when canOpenDoors && canOpenRealDoors. Upstream
-   * blocks on it (type-level bbox again), making gates effectively
-   * one-shot on modern versions.
-   */
+  /** Open non-iron fence gate without collision shapes; passable when both door options are enabled. */
   GATE_OPEN: 1 << 7,
 } as const
 
-/**
- * Rare-block auxiliary classification, kept OUT of the main flags byte (all
- * 8 bits are taken) in an optional third grid that exists only when the
- * profile opts into the feature — zero cost and byte-identical behavior
- * otherwise. Currently: bubble columns (improvement over upstream, which
- * treats them as plain air).
- */
+/** Optional auxiliary classification for special blocks.
+ * The main flags byte has no spare bits, so these values use a separate grid. */
 export const LutSpecial = {
-  /** bubble_column[drag=false] (soul sand below) — pushes entities up. */
+  /** bubble_column[drag=false] above soul sand pushes entities up. */
   BUBBLE_UP: 1,
-  /** bubble_column[drag=true] (magma below) — drags entities down. */
+  /** bubble_column[drag=true] above magma drags entities down. */
   BUBBLE_DOWN: 2,
-  /** vine — climbable only with an adjacent solid block to press against
-   * (vanilla collision climb; prismarine-physics ascends only on
-   * horizontal collision, so a free-hanging curtain is unclimbable). */
+  /** Vines need an adjacent solid block: prismarine-physics ascends only on
+   * horizontal collision, so free-hanging vines cannot be climbed. */
   VINE: 4,
-  /** slime_block — a drop onto it rebounds (improvement, marked only when
-   * the profile enables allowParkourExtended: slime-bounce moves). */
+  /** Slime rebounds after a drop; marked only when allowParkourExtended is enabled. */
   SLIME: 8,
-  /**
-   * Bottom stair (improvement, allowParkourExtended): its lower slab
-   * [0,0,0,1,0.5,1] is full-footprint whatever the facing, so a parkour
-   * flight can catch the block half a block below its top and walk up the
-   * step — half a block more usable flight than a full-block landing. Marked
-   * only on straight/corner bottom stairs (top-half stairs stay full-top).
-   */
+  /** Bottom stairs have a full-footprint lower slab regardless of facing,
+   * so a jump can catch half a block below the top and step up. Requires allowParkourExtended. */
   STAIR: 16
-  /**
-   * Bits 5–7 (shapes.ts CARRY_SHIFT / carryCode): where a NARROW support
-   * (catch class > 0) carries the body relative to its cell — an edge panel
-   * in one of four orientations, or a line along x or z. 0 = centred, the
-   * class model. Set with the extended parkour repertoire; the bits are
-   * never set on the blocks the other values mark, so equality tests on
-   * those values keep working.
-   */
+  /** Bits 5-7 encode where narrow supports carry the body: an oriented edge panel,
+   * an x/z line, or 0 for centred. These bits never overlap the special-block
+   * values above, so equality tests on those values remain valid. */
 } as const
 
-/**
- * Snapshot cell = 2 bytes: flags (LutFlags) + a packed height byte.
- *
- * Height byte layout: bits 0–5 = collision-top height in 1/32 blocks
- * (vanilla tops max out at 1.5 = 48, so 6 bits are exact), bits 6–7 = the
- * TOP-CATCH class — how wide the centered landing surface at the top of the
- * block is, from `topCatchClass` (shapes.ts): 0 = full/wide (≥0.4 half),
- * 1 = head/wall class (0.25), 2 = fence-post/pot class (0.125), 3 = too
- * small to stand on. Consumers must mask: height = (byte & 63) / 32.
- */
+/** Snapshot cells store a LutFlags byte and a packed height byte.
+ * Height bits 0-5 encode 1/32 blocks: (byte & 63) / 32; bits 6-7 encode top-catch class.
+ * Catch classes use half-widths: 0 = wide (>=0.4), 1 = head/wall (0.25),
+ * 2 = post/pot (0.125), 3 = too small to stand on. */
 export interface SnapshotMeta {
   /** World-space minimum corner of the AABB (inclusive). */
   x0: number
@@ -106,25 +55,23 @@ export interface SnapshotMeta {
   w: number
   h: number
   l: number
-  /** bot.game.minY — getLandingBlock stops scanning below this. */
+  /** World minimum Y; landing scans stop below this. */
   worldMinY: number
-  /** PROCESS-globally unique generation (cache key across consumers). */
+  /** Process-wide unique generation used as a cache key. */
   generation: number
-  /** Bumped on every in-place cell patch — (generation, patchCount)
-   * uniquely identifies snapshot content for residency caches. */
+  /** Incremented on each cell patch; (generation, patchCount) uniquely identifies
+   * snapshot content for residency caches. */
   patchCount: number
 }
 
 export interface SnapshotBuffers {
   meta: SnapshotMeta
-  /** flags[idx] — LutFlags byte per cell. SharedArrayBuffer-backed. */
+  /** LutFlags byte per cell, backed by SharedArrayBuffer. */
   flags: Uint8Array
-  /** heights[idx] — collision-top of the cell, in 1/32 blocks above the cell floor. */
+  /** Packed height byte per cell: low six bits are collision height in 1/32 blocks. */
   heights: Uint8Array
-  /**
-   * Sparse entity-intersection grid, mirroring Movements.entityIntersections:
-   * pairs of (cellIdx, weight). Empty when allowEntityDetection is off.
-   */
+  /** Sparse entity-intersection pairs (cellIdx, weight), matching Movements.entityIntersections.
+   * Empty when allowEntityDetection is disabled. */
   entityIdx: Int32Array
   entityWeight: Int32Array
   /** Sparse exclusion-step weights (cellIdx, weight); empty unless exclusionAreasStep set. */
@@ -132,89 +79,59 @@ export interface SnapshotBuffers {
   exclusionWeight: Int32Array
 }
 
-/** Serializable subset of a Movements profile — everything the solver core needs. */
+/** Serializable movement profile used by the solver. */
 export interface MovementsConfig {
+  /** Touchdown damage a hop search refuses, set under a health floor. Not read by the core search. */
+  fallVeto?: number
   allowSprinting: boolean
   allowParkour: boolean
-  /**
-   * Improvement over upstream: extended parkour — sprint-jumps to diagonal
-   * and long offsets, up (+1) and drop landings, and gap-jumps that catch a
-   * ladder / water / bubble column (docs/ExtendedParkour.md). Default false;
-   * needs allowParkour + allowSprinting.
-   */
+  /** Extended sprint-jumps to diagonal, long, raised and drop landings, including
+   * ladder, water and bubble-column catches. Default false; requires allowParkour and allowSprinting. */
   allowParkourExtended: boolean
   canOpenDoors: boolean
-  /** Improvement toggle: also open real (non-iron) doors, not just gates. Default true. */
+  /** Open non-iron doors as well as gates when canOpenDoors is enabled. Default true. */
   canOpenRealDoors: boolean
   maxDropDown: number
   infiniteLiquidDropdownDistance: boolean
   liquidCost: number
   entityCost: number
-  /** Dig moves enabled (default false). Cost model is upstream-identical. */
+  /** Enable digging moves. Default false. */
   canDig: boolean
   digCost: number
   dontCreateFlow: boolean
   dontMineUnderFallingBlock: boolean
-  /**
-   * Improvement over upstream: ride bubble-column elevators (soul sand up,
-   * magma down). Default false — upstream treats columns as plain air.
-   */
+  /** Ride bubble-column elevators: soul sand pushes up, magma pulls down. Default false. */
   useBubbleColumns: boolean
-  /** Cost per block of column ride (default 1 = admissible vs the |dy|
-   * heuristic; the true ride is faster — ~0.31 up / ~0.72 down). */
+  /** Cost per block of bubble-column travel. Default 1 keeps the vertical
+   * distance heuristic admissible. */
   bubbleCost: number
-  /**
-   * Blocks of flight a planned parkour jump must keep short of the physics
-   * limit (parkourEnvelope.ts ENVELOPE_SAFETY_MARGIN = 0.1 default). 0 plans
-   * the frame-tight jumps a practised player makes; the executor's rollout
-   * still gates every take-off. Optional for older serialized configs.
-   */
+  /** Blocks of reach reserved below the physics limit. Default 0.1; 0 allows
+   * frame-perfect jumps. The executor checks every takeoff with a physics rollout. */
   parkourSafetyMargin?: number
-  /**
-   * Improvement (opt-in, needs allowParkourExtended): momentum-aware search.
-   * A parkour landing carries its flight direction into the search node, so a
-   * re-jump on the landing tick (the J_CHAIN row) is a state transition rather
-   * than a two-hop compound edge: chains of any length, from any support
-   * (docs/VelocityInSearch.md). Off by default; optional for older serialized
-   * configs.
-   */
+  /** Carry landing direction into search state to chain jumps on the landing tick.
+   * Default false; requires allowParkourExtended. */
   allowParkourMomentum?: boolean
-  /**
-   * Improvement (needs allowParkourExtended; default on): where the reach
-   * envelope with the profile's parkourSafetyMargin offers no jump, offer
-   * the ZERO-margin one — the frame-perfect jump a practised player makes —
-   * at a cost premium (moveGen.ts TIGHT_COST), so the search buys it only
-   * where nothing comfortable gets through. Optional for older configs.
-   */
+  /** Offer zero-margin jumps at a cost premium when the normal envelope has no jump.
+   * Default true; requires allowParkourExtended. */
   allowParkourTight?: boolean
-  /**
-   * Improvement (opt-in, needs allowParkourExtended): where the search FAILS,
-   * look for physics-verified hops out of its reach (hopOracle.ts) — jumps the
-   * table cannot express, flown in the exact kernel against the exact
-   * collision boxes — and stitch them into the path. Routes the table plans
-   * are untouched. Optional for older serialized configs.
-   */
+  /** Use physics-verified hops beyond the table's reach when search fails.
+   * Default false; requires allowParkourExtended. */
   allowParkourPhysics?: boolean
 }
 
 /** Per-state dig auxiliaries (only consulted when a block is unsafe). */
 export const DigFlags = {
-  /** gravityBlocks type (sand/gravel) — blocks below it can't be mined
-   * under dontMineUnderFallingBlock. */
+  /** Falling blocks such as sand or gravel prevent mining below them when dontMineUnderFallingBlock is enabled. */
   CAN_FALL: 1,
   /** blocksCantBreak type (non-diggable + chest by default). */
   CANT_BREAK: 2
 } as const
 
-/**
- * Per-state dig tables, computed from the bot's CURRENT inventory/effects
- * (upstream re-evaluates bestHarvestTool per probe — same numbers, computed
- * once per solve instead of millions of times).
- */
+/** Per-state dig tables computed once per solve from the bot's current inventory and effects. */
 export interface DigData {
   fingerprint: string
-  /** labor[stateId] = 1 + 3 * digTime(bestTool) / 1000 — multiplied by
-   * movements.digCost at move-generation time (upstream formula). */
+  /** labor[stateId] = 1 + 3 * digTime(bestTool) / 1000;
+   * move generation multiplies it by movements.digCost. */
   labor: Float32Array
   /** DigFlags byte per stateId. */
   flags: Uint8Array
@@ -233,43 +150,32 @@ export interface RawPathNode {
   useOne: { x: number, y: number, z: number } | null
   /** Blocks to dig before entering this node (canDig solves only). */
   toBreak?: Array<{ x: number, y: number, z: number }>
-  /**
-   * Two-stage moves (allowParkourExtended). Slime bounce: drop onto the
-   * slime STAND cell `via`, let the rebound carry the body up, land at this
-   * node. Momentum chain (`chain`): jump onto the stepping stone `via` and
-   * re-jump on the landing tick to reach this node. Absent otherwise.
-   */
+  /** Intermediate stand cell for a two-stage move when allowParkourExtended is enabled.
+   * Slime moves rebound here; chain moves jump again on the landing tick. */
   via?: { x: number, y: number, z: number }
   chain?: boolean
-  /** Parkour jump the standing (creep-to-the-lip) reach cannot fly: the executor lines up a run. */
+  /** Jump requiring a run-up because standing reach is insufficient. */
   run?: boolean
-  /** Parkour jump flown on an AIMED line (moveGen.ts META_AIM): bits 0-6 the
-   * 1-based parkourTable.ts AIM_VARIANTS index, bit 7 set when the table's
-   * side is mirrored in world space. Take-off and landing points sit beside
-   * their cell centres by the variant's offsets. */
+  /** Aimed flight: bits 0-6 hold the 1-based AIM_VARIANTS index; bit 7 mirrors
+   * the variant in world space. Variant offsets shift takeoff and landing from cell centres. */
   aim?: number
-  /**
-   * Physics-verified hop (allowParkourPhysics, hopOracle.ts): the control
-   * program that lands this node, flown by the executor tick for tick from
-   * rest at its start point on the previous node's support.
-   */
+  /** Physics-verified control program replayed tick for tick from rest on the
+   * previous node's support. Requires allowParkourPhysics. */
   program?: import('./hopOracle.js').HopProgram
 }
 
 export interface SolveResult {
   status: SolveStatus
   cost: number
-  /** Milliseconds of think time for this compute (parity with upstream `time`). */
+  /** Solver computation time in milliseconds. */
   time: number
   visitedNodes: number
   generatedNodes: number
   path: RawPathNode[]
   /** Packed (cx & 0xffff) | (cz << 16) chunk keys the search expanded into. */
   touchedChunks: number[]
-  /**
-   * True when the search pruned nodes at the snapshot boundary — the host
-   * should retry with a larger snapshot before trusting a noPath.
-   */
+  /** True when search prunes nodes at the snapshot boundary; retry with a
+   * larger snapshot before treating noPath as definitive. */
   boundaryLimited: boolean
 }
 
@@ -278,7 +184,7 @@ export interface GoalDescriptor {
   [key: string]: unknown
 }
 
-/** Minimal node shape our goals read — upstream passes Move (a Vec3 subclass). */
+/** Minimal position shape consumed by goals. */
 export interface XYZ {
   x: number
   y: number
@@ -286,75 +192,58 @@ export interface XYZ {
 }
 
 export interface PathfinderOptions {
-  /**
-   * Run the A* solver in a worker_thread (default true). Falls back to
-   * main-thread tick-sliced solving (upstream-identical scheduling) when
-   * worker startup fails or the goal isn't serializable (custom goal class).
-   */
+  /** Run A* in a worker thread (default true). Falls back to tick-sliced solving
+   * on the main thread if worker startup fails or a custom goal cannot be serialized. */
   useWorkerThreads?: boolean
-  /**
-   * The solver core the worker runs (default 'wasm'): the Rust core, or the
-   * JavaScript reference implementation it is pinned bit-identical to. Both
-   * run the physics-hop pipeline; only the search's speed differs. Ignored
-   * on the main thread, which is always the JavaScript core.
-   */
+  /** Worker solver core: Rust ('wasm', default) or the equivalent JavaScript implementation.
+   * Both support physics hops; main-thread solves always use JavaScript. */
   core?: 'wasm' | 'js'
   /** Override the worker entry file (tests / exotic bundlers). */
   workerEntryPath?: string
   /** Hard cap on snapshot cells before giving up growth (memory bound). */
   maxSnapshotCells?: number
-  /**
-   * Nudge prismarine-physics' player dimensions off their exact block
-   * boundaries (0.3/1.8 → 0.30001/1.80001) on inject. Default TRUE.
-   *
-   * On 1.21.x a body resting exactly on a boundary makes the SERVER's
-   * collision sweep compute exactly 1.0, call the move blocked, and teleport
-   * the client back — silently, every tick, for as long as the bot keeps
-   * producing that position. It is a physics bug, but it presents as a
-   * pathfinder that cannot climb a one-block step. See the measurements at
-   * the injection site. Turn it off if the application already applies the
-   * same nudge (harmless either way — it is guarded on the stock values).
-   */
+  /** Nudge stock player dimensions from 0.3/1.8 to 0.30001/1.80001 on injection
+   * to avoid exact-boundary collision rounding and server corrections on 1.21.x. Default true. */
   hitboxPrecisionFix?: boolean
-  /**
-   * Injectable movement-simulation backend (tests). Defaults to the
-   * prismarine-physics-driven PhysicsSim, exactly like upstream.
-   */
+  /** Injectable movement simulator, defaulting to the prismarine-physics-backed PhysicsSim. */
   physicsFactory?: (bot: unknown) => PhysicsLike
-  /**
-   * Called on every terminal no-path solve (after growth retries) with the
-   * exact snapshot the solver saw — the capture side of the offline replay
-   * loop for "the bot says No path in a room it should cross". The dump's
-   * shape matches the upstream-mode PF_DUMP_SNAPSHOTS corpus lines.
-   */
+  /** Called after growth retries on a terminal no-path solve with the exact solver snapshot. */
   onNoPath?: (dump: NoPathDump) => void
+  /** Where warnings go (default console). The worker thread's own rare warnings still use console. */
+  logger?: PathfinderLogger
+}
+
+export interface PathfinderLogger {
+  warn: (message: string) => void
 }
 
 /** Per-call options for `bot.pathfinder.goto(goal, options)`. */
 export interface GotoOptions {
-  /**
-   * Walk to the closest reachable cell instead of rejecting when the goal
-   * itself cannot be reached, and resolve there.
-   *
-   * The search already computes this: a noPath result carries the path to
-   * bestIdx, the closest node the search reached. Default `false` keeps the
-   * upstream contract (a NoPath error), because callers that route around an
-   * unreachable target must not silently get a partial walk.
-   *
-   * Turn it on where "as close as you can get" is the actual intent — reaching
-   * a block over broken ground, climbing as far up a canopy as walking allows —
-   * so the caller stops re-deriving by hand what the solver already knows.
-   */
+  /** Resolve at the closest reachable cell when the goal is unreachable.
+   * Default false rejects with NoPath, so callers do not silently accept a partial walk. */
   bestEffort?: boolean
-  /**
-   * Best-effort legs to walk before resolving where we stand (default 3).
-   * Each leg is one noPath solve whose partial path the bot walks out; the cap
-   * bounds the case where the closest node keeps moving and never converges.
-   */
+  /** Maximum partial-path legs before best-effort walking resolves. Default 3;
+   * the cap prevents endless retries when the closest reachable node keeps changing. */
   maxBestEffortLegs?: number
+  /** Cancel the goal. `goto` rejects with the signal's reason and the bot stops. */
+  signal?: AbortSignal
 }
 
-/** Payload of PathfinderOptions.onNoPath — serializable solver inputs. */
+/** Options for `bot.pathfinder.computePath(goal, options)`. */
+export interface ComputePathOptions {
+  /** Where the path starts (default: the bot's position). */
+  from?: Vec3
+  /** The profile to plan with (default: the current one). */
+  movements?: import('./movements.js').Movements
+  /** Search budget in ms (default: thinkTimeout). */
+  timeout?: number
+  /** Extra cost allowed past the heuristic (default: searchRadius). */
+  searchRadius?: number
+  /** Cancel the search. The promise rejects with the signal's reason. */
+  signal?: AbortSignal
+}
+
+/** Serializable solver inputs passed to PathfinderOptions.onNoPath. */
 export interface NoPathDump {
   meta: SnapshotMeta
   flags: Uint8Array
@@ -375,116 +264,108 @@ export interface PhysicsLike {
   canSprintJump (path: XYZ[], jumpAfter?: number): boolean
   canWalkJump (path: XYZ[], jumpAfter?: number): boolean
   canStraightLineBetween (n1: Vec3, n2: Vec3): boolean
-  /** Pressed into a face with no headway — the wedge the server refuses. */
+  /** Detect a body pressed against a face without making progress. */
   isGrinding (path: XYZ[], ticks?: number): boolean
-  /** Is there ground behind to step back onto? */
+  /** Check for safe ground behind the body. */
   canBackOff (ticks?: number): boolean
-  /** Would this control combination actually move the body, safely? */
+  /** Check whether the given controls move the body safely. */
   canNudge (control: { forward?: boolean, back?: boolean, left?: boolean, right?: boolean, jump?: boolean, sneak?: boolean }, ticks?: number): boolean
-  /** Optional: these keys a tick (null: the controls as set), then a coast to rest - still on what carries it (physics.ts holdsOn)? */
+  /** Check whether holding the keys, then coasting to rest, stays supported; null uses current controls. */
   holdsOn? (keys: { forward?: boolean, back?: boolean, sneak?: boolean } | null, ticks?: number, keyTicks?: number, maxDrop?: number): boolean
   /** A take-off heading offset that lands this jump, or null. */
   bestHeading (path: XYZ[], jump: boolean, sprint: boolean): number | null
-  /** A heading offset that WALKS a flat step round a clipped corner, or null. */
+  /** Heading offset for walking around a clipped corner, or null. */
   bestWalkHeading (path: XYZ[], sprint: boolean): number | null
-  /** Does hopping while sprinting get further down this path, safely? */
+  /** Check whether sprint-hopping makes more progress safely than running. */
   sprintHopBetter (path: XYZ[], lowCeilingHop?: boolean, horizon?: number): boolean
-  /** Optional: does the kernel walk from the body, as it stands, to `node` (physics.ts walksTo)? */
+  /** Check whether the kernel can walk from the current body state to the node. */
   walksTo? (node: XYZ): boolean
-  /** Optional: the tick from the exact kernel (physics.ts gaitDrive, allowHopIntoJump). */
+  /** Choose this tick's movement with the physics kernel when allowHopIntoJump is enabled. */
   gaitDrive? (path: ReadonlyArray<XYZ & { parkour?: boolean }>): GaitDrive
-  /**
-   * Optional: what to hold this tick of a flight so it comes down on the
-   * node (null = the default forward + sprint). A physics without it flies
-   * every jump with forward held, as upstream does.
-   */
+  /** Choose flight controls for landing on the node; null uses forward and sprint.
+   * Without this method, jumps hold forward throughout. */
   airControl? (node: XYZ, engaged: boolean): { control: { forward: boolean, back: boolean, sprint: boolean } | null, engaged: boolean }
-  /**
-   * Optional: search for a scripted jump from the body's state now to the
-   * node (physics.ts JumpScript) — up to `budget` candidates per call;
-   * undefined while searching, null when nothing lands.
-   */
+  /** Search up to budget scripted jumps from the current body state per call.
+   * Returns undefined while searching or null when no candidate lands. */
   solveJump? (node: XYZ, budget: number): {
     yawA: number, yawB: number, turnTick: number, sprint: boolean, jumpAfter: number, ticks: number
     track: Array<{ x: number, y: number, z: number }>, miss: number
   } | null | undefined
-  /** Why the last sprintHopBetter said no ('' = yes). Trace diagnostics. */
+  /** Reason sprintHopBetter refuses a hop; empty string means it accepts. */
   hopRefusal?: string
-  /** Optional: the kernel's shape tables (physics.ts setShapeTables). */
+  /** Provide the kernel with block shape tables. */
   setShapeTables? (lut: import('./lut.js').BlockLut): void
-  /** Optional: the movement-speed attribute without sprinting (the worker kernel's speed). */
+  /** Movement-speed attribute without sprinting, used by the worker kernel. */
   walkSpeed? (): number
-  /** Optional: a live control program to this planner node from the body as it is (physics.ts hopFrom). */
+  /** Find a control program from the current body state to a planner node. */
   hopFrom? (cell: readonly [number, number, number], budgetTicks: number, land?: { x: number, y: number, z: number }, next?: readonly [number, number, number], beam?: boolean,
     seed?: ReadonlyArray<'kick' | 'pivot'>, seedFirst?: boolean): import('./hopOracle.js').HopProgram | null
-  /** Optional: a live program straight past the gait's stood node to the one a planned program leaves for (physics.ts skipAhead, plugin.ts SKIP_AHEAD). */
+  /** Find a live program past the gait's standing node to the next planned program's departure node. */
   skipAhead? (path: ReadonlyArray<XYZ & { parkour?: boolean }>, drive: GaitDrive): { program: import('./hopOracle.js').HopProgram, cut: number } | null
-  /** Did the last skipAhead() fly a search? */
+  /** Whether skipAhead uses search on its latest call. */
   skipSearched?: boolean
-  /** Skip-ahead at a neo (plugin.ts SKIP_NEO): a live program past neo path[0] to path[1], against its own program's `t0` ticks. */
+  /** Find a live program past a pillar-dodging jump at path[0] to path[1], using t0 as the comparison budget. */
   skipNeo? (path: ReadonlyArray<XYZ & { parkour?: boolean }>, t0: number, rest: boolean): { program: import('./hopOracle.js').HopProgram, cut: number } | null
-  /** Optional: had the last hopLinedUp no stand to fly from or to (physics.ts linedVerdict)? */
+  /** Whether the last hopLinedUp call lacks a supported departure or landing point. */
   hopNoStand?: boolean
-  /** Optional: a live program onto a stone the plan goes straight on from, picked for the leg after it (physics.ts hopChain, plugin.ts CHAIN_KERNEL). */
+  /** Find a live program onto an intermediate support, chosen for the following jump. */
   hopChain? (cell: readonly [number, number, number], next: readonly [number, number, number], budgetTicks: number, nextGo?: boolean): import('./hopOracle.js').HopProgram | null
-  /** Optional: the lined-up verdict on node `to` from node `from` before the body is there (physics.ts hopFromCell, plugin.ts NEO_AHEAD). */
+  /** Check a lined-up jump from one node to another before the body arrives. */
   hopFromCell? (from: readonly [number, number, number], to: readonly [number, number, number], budgetTicks: number, beam?: boolean): import('./hopOracle.js').HopProgram | null
-  /** Optional: the cell the last lined verdict was flown from (physics.ts linedVerdict). */
+  /** Departure cell used by the last lined-up jump check. */
   linedFrom?: readonly [number, number, number] | null
-  /** Skip-ahead over walk nodes (plugin.ts SKIP_WALK): a live program past walked path[0..c-1] to the first jump, against the gait's own way there. */
+  /** Find a live program past walking nodes to the first jump, compared with the gait's approach. */
   skipWalk? (path: ReadonlyArray<XYZ & { parkour?: boolean }>, allowed: (m: XYZ) => boolean): { program: import('./hopOracle.js').HopProgram, cut: number } | null
-  /** On the ground, nothing under the box: the latched tick (HopProgram.jumpOnLeave); null without a kernel. */
+  /** Whether onGround remains set after the body leaves support; null without a kernel. */
   latchedNow? (): boolean | null
-  /** Optional: a control program to this planner node from rest at a stand point of the body's node (physics.ts hopLinedUp). */
+  /** Find a program from rest at a supported point in the body's current node. */
   hopLinedUp? (cell: readonly [number, number, number], budgetTicks: number): import('./hopOracle.js').HopProgram | null
-  /** A short ground retreat, then one jump, from a flush rest (PhysicsSim.hopPrefix, PF_LIVE_PREFIX). */
+  /** Find a short ground retreat followed by one jump from rest flush against an obstacle. */
   hopPrefix? (cell: readonly [number, number, number], land?: { x: number, y: number, z: number }, hint?: import('./hopOracle.js').HopProgram): import('./hopOracle.js').HopProgram | null
-  /** Optional: a planned program re-anchored at the body as it is, if it still lands (physics.ts hopAnchored). */
+  /** Re-anchor a planned program at the current body state if it still lands. */
   hopAnchored? (cell: readonly [number, number, number], prog: import('./hopOracle.js').HopProgram): import('./hopOracle.js').HopProgram | null
-  /** Optional: does the bot's physics keep the faster rise on a jump (vanilla; physics.ts probeVanillaJump)? Sets the kernel's rule. */
+  /** Detect whether the bot's physics preserves the faster vanilla jump rise and set the kernel rule. */
   probeVanillaJump? (): boolean
-  /** Optional: a deep bounce's live check - does the rest of it arrive, does its abort land in the pool (physics.ts deepVerdict)? */
+  /** Check whether a deep bounce still reaches its target and whether aborting lands in the pool. */
   deepVerdict? (prog: import('./hopOracle.js').HopProgram, t: number, fired: boolean, air: number, rebounds: number): { arrives: boolean, abortable: boolean } | null
-  /** mcc-7-2's moving line-up spends its attempt only at a safe, near glide end (moving.tried); delay precedes the presses. */
+  /** Moving line-up attempts start only near a safe glide end; moving.tried
+   * records the attempt, and delay precedes the control presses. */
   hopLineUp? (prog: import('./hopOracle.js').HopProgram, budgetTicks: number, moving?: { reach: number, tried: boolean }): { yaws: number[], delay?: number, prog: import('./hopOracle.js').HopProgram } | null
-  /** Why the last hopFrom / hopLinedUp came out as it did. Trace diagnostics. */
+  /** Diagnostic reason for the latest hopFrom or hopLinedUp result. */
   hopNote?: string
-  /** Did the last hopLinedUp fly every family's programs and land none (a verdict, not a timeout)? */
+  /** True when hopLinedUp exhausts every program family without landing, rather than timing out. */
   hopExhausted?: boolean
-  /** Optional: the hop the last gait decision chose, as the kernel flew it (a yaw a tick); the executor replays it. */
-  /** The node the executor retired last, for the gait's landing retirement (GaitGoal.from). */
+  /** Last retired node, used to recognize landings in gait decisions. */
   gaitFrom?: { x: number, z: number } | null
-  /** The server counts the whole fall (fallDamage.ts). */
+  /** Whether the server counts the whole fall for fall damage. */
   wholeFall?: boolean
-  /** Fly and run the gait with the 45° strafe (Movements.allowStrafe). */
+  /** Touchdown damage live hop searches refuse. */
+  fallVeto?: number
+  /** Enable the 45-degree strafe gait when Movements.allowStrafe is set. */
   gaitStrafe?: boolean
-  /** The executor retires a parkour node the body came down past (Movements.allowLandingRetire). */
+  /** Retire parkour nodes passed during landing when Movements.allowLandingRetire is set. */
   gaitLandRetire?: boolean
 }
 
-/**
- * The tick the exact kernel decided (physics.ts gaitDrive): a jump now, flown
- * as `flight` says (a look a tick, take-off to touchdown; `strafe`: the
- * strafe key held after the take-off's tick); a tick on the ground (look
- * `yaw`, sprint and strafe as given); or none — the kernel has no schedule
- * from here.
- */
+/** Kernel decision for this tick: replay flight headings for a hop, use yaw,
+ * sprint and strafe for a run, or return none when no schedule is available.
+ * For hops, strafe starts after the takeoff tick. */
 export interface GaitDrive {
   kind: 'hop' | 'run' | 'none'
   flight: number[] | null
   strafe: boolean
-  /** The tick of the flight from which forward and the strafe key are let go (gaitSearch.ts EASE_NEVER: held throughout). */
+  /** Flight tick at which forward and strafe are released; EASE_NEVER holds them throughout. */
   ease: number
   yaw: number
   sprint: boolean
-  /** The kernel's ticks to the window's goal (the better of its hop and run schedules; Infinity: none). */
+  /** Kernel ticks to the window's goal using the faster hop or run schedule; Infinity if neither reaches it. */
   ticks?: number
-  /** The path index of the node the window stopped short of, a program (or chain, via, neo) leaving from the one before it; -1 when not cut so. */
+  /** Path index where the window stops before a programmed jump from the preceding node; -1 if uncut. */
   cut?: number
-  /** The window's goal as the search ended it (an index into the path) and whether it was a stop there (GaitResult.goal). */
+  /** Path index of the window's goal; goalLast indicates whether the schedule stops there. */
   goal?: number
   goalLast?: boolean
-  /** Kernel ticks the search flew. */
+  /** Number of kernel ticks simulated during the search. */
   work?: number
 }
 

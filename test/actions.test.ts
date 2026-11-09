@@ -8,7 +8,9 @@ import { ActionErrors, DEFAULT_ACTION_CONFIG } from '../src/actions/types.js'
 import type { ActionConfig, ActionTable } from '../src/actions/types.js'
 import type { ActionContext } from '../src/actions/context.js'
 import { Pacer } from '../src/actions/pacing.js'
-import { reachToCell, eyePos, faceId, FACE_VECTORS } from '../src/actions/reach.js'
+import { reachToCell, eyePos, faceId, FACE_VECTORS, toVec3 } from '../src/actions/reach.js'
+import { placedFrom } from '../src/actions/place.js'
+import { mcData } from './helpers/voxelWorld.js'
 import { makeActionBot, setItems } from './helpers/actionBot.js'
 import type { ActionBot } from './helpers/actionBot.js'
 
@@ -180,6 +182,27 @@ describe('actions: dig', () => {
 
   // The dig promise resolving is not evidence the block broke: mineflayer
   // resolves on its own timer. The world is the only authority.
+  // Mineflayer writes air itself the moment it sends the finish packet. A server that refuses
+  // the break sends the block back a round trip later.
+  it('reports a break the server refuses, though the world showed air at first', async () => {
+    const r = rig()
+    const target = new Vec3(2, 64, 0)
+    r.bot.set(target, 'stone')
+    const dig = r.bot.dig
+    r.bot.dig = async (...args: unknown[]) => {
+      await (dig as (...a: unknown[]) => Promise<void>)(...args)
+      setTimeout(() => r.bot.set(target, 'stone'), 0)
+    }
+
+    const err = await failure(r.actions.dig(r.bot.blockAt(target) as never, { retries: 1, pacing: 'none' }))
+    expect(err.name).to.equal(ActionErrors.DIG_FAILED)
+    expect(err.message).to.contain('still there')
+  })
+
+  it('reads a block from another copy of vec3 by its shape', () => {
+    expect(toVec3({ position: { x: 1.5, y: 2, z: -3.2 } } as never)).to.deep.equal(new Vec3(1, 2, -4))
+  })
+
   it('fails when the dig resolves but the block is still standing', async () => {
     const r = rig()
     const target = new Vec3(2, 64, 0)
@@ -302,8 +325,7 @@ describe('actions: place', () => {
   })
 
   // Right-clicking a chest with a block in hand opens it. Vanilla's answer is
-  // to sneak, and so is ours — without it a shulker station on a hopper is
-  // simply unplaceable.
+  // to sneak, and so is ours: without it nothing can be placed on a container.
   it('sneaks when the reference block is one that would open instead', async () => {
     const r = floorRig()
     const target = new Vec3(2, 64, 0)
@@ -396,23 +418,65 @@ describe('actions: place', () => {
     expect(r.bot.places[0].face).to.deep.equal(new Vec3(0, 0, -1))
   })
 
-  it('gives up when every face would leave the block sealed', async () => {
+  it('gives up when every face would leave a shulker box sealed', async () => {
     const r = floorRig()
     const target = new Vec3(2, 64, 0)
+    setItems(r.bot, ['red_shulker_box'])
     for (const f of FACE_VECTORS) r.bot.set(target.plus(f), 'stone')
 
-    const err = await failure(r.actions.place(target, { item: 'stone', retries: 1 }))
+    const err = await failure(r.actions.place(target, { item: 'red_shulker_box', retries: 1 }))
     expect(err.name).to.equal(ActionErrors.PLACE_FAILED)
     expect(err.message).to.contain('No supporting face')
   })
 
-  it('can be told not to care about the opening', async () => {
+  it('does not care about the opening for an ordinary block', async () => {
     const r = floorRig()
     const target = new Vec3(2, 64, 0)
     r.bot.set(new Vec3(2, 65, 0), 'stone') // sealed from above
 
-    await r.actions.place(target, { item: 'stone', requireOpenable: false })
+    await r.actions.place(target, { item: 'stone' })
     expect(r.bot.places[0].ref).to.deep.equal(new Vec3(2, 63, 0))
+  })
+
+  it('can be told to care about the opening for any block', async () => {
+    const r = floorRig()
+    const target = new Vec3(2, 64, 0)
+    r.bot.set(new Vec3(2, 65, 0), 'stone') // sealed from above
+    r.bot.set(new Vec3(2, 64, 1), 'stone')
+
+    await r.actions.place(target, { item: 'stone', requireOpenable: true })
+    expect(r.bot.places[0].ref).to.deep.equal(new Vec3(2, 64, 1))
+  })
+
+  it('knows which block an item makes when the names differ', () => {
+    const bot = { registry: mcData } as never
+    const item = (n: string): { type: number, name: string } => ({ type: mcData.itemsByName[n].id, name: n })
+    const block = (n: string): { type: number, name: string } => ({ type: mcData.blocksByName[n].id, name: n })
+    expect(placedFrom(bot, block('wall_torch'), item('torch'))).to.equal(true)
+    expect(placedFrom(bot, block('redstone_wire'), item('redstone'))).to.equal(true)
+    expect(placedFrom(bot, block('tripwire'), item('string'))).to.equal(true)
+    expect(placedFrom(bot, block('oak_wall_sign'), item('oak_sign'))).to.equal(true)
+    expect(placedFrom(bot, block('carrots'), item('carrot'))).to.equal(true)
+    expect(placedFrom(bot, block('wheat'), item('wheat_seeds'))).to.equal(true)
+    expect(placedFrom(bot, block('stone'), item('stone'))).to.equal(true)
+    // Stone drops cobblestone, but it is not what placing cobblestone makes.
+    expect(placedFrom(bot, block('stone'), item('cobblestone'))).to.equal(false)
+    expect(placedFrom(bot, block('dirt'), item('torch'))).to.equal(false)
+  })
+
+  it('prefers a support it can see over an earlier one it cannot', async () => {
+    const r = floorRig()
+    const target = new Vec3(2, 64, 0)
+    r.bot.set(new Vec3(2, 64, 1), 'stone')
+    const floor = new Vec3(2, 63, 0)
+    const wall = new Vec3(2, 64, 1)
+    // The floor's face is hidden from the eye, the wall's is not. From the eye at y 65.62 the ray to the
+    // floor's top face points about 0.64 down, the ray to the wall's face about 0.47.
+    r.bot.world.raycast = (_from, dir) => ({ position: dir.y < -0.55 ? new Vec3(1, 64, 0) : wall, face: 2 })
+
+    await r.actions.place(target, { item: 'stone' })
+    expect(r.bot.places[0].ref).to.deep.equal(wall)
+    expect(r.bot.places[0].ref).to.not.deep.equal(floor)
   })
 })
 
@@ -526,6 +590,17 @@ describe('actions: open', () => {
 
     await r.actions.open(r.bot.blockAt(target) as never)
     expect(r.approaches).to.have.length(1)
+  })
+
+  it('never walks with approach: false, not even to retry', async () => {
+    const r = rig()
+    const target = new Vec3(2, 64, 0)
+    r.bot.set(target, 'chest')
+    r.bot.openSilent = true
+
+    const err = await failure(r.actions.open(r.bot.blockAt(target) as never, { windowTimeout: 30, approach: false }))
+    expect(err.name).to.equal(ActionErrors.OPEN_FAILED)
+    expect(r.approaches).to.have.length(0)
   })
 })
 

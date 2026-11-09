@@ -1,7 +1,4 @@
-// Shared shapes for the world-interaction layer (dig / place / open /
-// activate). These are deliberately structural rather than importing
-// mineflayer's own types: the executor already treats `bot` structurally, the
-// package only peer-depends on mineflayer, and tests drive a fake bot.
+// Structural types keep interactions independent of mineflayer's concrete bot types.
 import type { Vec3 } from 'vec3'
 
 /** The subset of prismarine-block this layer touches. */
@@ -12,11 +9,12 @@ export interface BlockLike {
   position: Vec3
   boundingBox?: string
   shapes?: number[][]
-  digTime?: (...args: unknown[]) => number
+  // Method syntax, so that prismarine-block's typed digTime is accepted.
+  digTime? (...args: unknown[]): number
   getProperties?: () => Record<string, unknown>
 }
 
-/** Anything a caller may hand a convenience method as "the block over there". */
+/** A live block or block position accepted by interaction methods. */
 export type BlockTarget = BlockLike | Vec3 | { x: number, y: number, z: number }
 
 /** Window as returned by mineflayer's `openBlock` (already `extendWindow`'d). */
@@ -28,15 +26,11 @@ export interface WindowLike {
   close?: () => void
 }
 
-/**
- * Error names thrown by this layer. Stable strings, matched the way the
- * upstream `NoPath` / `Timeout` / `GoalChanged` / `PathStopped` names are —
- * consumers string-match, so treat these as API.
- */
+/** Stable error names for callers to match across interaction failures. */
 export const ActionErrors = {
   /** The block is not within vanilla interaction range from where the bot is. */
   OUT_OF_REACH: 'OutOfReach',
-  /** No line of sight to any face — something is between the eye and the block. */
+  /** No line of sight to any face; a block occludes the target. */
   OCCLUDED: 'Occluded',
   /** The target cell holds nothing / no longer holds what the caller named. */
   NO_TARGET: 'NoTarget',
@@ -58,8 +52,7 @@ export type ActionErrorName = typeof ActionErrors[keyof typeof ActionErrors]
 /** Error carrying a stable `name` plus the target it refers to. */
 export class ActionError extends Error {
   readonly target?: Vec3
-  /** Set when the action stopped short rather than failing outright — the
-   *  caller may reposition and try again without anything being wrong. */
+  /** Refused before acting; the caller may reposition and retry. */
   readonly refused: boolean
 
   constructor (name: ActionErrorName, message: string, target?: Vec3, refused = false) {
@@ -78,11 +71,7 @@ export interface BaseActionOptions {
   timeout?: number
   /** Cancel mid-flight. */
   signal?: AbortSignal
-  /**
-   * Walk to a spot the action can be performed from when the target is out of
-   * range (default true). With `false` the action throws `OutOfReach` instead
-   * of touching the goal — the right choice inside a caller that owns the goal.
-   */
+  /** Approach out-of-range targets (default true); false preserves the caller's goal and throws OutOfReach. */
   approach?: boolean
   /** Reach used for the approach goal and the range gate (default 4.5). */
   reach?: number
@@ -91,44 +80,25 @@ export interface BaseActionOptions {
 export interface DigOptions extends BaseActionOptions {
   /** Equip the fastest harvest tool first (default true). */
   equipTool?: boolean
-  /**
-   * Aim at the face the raycast actually reports. With `false` the face is
-   * derived geometrically, which the server rejects unless the bot is nearly
-   * point-blank — only useful when digging out of an enclosure (default true).
-   */
+  /** Use the raycast face (default true); false uses geometry, accepted only at very close range. */
   requireCursor?: boolean
-  /**
-   * Allow the geometric fallback above when point-blank. This is how a buried
-   * bot digs itself out, and why `digOutIfBuried` works at all (default false).
-   */
+  /** Allow geometric fallback at very close range, for escape from an enclosure (default false). */
   allowGeometric?: boolean
   /** Refuse to swing while airborne or sliding (default true). */
   requireGrounded?: boolean
-  /** Pacing profile — see `pacing.ts` (default from the action config). */
+  /** Pacing profile (default from the action config). */
   pacing?: PacingProfile
 }
 
 export interface PlaceOptions extends BaseActionOptions {
   /** Item to place. A name, an item id, or an inventory item object. */
   item?: string | number | { type: number, name?: string }
-  /**
-   * Faces to try placing against, best first. Defaults to "support below,
-   * then the four sides, then hung from above" — the order that keeps a
-   * shulker box openable.
-   */
+  /** Supporting faces, best first: below, four sides, then above; below keeps shulker boxes openable. */
   faces?: Vec3[]
-  /**
-   * Sneak while clicking so an interactable reference block (chest, hopper,
-   * barrel, crafting table) is placed against rather than opened. Default
-   * true, and it is what makes placing onto a container station work at all.
-   */
+  /** Sneak while clicking an interactable reference block to place against it (default true). */
   sneak?: boolean
-  /**
-   * Refuse any supporting face whose opposite side is obstructed (default
-   * true). This is what keeps a placed shulker box openable: a shulker opens
-   * along the face it was placed against, and one whose opening is sealed by
-   * another block can never be opened again.
-   */
+  /** Reject supports whose opposite side is blocked, so the placed block can open there.
+   * Default: true for shulker boxes, false for everything else. */
   requireOpenable?: boolean
   /** Wait for the body to stop before clicking (default true). */
   requireGrounded?: boolean
@@ -140,37 +110,23 @@ export interface PlaceOptions extends BaseActionOptions {
 export interface OpenOptions extends BaseActionOptions {
   /** ms to wait for `windowOpen` per attempt (default 3000). */
   windowTimeout?: number
-  /**
-   * Close an already-open window first (default true). A stale window makes
-   * the server drop the next open silently.
-   */
+  /** Close an existing window first so it cannot cause a silent open rejection (default true). */
   closeStale?: boolean
-  /**
-   * Reuse `bot.currentWindow` when it is already the window for this block
-   * (default true).
-   */
+  /** Reuse currentWindow when it belongs to this block (default true). */
   reuse?: boolean
 }
 
 export interface ActivateOptions extends BaseActionOptions {
-  /** Sneak while clicking (default false — activating IS the point here). */
+  /** Sneak while clicking (default false). */
   sneak?: boolean
-  /**
-   * Aim at the block and wait for the rotation to reach the server before
-   * clicking (default true). The path executor opens doors with this off:
-   * it is already facing the door it is walking through, and spending ticks
-   * re-aiming mid-path is how a door becomes a stall.
-   */
+  /** Wait for rotation before clicking (default true); the path executor skips this when already facing a door. */
   settle?: boolean
 }
 
 /** How aggressively breaks and placements are spaced out. */
 export type PacingProfile = 'none' | 'default' | 'drill'
 
-/**
- * Tunables for the built-in actions. Reachable and mutable at runtime via
- * `bot.pathfinder.actions.config` — changing a field affects the next action.
- */
+/** Built-in action settings; changes via bot.pathfinder.actions.config affect the next action. */
 export interface ActionConfig {
   /** Vanilla block-interaction range (1.20.5+ survival is 4.5). */
   reach: number
@@ -182,11 +138,7 @@ export interface ActionConfig {
   pacing: PacingProfile
   /** ms to wait for `windowOpen`. */
   windowTimeout: number
-  /**
-   * Refuse to act for this long after a server position correction — a swing
-   * sent from a position the server has already rejected is a wasted packet
-   * at best and a flagged one at worst.
-   */
+  /** Refuse actions for this many ms after a server position correction rejects the interaction position. */
   forcedMoveGrace: number
 }
 
@@ -199,22 +151,17 @@ export const DEFAULT_ACTION_CONFIG: ActionConfig = {
   forcedMoveGrace: 800
 }
 
-/**
- * The overridable interaction table. Every world interaction the pathfinder
- * performs — from the executor's own dig branch to `bot.pathfinder.dig()` —
- * goes through exactly one of these, so replacing one replaces it everywhere.
- *
- * ```js
- * // wrap rather than replace, to keep the built-in guards
- * const inner = bot.pathfinder.actions.dig
- * bot.pathfinder.actions.dig = async (block, opts) => {
- *   console.log('digging', block.name)
- *   return await inner(block, opts)
- * }
- * ```
- */
+/** All pathfinder interactions use this table; replacing an action changes both path execution and direct calls. */
+export type ActionName = 'dig' | 'place' | 'open' | 'activate' | 'equip'
+
 export interface ActionTable {
-  config: ActionConfig
+  /** Change its fields. The actions keep this object, so replacing it would change nothing. */
+  readonly config: ActionConfig
+  /**
+   * Layer over an action while keeping what is under it. `next` is the action as it was.
+   * Returns a function that removes this layer, in any order. Later layers run first.
+   */
+  wrap: <K extends ActionName>(name: K, wrapper: (next: ActionTable[K]) => ActionTable[K]) => () => void
   dig: (block: BlockLike, options?: DigOptions) => Promise<void>
   place: (target: Vec3, options?: PlaceOptions) => Promise<void>
   open: (block: BlockLike, options?: OpenOptions) => Promise<WindowLike>

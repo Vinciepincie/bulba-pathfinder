@@ -6,27 +6,9 @@ import { Vec3 } from 'vec3'
  * head/wall post, flower pot, fence post. */
 export const CATCH_HALF: readonly number[] = [0.5, 0.25, 0.1875, 0.125]
 
-/**
- * How much of the top of this shape set can actually CATCH a landing body.
- *
- * Every face within step height (0.6) of the collision top is projected
- * onto XZ, and the largest centered square inside their UNION gives the
- * class: 0 = full/wide (slabs, stairs, chests — any face a landing can
- * catch and walk up), 1 = the 0.5-wide class (heads, wall posts), 2 = the
- * flower-pot class (0.375 wide), 3 = the fence-post class (0.25 wide) — and
- * anything narrower than that, or a top that does not even hold the body's
- * centre (a ladder's 3/16 edge), which the solver refuses by its CLIMBABLE
- * flag.
- *
- * The union, not each box alone: an upside-down stair is two boxes that TILE
- * its cell, and its top is as flat and as full as a slab's — measured one box
- * at a time it came out a fence post (class 3) and lost a landing the whole
- * top can catch. A fence keeps its class either way: its arms sit half a block
- * under the post, so the union is a cross and the largest centred square in a
- * cross is still the post. The solver plans narrow landings with the reduced
- * per-axis credit (parkourEnvelope.ts) and the executor caps its takeoff
- * creep with it.
- */
+/** Classify landing width from the union of faces within 0.6 blocks of the top.
+ * Classes: 0 full/wide, 1 half-block, 2 flower pot, 3 fence post or narrower.
+ * Union coverage keeps tiled stair boxes full-width; fence arms leave only the post centred. */
 export function topCatchClass (shapes: readonly number[][]): number {
   let top = 0
   for (const s of shapes) {
@@ -38,12 +20,7 @@ export function topCatchClass (shapes: readonly number[][]): number {
   return covers(faces, 0.4) ? 0 : covers(faces, 0.2) ? 1 : covers(faces, 0.15) ? 2 : 3
 }
 
-/**
- * Is the centred square of half-extent `h` fully covered by the faces' XZ
- * projections? Exact for axis-aligned rects: the faces' own edges cut the
- * square into cells that each lie wholly inside a face or wholly outside
- * every one, so testing cell centres decides it.
- */
+/** Test centred-square coverage by face union; rectangle edges partition it into uniform cells. */
 function covers (faces: ReadonlyArray<readonly number[]>, h: number): boolean {
   const lo = 0.5 - h
   const hi = 0.5 + h
@@ -74,26 +51,10 @@ function covers (faces: ReadonlyArray<readonly number[]>, h: number): boolean {
   return true
 }
 
-/**
- * Where a NARROW support carries the body relative to its cell, per side —
- * the direction-dependent half of the catch class above. The class says how
- * wide the top is; it says nothing about where it sits, and the planner's
- * per-axis credits assume the middle. Three spare bits of the LutSpecial byte
- * (CARRY_SHIFT) carry one of seven patterns:
- *
- *   0  centred (or class 0): the class model as it stands — posts, heads,
- *      pots, bars, a lone pane, anything wide.
- *   1–4  an EDGE PANEL: the face is a strip against the cell's W/E/N/S face
- *      (an open trapdoor, a ladder's top). Toward the panel's own side the
- *      body is carried like a full block (0.8 past centre); toward the far
- *      side it must already be past centre (credit 0); along the panel, full.
- *   5, 6  a LINE along x / along z (a pane or fence line with both arms, a
- *      pane row): full along the line, the class across it.
- *
- * Anything else — an L of arms, a single arm — stays 0: the class model,
- * conservative where it is wrong. Only class > 0 supports get a code, so a
- * full block's plans cannot change.
- */
+/** Carry codes describe where a narrow support sits, in three LutSpecial bits.
+ * 0 uses centred class credit; 1-4 have no W/E/N/S credit respectively; 5/6 are X/Z lines.
+ * Panels carry fully toward their edge and along it, with no credit away; lines carry fully along them.
+ * Other footprints keep conservative class credit. Full-width supports always use 0. */
 export const CARRY_SHIFT = 5
 export const CARRY_W_NONE = 1
 export const CARRY_E_NONE = 2
@@ -101,20 +62,14 @@ export const CARRY_N_NONE = 3
 export const CARRY_S_NONE = 4
 export const CARRY_LINE_X = 5
 export const CARRY_LINE_Z = 6
-/**
- * A narrow-TOPPED block whose body is wider than its top (a brewing stand's
- * base plate, a pane with one arm): the class model as a support, exactly as
- * code 0 — and never a thin obstacle a flight may pass beside (moveGen.ts
- * thinClear), which is what telling it apart from 0 is for.
- */
+/** A narrow top with a wider body keeps class credit but cannot be passed as a thin obstacle. */
 export const CARRY_WIDE = 7
 
 export function carryCode (shapes: readonly number[][]): number {
   const cls = shapes.length === 0 ? 0 : topCatchClass(shapes)
   if (cls === 0) return 0
   const code = topCarryCode(shapes)
-  // Every box of the block — not only the ones that make its top — has to
-  // sit inside the footprint the code stands for, or it is CARRY_WIDE.
+  // The entire obstacle must fit the footprint, including boxes below the support face.
   let x0 = 1; let x1 = 0; let z0 = 1; let z1 = 0
   for (const b of shapes) {
     if (b[0] < x0) x0 = b[0]
@@ -129,7 +84,7 @@ export function carryCode (shapes: readonly number[][]): number {
   return x0 >= r[0] - E && x1 <= r[1] + E && z0 >= r[2] - E && z1 <= r[3] + E ? code : CARRY_WIDE
 }
 
-/** Footprint [x0, x1, z0, z1] a carry code 1-6 stands for as an OBSTACLE (a line is a fence's post wide). */
+/** Obstacle footprint [x0, x1, z0, z1] for carry codes 1-6; lines are fence-post wide. */
 export const THIN_FOOTPRINT: ReadonlyArray<readonly [number, number, number, number]> = [
   [0, 1, 0, 1],
   [0.8125, 1, 0, 1],
@@ -152,8 +107,7 @@ function topCarryCode (shapes: readonly number[][]): number {
     if (s[2] < z0) z0 = s[2]
     if (s[5] > z1) z1 = s[5]
   }
-  // per side: 2 = the face reaches this edge, 1 = the face is entirely on
-  // the other side of the centre, 0 = neither (the class model)
+  // Per side: 2 reaches the edge, 1 lies across the centre, 0 keeps class credit.
   const side = (near: number, far: boolean): number => far ? (near >= 0.999 ? 2 : near <= 0.5 ? 1 : 0) : (near <= 0.001 ? 2 : near >= 0.5 ? 1 : 0)
   const w = side(x0, false); const e = side(x1, true); const n = side(z0, false); const s = side(z1, true)
   if (w === 1 && e === 2 && n === 2 && s === 2) return CARRY_W_NONE
@@ -165,34 +119,18 @@ function topCarryCode (shapes: readonly number[][]): number {
   return 0
 }
 
-/**
- * The carry on one side of a support with carry code `code`, for a body
- * moving along signed axis step (dx, dz) — the credit the planner may take
- * toward that side: 2 full (a full block's), 1 none, 0 the class model.
- * `dx`/`dz` is the direction of the side asked about: (+1, 0) is the east
- * side, (0, −1) the north side.
- */
+/** Carry credit toward signed axis (dx, dz): 2 full, 1 none, 0 class-based. */
 export function carrySide (code: number, dx: number, dz: number): number {
   if (code === 0 || code === CARRY_WIDE) return 0
   if (code === CARRY_LINE_X) return dx !== 0 ? 2 : 0
   if (code === CARRY_LINE_Z) return dz !== 0 ? 2 : 0
-  // an edge panel: one side none, the other three full
   const none = code === CARRY_W_NONE ? (dx < 0) : code === CARRY_E_NONE ? (dx > 0) : code === CARRY_N_NONE ? (dz < 0) : (dz > 0)
   return none ? 1 : 2
 }
 
-/**
- * THIN footprint byte of a block (improvement, allowParkourExtended): where
- * its collision boxes sit in the cell, so a parkour flight can pass BESIDE a
- * pane post, a fence arm, an open trapdoor's panel or a door instead of
- * treating the whole cell as solid. Low nibble = the x interval's class, high
- * nibble = the z interval's; 0 = both FULL = an ordinary solid cell (and what
- * every full cube, slab, stair and empty block gets). Interval classes, in
- * sixteenths of a block — the smallest one that CONTAINS the boxes' extent:
- *   0 FULL [0,16]   1 LOW EDGE [0,3]   2 HIGH EDGE [13,16]
- *   3-6 CENTRED, half-width 1/2/3/4   7-10 LOW HALF [0, 8+hw]   11-14 HIGH HALF [8-hw, 16]
- * Self-describing (no table travels with the snapshot): thinInterval decodes.
- */
+/** Packed X/Z obstacle intervals for flights past partial blocks; 0 treats the cell as solid.
+ * Low/high nibbles encode X/Z bounds in sixteenths using the narrowest containing interval.
+ * Classes cover full, edge, centred and half-cell intervals; thinInterval decodes them. */
 const THIN_INTERVALS: ReadonlyArray<readonly [number, number]> = [
   [0, 16], [0, 3], [13, 16],
   [7, 9], [6, 10], [5, 11], [4, 12],
@@ -201,7 +139,6 @@ const THIN_INTERVALS: ReadonlyArray<readonly [number, number]> = [
 ]
 
 function thinClass (lo: number, hi: number): number {
-  // lo/hi in blocks; pick the narrowest listed interval that contains them
   const a = Math.round(lo * 16 * 1000) / 1000
   const b = Math.round(hi * 16 * 1000) / 1000
   let best = 0
@@ -246,13 +183,8 @@ const CARRY_RECT: ReadonlyArray<readonly [number, number, number, number]> = [
 /** How far past a face's edge the hitbox centre is still carried, less a margin. */
 const CARRY_REACH = 0.275
 
-/**
- * Is a walk from a support with carry code `a` to one with code `b` at cell
- * offset (dx, dz) continuous ground — is there a body position both faces
- * carry? Two ledges round the OUTER corner of one wall meet at the corner;
- * the ledges of two walls across an inner corner do not, and the step
- * between them is a hop.
- */
+/** Whether supports at offset (dx, dz) share a body position, allowing continuous walking.
+ * Ledges meet around an outer corner; ledges across an inner corner require a hop. */
 export function carryTouch (a: number, b: number, dx: number, dz: number): boolean {
   const ra = CARRY_RECT[a]
   const rb = CARRY_RECT[b]
@@ -280,14 +212,9 @@ export function getShapeFaceCenters (shapes: number[][], direction: Vec3, half: 
   return faces
 }
 
-/**
- * LID byte (lid model): a FULL-footprint block whose every collision box
- * starts k/16 above its cell floor — a top slab (8), a closed top trapdoor
- * (13), a big dripleaf (11), a hopper or piston (4). Packed in the thin
- * table (no new snapshot array): high nibble 15, which no footprint class
- * uses, low nibble k. 0 for anything else (a partial footprint keeps its
- * footprint byte and counts as reaching its cell floor).
- */
+/** Encode a full-footprint block raised k/16 above its cell floor as a lid byte.
+ * High nibble 15 distinguishes lids from footprints; low nibble stores k.
+ * Partial footprints retain their footprint byte and count as reaching the cell floor. */
 export const LID_TAG = 0xF0
 export function lidByte (shapes: readonly number[][]): number {
   if (shapes.length === 0 || thinFootprint(shapes) !== 0) return 0

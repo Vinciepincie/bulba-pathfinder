@@ -1,7 +1,4 @@
-// Which landings hurt: the server's fall accounting (Entity.checkFallDamage,
-// LivingEntity.calculateFallDamage and the landing block's fallOn), read from
-// the 1.21.11 server. A landing that hurts is one whose speed the server
-// takes away, a velocity packet later — see docs/PhysicsHops.md.
+// A damaging landing removes speed through a later server velocity packet.
 
 import { SIM_SLIME, SIM_CUSHION, SIM_BED } from './playerSim.js'
 
@@ -9,21 +6,33 @@ import { SIM_SLIME, SIM_CUSHION, SIM_BED } from './playerSim.js'
 export const SAFE_FALL = 3
 
 /**
- * Does this landing hurt? `fall`: every tick's descent since the ground was
- * left; `last`: the landing tick's share of it; `kind`: the SIM_* bits of
- * what the feet came down on.
- *
- * From 1.21.5 (`whole`) the whole fall counts and the damage is rounded DOWN,
- * so the first point of it takes a full block past the safe three. Before,
- * the landing tick's descent is never counted and any excess is rounded UP.
+ * The deepest drop a plan may choose with `spare` health to lose. A jump's rise adds up to
+ * 1.25 blocks to the fall, so a chosen drop never costs all of `spare`, and 2 blocks never hurt.
+ */
+export function dropForHealth (spare: number): number {
+  return Math.max(2, SAFE_FALL - 2 + Math.floor(spare))
+}
+
+/** Hop searches reject touchdowns causing this many fall-damage points or more.
+ * Sneaked slime landings take the whole fall, including in deep bounce searches. */
+export const FALL_VETO = 5
+
+/** The hop veto with `spare` health to lose: a touchdown may not cost all of it. */
+export function fallVetoForHealth (spare: number): number {
+  return Math.min(FALL_VETO, Math.max(1, Math.ceil(spare)))
+}
+
+/**
+ * Whether a landing hurts: `fall` sums descent, `last` is its landing-tick share, `kind` holds support flags.
+ * With `whole` (1.21.5+), count the full fall and round down; otherwise exclude `last` and round up.
  */
 export function landingHurts (fall: number, last: number, kind: number, sneaking: boolean, whole: boolean): boolean {
   return fallDamagePoints(fall, last, kind, sneaking, whole) >= 1
 }
 
-/** The damage (health points) of that landing: landingHurts' arithmetic, 0 where it does not hurt. */
+/** Landing damage in health points, using the same fall accounting as landingHurts. */
 export function fallDamagePoints (fall: number, last: number, kind: number, sneaking: boolean, whole: boolean): number {
-  // (slime spares a body that bounces; sneaking is what refuses the bounce)
+  // Sneaking disables the slime bounce and its fall-damage protection.
   if ((kind & SIM_SLIME) !== 0 && !sneaking) return 0
   const reach = (kind & SIM_BED) !== 0 ? 0.5 : 1
   const kept = (kind & SIM_CUSHION) !== 0 ? 0.2 : 1

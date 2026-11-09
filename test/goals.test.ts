@@ -219,20 +219,30 @@ describe('GoalLookAtBlock parity over a shared raycast backend', function () {
     }
     const up = new upstream.GoalLookAtBlock(target.clone(), shim, { reach: 4.5 })
 
+    // One deliberate difference: upstream's range check measures from the stance's feet to a point
+    // 1.6 above the block, and so rejects stances below the block that can see it. Ours measures from
+    // the eye. Everything upstream accepts, ours accepts; ours accepts more only where that check bit.
     const rng = mulberry32(0x100CA7)
     let trues = 0
     let falses = 0
+    let widened = 0
     for (let i = 0; i < 200; i++) {
       const node = new Vec3(randInt(rng, 4, 13), randInt(rng, 1, 5), randInt(rng, 0, 8))
       const at = `node (${node.x},${node.y},${node.z})`
       expect(our.heuristic(node), `heuristic ${at}`).to.equal(up.heuristic(node))
       const ourEnd = our.isEnd(node)
-      expect(ourEnd, `isEnd ${at}`).to.equal(up.isEnd(node))
+      const upEnd = up.isEnd(node)
+      if (ourEnd !== upEnd) {
+        expect(ourEnd, `isEnd ${at}: only ever wider than upstream`).to.equal(true)
+        expect(node.distanceTo(target.offset(0, 1.6, 0)), `isEnd ${at}: upstream's range check`).to.be.greaterThan(4.5)
+        widened++
+      }
       if (ourEnd) trues++
       else falses++
     }
     // The scene must actually exercise both outcomes.
     expect(trues, 'some sampled nodes see a face of the target').to.be.greaterThan(0)
     expect(falses, 'some sampled nodes cannot see the target').to.be.greaterThan(0)
+    expect(widened, 'agrees with upstream on most nodes').to.be.lessThan(40)
   })
 })

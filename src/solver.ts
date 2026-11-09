@@ -1,17 +1,5 @@
-// A* core over the snapshot: node ids are snapshot cell indices, g/parent/
-// state live in reusable epoch-stamped typed arrays (no clearing between
-// solves), the open set is a lazy-delete binary heap. Semantics are an exact
-// port of mineflayer-pathfinder/lib/astar.js: same slicing statuses, same
-// searchRadius cost-slack pruning, same best-node (lowest heuristic)
-// partial-path selection, same tie-break-relevant relaxation rule.
-//
-// Momentum (allowParkourMomentum, docs/VelocityInSearch.md): a node is
-// (cell, momentum). Slots [0, n) are the cells themselves at momentum NONE —
-// the whole search when the flag is off, byte for byte. Momentum-bearing
-// states are SPARSE (they exist only where a parkour landing put one), so
-// they live in a secondary region [n, n + secCount) of the same arrays,
-// found per cell through a small linked list, instead of multiplying every
-// arena by the momentum count.
+// A* stores snapshot cell IDs in reusable epoch-stamped arrays and a lazy-delete heap.
+// Momentum states use sparse secondary slots linked per cell, avoiding a full state grid.
 import { performance } from 'node:perf_hooks'
 import { MinHeap } from './heap.js'
 import { MoveGen, META_PARKOUR, META_USEONE, META_BOUNCE, META_CHAIN, META_RUN, META_AIM, META_DEEP, MOM_NONE } from './moveGen.js'
@@ -53,10 +41,7 @@ function momentumReserve (n: number): number {
   return n >> 3 > 4096 ? n >> 3 : 4096
 }
 
-// ── reusable arenas (grow-only, epoch-stamped so no per-solve clearing) ────
-// A pool rather than a single global: upstream's API allows several live
-// astarContexts at once (an abandoned getPathFromTo generator + the drive
-// loop's own solve), and they must not stomp each other's g/parent tables.
+// Concurrent solvers need separate arrays so live searches cannot overwrite each other.
 class Arena {
   size = 0
   g = new Float64Array(0)
@@ -66,10 +51,7 @@ class Arena {
   closed = new Uint8Array(0)
   epoch = 0
   inUse = false
-  // ── momentum secondary region (allocated on first momentum solve) ──
-  /** Per cell: index of its first secondary entry; valid only when that
-   * entry's secCell reads back the cell (the secondary is rebuilt from 0
-   * every solve, so no epoch stamp is needed). */
+  /** First momentum entry per cell; trust it only when secCell points back to that cell. */
   momHead = new Int32Array(0)
   momHeadSize = 0
   secCell = new Int32Array(0)
@@ -87,9 +69,7 @@ class Arena {
       this.stamp = new Int32Array(cap)
       this.closed = new Uint8Array(cap)
       this.size = cap
-      // Epoch stays MONOTONIC across growth (fresh stamp arrays are zeroed,
-      // so old epochs can't collide) — resetting it would let a finished
-      // solver's stamp guard accept a later solve's tables as its own.
+      // Keep epochs monotonic across growth so finished solvers cannot read a later solve's tables.
     }
     if (momentum && n > this.momHeadSize) {
       this.momHeadSize = Math.ceil(n * 1.2)
@@ -173,8 +153,7 @@ export class Solver {
   private readonly chunkSet = new Set<number>()
   private readonly chunkList: Array<[number, number]> = []
   private done = false
-  /** Terminal result snapshot — compute() after done must never re-read the
-   * (released, possibly re-acquired) arena. */
+  /** Saved terminal result; compute() must not read an array pool released to another solve. */
   private finalResult: RawSolveResult | null = null
   /** Per-node toBreak (cell indices) for canDig solves; lazily created. */
   private breaks: Map<number, number[]> | null = null
@@ -230,8 +209,7 @@ export class Solver {
       this.heap.push(sIdx, h0)
       this.openCount = 1
     }
-    // Start outside the snapshot: shouldn't happen (the box is built around
-    // the start), degrade to an immediate boundary-limited noPath.
+    // An out-of-box start cannot be searched; report a boundary-limited failure.
   }
 
   private finish (result: RawSolveResult): RawSolveResult {
@@ -244,25 +222,20 @@ export class Solver {
     return result
   }
 
-  /** Momentum (cell, direction) states created so far (diagnostics/tests). */
+  /** Number of momentum (cell, direction) states created this solve. */
   get momentumStates (): number {
     return this.secCount
   }
 
-  /** Upstream-parity visitedChunks (strings), for astarContext consumers. */
+  /** Visited chunk keys for astarContext consumers. */
   get visitedChunks (): Set<string> {
     const out = new Set<string>()
     for (const [cx, cz] of this.chunkList) out.add(`${cx},${cz}`)
     return out
   }
 
-  /**
-   * Was cell (x, y, z) reached (opened) by this search, at any momentum?
-   * Read-only, and only while the arena is still this solve's (a later solve
-   * that re-acquired it has moved the epoch on; the answer is then false).
-   * What a failed search did not reach is where a physics hop can open the
-   * way (hopOracle.ts).
-   */
+  /** Whether this search opened the cell at any momentum, while it still owns the arrays.
+   * Returns false after another solve reuses them; unreached cells guide physics-hop discovery. */
   reached (x: number, y: number, z: number): boolean {
     const lx = x - this.x0
     const ly = y - this.y0
@@ -294,12 +267,8 @@ export class Solver {
     return slot < this.n ? MOM_NONE : this.arena.secDir[slot - this.n]
   }
 
-  /**
-   * Slot for (cell, momentum): the cell itself at NONE, otherwise the
-   * matching secondary entry, created on first sight. Entries for one cell
-   * form a list off momHead; a head is trusted only when its entry reads
-   * back the cell, which rebuilds the table for free every solve.
-   */
+  /** Find or create a slot for (cell, momentum); NONE uses the cell's own slot.
+   * Per-cell lists are valid only when their first entry points back to the cell. */
   private slotFor (cell: number, mom: number): number {
     if (mom === MOM_NONE) return cell
     const arena = this.arena
@@ -392,16 +361,11 @@ export class Solver {
     }
   }
 
-  /**
-   * Run the search for up to `sliceMs` (upstream tickTimeout semantics).
-   * Returns 'partial' when the slice ran out, 'timeout' when the total
-   * budget ran out, 'success'/'noPath' when finished. Resumable until a
-   * terminal status is returned.
-   */
+  /** Resume for up to `sliceMs`; returns partial on slice expiry, timeout on total budget expiry,
+   * or success/noPath when finished. Terminal results remain available after arrays are released. */
   compute (sliceMs: number): RawSolveResult {
     if (this.done) {
-      // Never re-read the arena after release — it may belong to another
-      // solve by now. Return the snapshotted terminal result.
+      // Released arrays may belong to another solve; return the saved result.
       return this.finalResult ?? this.makeEmptyResult('noPath')
     }
     if (this.startIdx < 0) {
@@ -440,7 +404,6 @@ export class Solver {
       const y = this.decodeY(cell)
       const z = this.decodeZ(cell)
 
-      // Upstream checks isEnd on pop, before closing.
       if (goal.isEnd(x, y, z)) {
         return this.finish(this.makeResult('success', idx))
       }
@@ -457,8 +420,7 @@ export class Solver {
 
       moveGen.generate(x, y, z, momentum ? this.momOf(idx) : MOM_NONE)
       const count = moveGen.outCount
-      // Every neighbour may open one momentum slot: grow once, up front, so
-      // the array views below stay valid for the whole relaxation loop.
+      // Grow before capturing array views; each neighbour may need a new momentum slot.
       if (momentum && this.n + this.secCount + count > arena.size) arena.growSlots(this.n + this.secCount + count)
       const gAll = arena.g
       const parentAll = arena.parent
@@ -486,19 +448,13 @@ export class Solver {
 
         if (touched) {
           if (closedAll[nIdx] !== 0) {
-            // Improvement over upstream: REOPEN a closed node on a strictly
-            // better g. Parkour edges (up to 4 blocks for cost 1) make the
-            // octile heuristic inadmissible, so first-closed routes aren't
-            // always optimal — upstream locks them in and can return a
-            // costlier path; reopening makes ours graph-optimal (never
-            // worse than upstream, sometimes cheaper).
+            // Parkour makes the octile heuristic inadmissible, so a closed node can get a cheaper route.
             if (gAll[nIdx] <= g2) continue
             closedAll[nIdx] = 0
-            this.visited-- // keep visitedNodes ≈ unique closed (upstream parity)
+            this.visited-- // Count unique closed nodes when reopening.
             this.openCount++
           } else {
-            // Upstream skips when neighborNode.g < gFromThisNode (strict),
-            // so an equal-g route REPLACES the parent — mirror for tie parity.
+            // Equal-cost routes replace the parent to preserve tie-breaking order.
             if (gAll[nIdx] < g2) continue
           }
         } else {
@@ -508,7 +464,7 @@ export class Solver {
 
         gAll[nIdx] = g2
         parentAll[nIdx] = idx
-        // (past a drop the body cannot climb back from, every node is: META_DEEP)
+        // A deep drop can make every remaining node unable to climb back.
         metaAll[nIdx] = outMeta[i] | (metaAll[idx] & META_DEEP)
         const br = outBreaks[i]
         if (br !== null) {

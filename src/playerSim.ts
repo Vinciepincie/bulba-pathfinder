@@ -1,26 +1,9 @@
-// Allocation-free player physics: the normal-movement branch of
-// prismarine-physics (index.js simulatePlayer / moveEntityWithHeading /
-// moveEntity), op for op, over a flat state-id world with the LUT's shape
-// table. Same engine the executor's rollouts use, at a fraction of the cost —
-// no Vec3 or AABB per tick, no block objects — so a planner can afford to
-// fly candidate jumps instead of approximating them.
-//
-// The one deliberate difference: the look direction is a unit HEADING vector
-// (hx, hz) = (-sin yaw, -cos yaw), not an angle. prismarine derives the same
-// vector from the yaw with Math.sin/Math.cos, so the two agree to rounding;
-// taking the vector keeps every operation here +,-,*,/ and sqrt, which a Rust
-// port reproduces bit for bit.
-//
-// Out of scope (the caller is told, never silently wrong): water, lava and
-// fire (`inLiquid` is raised and the step returns), cobwebs, bubble columns,
-// elytra, levitation, slow falling. On 1.21 prismarine applies no soul-sand
-// or honey slowdown and no ladder-trapdoor climbing, and neither does this.
+// Allocation-free normal-movement physics matching prismarine-physics over state-id shape tables.
+// Look direction is (-sin yaw, -cos yaw), keeping rollouts free of trigonometry.
+// Liquids, fire and cobwebs stop the model via inLiquid; elytra, levitation and slow falling are unsupported.
+// As in prismarine-physics 1.21, soul sand and honey do not slow movement, and trapdoors do not extend ladders.
 
-/**
- * A flat state-id grid (a snapshot's): when a SimWorld carries one, the
- * kernel indexes it inline instead of calling stateAt per cell — the lookups
- * are most of a tick's cost. Cells outside it read as -1, as stateAt must.
- */
+/** Flat state-id grid for direct cell lookups; unstamped grids return -1 outside their bounds. */
 export interface SimGrid {
   states: Uint16Array | Int32Array
   x0: number
@@ -30,20 +13,18 @@ export interface SimGrid {
   h: number
   l: number
   /**
-   * A LAZY grid (a window on a live world): a cell is current while its
-   * stamp equals `serial`; any other is read through stateAt and stored, and
-   * cells outside the window are read through stateAt too. Bumping `serial`
-   * forgets the whole window at no cost.
+   * A stamped cell is current only when its stamp equals `serial`; other cells
+   * read through stateAt. Incrementing serial invalidates the whole window.
    */
   stamps?: Int32Array
   serial?: number
 }
 
-/** Blocks of the world the simulation reads. */
+/** World state and collision tables read by the simulation. */
 export interface SimWorld {
   /** State id at a cell, or -1 outside the loaded world (no collision, no support). */
   stateAt: (x: number, y: number, z: number) => number
-  /** Optional: the same world as a flat grid (see SimGrid); stateAt must agree with it. */
+  /** Optional flat grid of the same world; stateAt must agree with its cells. */
   grid?: SimGrid
   /** Box offset (in boxes) into `boxes`, per state; -1 for no collision. */
   shapeStart: Int32Array
@@ -60,33 +41,24 @@ export interface SimWorld {
 export const SIM_CLIMBABLE = 1
 export const SIM_LIQUID = 2
 export const SIM_SLIME = 4
-/** Breaks a fall: keeps a fifth of its damage (hay, honey), or halves its height (a bed). See fallDamage.ts. */
+/** Hay and honey retain one fifth of fall damage. */
 export const SIM_CUSHION = 8
 export const SIM_BED = 16
 /**
- * A fire's cell (fire, soul fire): no collision box, but the executor walks a
- * body touching one out before anything else (plugin.ts hazardEscape), so a
- * run or a flight through it is not one the bot flies. And a cobweb's, which
- * this model does not slow a body in. A body touching one stops the model as
- * a liquid does (SimBody.inLiquid; KERNEL_HAZARD).
+ * Fire triggers the executor's escape controls, while cobweb drag is unmodelled.
+ * Both stop a rollout via inLiquid when hazard checks are enabled.
  */
 export const SIM_HAZARD = 32
-/**
- * PF_KERNEL_HAZARD=0: fire is air to the kernel (A/B). Arena mcc-8-3: the
- * gait ran its stair landing 0.04 into a fire's cell, the hazard escape
- * walked it 0.05 back out, and the two traded ticks for 11 of them.
- */
+/** Enables stopping rollouts at hazard cells. */
 const KERNEL_HAZARD = typeof process === 'undefined' || process.env.PF_KERNEL_HAZARD !== '0'
 /**
- * A honey block: a jump off it rises at 0.4 of the jump (index.js
- * honeyblockJumpSpeed), read where prismarine reads it - the cell under the
- * floored feet (pos.floored().offset(0, -0.5, 0)), so the honey under a body on
- * honey's own 15/16 top is NOT that cell; the cell under it is.
+ * Honey scales jump velocity by 0.4, sampled below the floored feet.
+ * On honey's 15/16 top, that sample is below the honey block itself.
  */
 export const SIM_HONEY = 64
-/** index.js honeyblockJumpSpeed. */
+/** Honey jump multiplier used by prismarine-physics. */
 const HONEY_JUMP = 0.4
-/** PF_HAZARD_DEBUG=1: each hazard cell the kernel stops at, once (diagnostic). */
+/** Enables logging each encountered hazard cell once. */
 const HAZARD_DEBUG = typeof process !== 'undefined' && process.env.PF_HAZARD_DEBUG === '1'
 const hazardSeen = new Set<string>()
 
@@ -102,7 +74,7 @@ export interface SimBody {
   collidedH: boolean
   collidedV: boolean
   jumpTicks: number
-  /** Set when the body touches water, lava, a fire or a cobweb (SIM_HAZARD): this model stops there. */
+  /** Set on liquid or enabled hazard contact; the model stops at that position. */
   inLiquid: boolean
 }
 
@@ -119,13 +91,9 @@ export interface SimControl {
   hz: number
 }
 
-/** prismarine-physics constants (index.js `physics`), as that engine holds them. */
 /**
- * The jump rule of the prismarine-physics the bot runs (PhysicsSim.probeVanillaJump):
- * vanilla 1.21's jumpFromGround keeps the faster of the jump and the body's own
- * rise (max(jumpPower, vy): a jump held on a slime rebound keeps the rebound,
- * scripts/patchPhysics.mjs), stock prismarine sets the jump's. The kernel
- * follows whichever the bot's own physics does: one flag per thread.
+ * Match the bot's jump rule per thread: vanilla 1.21 preserves a faster upward
+ * velocity, such as a slime rebound; stock prismarine-physics replaces it.
  */
 let vanillaJump = false
 export function setVanillaJump (on: boolean): void { vanillaJump = on }
@@ -161,9 +129,9 @@ export function copyBody (dst: SimBody, src: SimBody): SimBody {
   return dst
 }
 
-/** A cell-range key's serial when it holds no range (PlayerSim.slotKey): a grid's serial is never negative. */
+/** Invalid range serial; valid grid serials are nonnegative. */
 const NO_RANGE = -1
-/** PlayerSim.bricks: a brick's side, as a shift (4 cells), and its bits. */
+/** Brick side as a shift: 2 means four cells per side. */
 const BRICK = 2
 const BRICK_MASK = (1 << BRICK) - 1
 const BRICK_SEEN = 1
@@ -174,45 +142,35 @@ const BRICK_WET = 4
 /** A cell of the brick is a fire or a cobweb (SIM_HAZARD). */
 const BRICK_HOT = 8
 
-/**
- * The simulator: world + body dimensions + scratch space. Not re-entrant
- * (one scratch buffer); one instance per thread of use.
- */
+/** Player simulator with shared scratch space; use one instance per thread without re-entry. */
 export class PlayerSim {
   readonly world: SimWorld
-  /** Half width / height of the body (the executor nudges both off the stock 0.3 / 1.8). */
+  /** Body half-width and height; the executor slightly reduces the stock 0.3 and 1.8. */
   halfWidth: number
   height: number
   /** Movement-speed attribute base (0.1 unless the server says otherwise). */
   speedBase: number
-  /** Scratch: collected boxes, 6 per box, absolute coordinates (the slot gather() last filled). */
+  /** Scratch collision boxes in absolute coordinates, six numbers per box. */
   private buf: Float64Array = new Float64Array(6 * 512)
   private nBoxes = 0
   /**
-   * The last two gathers, by cell range: a range asked again (the next tick's
-   * move; a move's after the step-up query between two) takes its boxes as
-   * they are. Only over a grid: a stamped grid's ranges inside its window,
-   * keyed by its serial; an unstamped grid is fixed for the sim's life (a
-   * solve's snapshot, which the oracle's stand caches assume too).
+   * Cache two cell ranges so step-up queries do not evict the preceding move.
+   * Stamped grids cache in-window ranges by serial; unstamped grids must stay fixed.
    */
   private readonly slotBuf: Float64Array[] = [this.buf, new Float64Array(6 * 512)]
   private readonly slotN = [0, 0]
-  /** Per slot: x0, y0, z0, x1, y1, z1, serial; serial NO_RANGE: holds no range. */
+  /** Per slot: x0, y0, z0, x1, y1, z1, serial; NO_RANGE marks an empty slot. */
   private readonly slotKey = new Float64Array([0, 0, 0, 0, 0, 0, NO_RANGE, 0, 0, 0, 0, 0, 0, NO_RANGE])
   private slot = 0
-  /** touchesLiquid's last answer, by cell range (keyed as a slot). */
+  /** Liquid-contact cache key by cell range and grid serial. */
   private readonly liqKey = new Float64Array([0, 0, 0, 0, 0, 0, NO_RANGE])
   private liqLast = false
-  /** ...and touchesHazard's. */
+  /** Hazard-contact cache key by cell range and grid serial. */
   private readonly hazKey = new Float64Array([0, 0, 0, 0, 0, 0, NO_RANGE])
   private hazLast = false
   /**
-   * An unstamped grid by brick of 4³ cells: BRICK_SEEN once looked at, with
-   * BRICK_SOLID when a cell has a collision box and BRICK_WET when one is a
-   * liquid. A gather skips the layers of empty bricks its range crosses (a
-   * fall's range is 4-6 cells tall, mostly air), and a body over dry bricks
-   * touches no liquid without a cell read (touchesLiquid ran every tick; most
-   * courses have none). Built as asked; null for other worlds.
+   * Lazy occupancy bits for 4x4x4-cell bricks in unstamped grids only.
+   * Skip empty layers and dry or hazard-free regions without reading every cell.
    */
   private bricks: Uint8Array | null = null
   private bw = 0
@@ -227,12 +185,12 @@ export class PlayerSim {
     this.speedBase = speedBase
   }
 
-  /** State id at a cell, as the simulation reads it (through the grid when there is one). */
+  /** State id at a cell, using the grid when available. */
   stateAt (x: number, y: number, z: number): number {
     return this.sid(x, y, z)
   }
 
-  /** State id at a cell: the grid inline when there is one, else the world's stateAt. */
+  /** State lookup through the grid or the world's stateAt callback. */
   private sid (x: number, y: number, z: number): number {
     const g = this.grid
     if (g === null) return this.world.stateAt(x, y, z)
@@ -250,10 +208,8 @@ export class PlayerSim {
   }
 
   /**
-   * The key a cell range is kept under (PlayerSim.slotKey): the grid's
-   * serial, 0 for an unstamped grid; NO_RANGE when the range cannot be kept
-   * (no grid, or cells of a stamped grid's range outside its window, which
-   * are read through every time).
+   * Grid serial for caching a cell range; zero for fixed grids, NO_RANGE without
+   * a grid or outside a stamped window, where reads cannot safely be cached.
    */
   private rangeSerial (x0: number, y0: number, z0: number, x1: number, y1: number, z1: number): number {
     const g = this.grid
@@ -263,7 +219,7 @@ export class PlayerSim {
     return g.serial as number
   }
 
-  /** Collect every box of every cell prismarine's getSurroundingBBs would visit for this query. */
+  /** Collect collision boxes using prismarine-physics' surrounding-cell range. */
   private gather (minX: number, minY: number, minZ: number, maxX: number, maxY: number, maxZ: number): number {
     const y0 = Math.floor(minY) - 1
     const y1 = Math.floor(maxY)
@@ -285,7 +241,7 @@ export class PlayerSim {
         }
       }
     }
-    // (into the other slot: the one just used may be asked again next)
+    // Keep the previous query in the other slot in case the next move reuses it.
     const sl = this.slot ^ 1
     this.slot = sl
     this.buf = this.slotBuf[sl]
@@ -298,17 +254,16 @@ export class PlayerSim {
     return n
   }
 
-  /** gather()'s cells, in its order, into this.buf: the box count. */
+  /** Fill the scratch buffer with collision boxes in cell traversal order; return the count. */
   private collect (x0: number, y0: number, z0: number, x1: number, y1: number, z1: number): number {
     const w = this.world
     const g = this.grid
     let n = 0
-    // (a range inside the grid: its cells indexed straight, no bounds test a cell)
+    // An in-grid range needs no per-cell bounds checks.
     const inside = g !== null && x0 >= g.x0 && y0 >= g.y0 && z0 >= g.z0 && x1 < g.x0 + g.w && y1 < g.y0 + g.h && z1 < g.z0 + g.l
     const states = g !== null ? g.states : null
     const stamps = g !== null ? g.stamps : undefined
     const serial = g !== null ? g.serial : undefined
-    // (an unstamped grid: whole layers of empty bricks skipped, PlayerSim.bricks)
     const sparse = inside && stamps === undefined
     for (let y = y0; y <= y1; y++) {
       if (sparse) {
@@ -358,7 +313,7 @@ export class PlayerSim {
     return n
   }
 
-  /** Would getSurroundingBBs return anything at all for this query? (the sneak edge guard's test) */
+  /** Test for any surrounding collision boxes using the sneak edge guard's cell range. */
   private anyBoxes (minX: number, minY: number, minZ: number, maxX: number, maxY: number, maxZ: number): boolean {
     const w = this.world
     const y0 = Math.floor(minY) - 1
@@ -378,7 +333,7 @@ export class PlayerSim {
     return false
   }
 
-  // computeOffset{X,Y,Z}: aabb.js, `this` = the block box, `other` = the player box.
+  // Offset calculations use the block box as the obstacle and the player box as the moving box.
   private offY (bMinX: number, bMinY: number, bMinZ: number, bMaxX: number, bMaxY: number, bMaxZ: number, dy: number): number {
     const b = this.buf
     for (let i = 0; i < this.nBoxes; i++) {
@@ -424,8 +379,7 @@ export class PlayerSim {
     return dz
   }
 
-  /** The SIM_* bits of the block at a point. */
-  /** The slipperiness a body with its feet at (x, y, z) runs on (step's `under`: the cell a block below the feet); 0 = the default 0.6. */
+  /** Slipperiness one block below the feet; zero means the default 0.6. */
   slipUnder (x: number, y: number, z: number): number {
     const s = this.sid(Math.floor(x), Math.floor(y - 1), Math.floor(z))
     return s < 0 ? 0 : this.world.slip[s]
@@ -436,22 +390,22 @@ export class PlayerSim {
     return s < 0 ? 0 : this.world.kind[s]
   }
 
-  /** index.js isOnLadder (1.21: ladders and vines; no trapdoor rule). */
+  /** Climbable contact uses the feet cell, without a trapdoor extension rule. */
   private onLadder (b: SimBody): boolean {
     return (this.kindAt(b.x, b.y, b.z) & SIM_CLIMBABLE) !== 0
   }
 
-  /** Is the body on a climbable (index.js isOnLadder: the cell its feet are in)? */
+  /** Whether the body's feet occupy a climbable cell. */
   onClimbable (b: SimBody): boolean {
     return this.onLadder(b)
   }
 
-  /** Would the next step stop the body (step(): a liquid, or a hazard)? For a touchdown taken without stepping on (HopOracle.goLanding). */
+  /** Whether a step stops at liquid or an enabled hazard, without advancing the body. */
   touchesWet (b: SimBody): boolean {
     return this.touchesLiquid(b) || (KERNEL_HAZARD && this.touchesHazard(b))
   }
 
-  /** index.js getWaterInBB/isMaterialInBB, reduced to "does the body touch a liquid cell". */
+  /** Liquid contact uses block cells rather than collision shapes. */
   private touchesLiquid (b: SimBody): boolean {
     const hw = this.halfWidth
     const minX = b.x - hw + 0.001; const maxX = b.x + hw - 0.001
@@ -463,7 +417,7 @@ export class PlayerSim {
     const g = this.grid
     if (g !== null && g.stamps === undefined && x0 >= g.x0 && y0 >= g.y0 && z0 >= g.z0 && x1 < g.x0 + g.w && y1 < g.y0 + g.h && z1 < g.z0 + g.l &&
       this.bricksLack(g, BRICK_WET, x0 - g.x0, y0 - g.y0, z0 - g.z0, x1 - g.x0, y1 - g.y0, z1 - g.z0)) return false
-    // (the cells of the last tick's question: its answer, kept as a gather's boxes are)
+    // Reuse the answer while the queried cell range and grid serial stay unchanged.
     const serial = this.rangeSerial(x0, y0, z0, x1, y1, z1)
     const k = this.liqKey
     if (serial !== NO_RANGE && k[6] === serial && k[0] === x0 && k[1] === y0 && k[2] === z0 && k[3] === x1 && k[4] === y1 && k[5] === z1) return this.liqLast
@@ -481,10 +435,7 @@ export class PlayerSim {
     return hit
   }
 
-  /**
-   * Does the body's box touch a fire's or a cobweb's cell (SIM_HAZARD)? The box a
-   * thousandth in on every side, as the executor's hazardContacts reads it.
-   */
+  /** Hazard contact trims the body box by 0.001 on each side, matching the executor. */
   private touchesHazard (b: SimBody): boolean {
     const hw = this.halfWidth
     const x0 = Math.floor(b.x - hw + 0.001); const x1 = Math.floor(b.x + hw - 0.001)
@@ -514,7 +465,7 @@ export class PlayerSim {
     return hit
   }
 
-  /** Do the bricks over grid cells [lx0..lx1]×[ly0..ly1]×[lz0..lz1] of an unstamped grid all lack `bit` (PlayerSim.bricks)? */
+  /** Whether every brick in an unstamped grid's cell range lacks `bit`. */
   private bricksLack (g: SimGrid, bit: number, lx0: number, ly0: number, lz0: number, lx1: number, ly1: number, lz1: number): boolean {
     for (let by = ly0 >> BRICK; by <= ly1 >> BRICK; by++) {
       for (let bz = lz0 >> BRICK; bz <= lz1 >> BRICK; bz++) {
@@ -526,7 +477,7 @@ export class PlayerSim {
     return true
   }
 
-  /** A brick's bits (PlayerSim.bricks), its cells read the first time it is asked. */
+  /** Lazily read a brick's occupancy bits. */
   private brick (g: SimGrid, bx: number, by: number, bz: number): number {
     let bricks = this.bricks
     if (bricks === null) {
@@ -558,10 +509,8 @@ export class PlayerSim {
   }
 
   /**
-   * Does the body's box with its feet at (x, y, z), its sides grown by `grow`
-   * (negative: shrunk) and its top and bottom trimmed by `trim`, overlap a
-   * collision box? The executor's probes (geometry.playerCollides, nearWall)
-   * for a kernel that steers as it does.
+   * Test the body box at (x, y, z) against collision shapes, expanding its sides
+   * by `grow` and trimming its top and bottom by `trim`. Negative grow shrinks it.
    */
   boxHits (x: number, y: number, z: number, grow: number, trim: number): boolean {
     const hw = this.halfWidth + grow
@@ -578,10 +527,8 @@ export class PlayerSim {
   }
 
   /**
-   * Many probes round one place: gather once the boxes any of them could
-   * touch — a body's box within `reach` of (x, y, z) sideways, from `below`
-   * under its feet up — and ask probeHit of each. Valid until the next step
-   * or probe of another kind (they share the scratch buffer).
+   * Gather boxes for probes within `reach` horizontally and `below` the feet.
+   * Use probeHit until the next step or other probe overwrites the shared buffer.
    */
   probeBegin (x: number, y: number, z: number, reach: number, below: number): number {
     const r = this.halfWidth + reach
@@ -589,20 +536,19 @@ export class PlayerSim {
   }
 
   /**
-   * The collision boxes in a region: their count, six numbers a box in
-   * `scratchBoxes` (minX, minY, minZ, maxX, maxY, maxZ). Valid until the
-   * next step or probe (one scratch buffer).
+   * Gather collision boxes and return their count. Each box in scratchBoxes is
+   * (minX, minY, minZ, maxX, maxY, maxZ); valid until the next step or probe.
    */
   boxesIn (minX: number, minY: number, minZ: number, maxX: number, maxY: number, maxZ: number): number {
     return this.gather(minX, minY, minZ, maxX, maxY, maxZ)
   }
 
-  /** The scratch buffer boxesIn() and the probes fill. */
+  /** Shared scratch buffer filled by boxesIn and the probes. */
   get scratchBoxes (): Float64Array {
     return this.buf
   }
 
-  /** boxHits, against the boxes probeBegin gathered. */
+  /** Test the body box against the boxes gathered by probeBegin. */
   probeHit (x: number, y: number, z: number, grow: number, trim: number): boolean {
     const hw = this.halfWidth + grow
     const minX = x - hw; const maxX = x + hw
@@ -616,7 +562,7 @@ export class PlayerSim {
     return false
   }
 
-  /** Does the body's box overlap any collision box (an embedded position no move can produce)? */
+  /** Whether the body overlaps a collision box, indicating an embedded position. */
   collides (b: SimBody): boolean {
     const hw = this.halfWidth
     const minX = b.x - hw; const maxX = b.x + hw
@@ -632,11 +578,8 @@ export class PlayerSim {
   }
 
   /**
-   * Is the body carried: a collision box under its hitbox, its top at the
-   * feet? A body can be onGround without. The tick it lands it moves down
-   * before it moves on, so it touches down on the edge it is leaving and ends
-   * the tick past it, with the ground flag and nothing underneath: it can
-   * still jump on the next tick, and falls on the one after if it does not.
+   * Check for a supporting collision box at the feet; onGround can remain true
+   * after horizontal motion leaves an edge, allowing one more jump before falling.
    */
   carried (b: SimBody): boolean {
     const hw = this.halfWidth
@@ -652,9 +595,8 @@ export class PlayerSim {
   }
 
   /**
-   * Is the body carried by a box of the block column (cx, cz): a box whose top
-   * is at the feet and whose footprint is under the hitbox? Tells a body
-   * standing ON a column from one overhanging it from the column beside.
+   * Check support from column (cx, cz) at the feet, distinguishing standing
+   * on that column from overhanging it while supported by a neighbouring column.
    */
   supportedIn (b: SimBody, cx: number, cz: number): boolean {
     const hw = this.halfWidth
@@ -674,7 +616,7 @@ export class PlayerSim {
     return false
   }
 
-  /** index.js moveEntity, normal branch (no web). */
+  /** Resolve normal-movement collisions using prismarine-physics' axis order. */
   private moveEntity (b: SimBody, sneak: boolean, dx: number, dy: number, dz: number): void {
     const hw = this.halfWidth
     const h = this.height
@@ -706,10 +648,8 @@ export class PlayerSim {
       }
     }
 
-    // player box
     let pMinX = b.x - hw; let pMinY = b.y; let pMinZ = b.z - hw
     let pMaxX = b.x + hw; let pMaxY = b.y + h; let pMaxZ = b.z + hw
-    // query = player box extended by the move
     this.gather(
       dx < 0 ? pMinX + dx : pMinX, dy < 0 ? pMinY + dy : pMinY, dz < 0 ? pMinZ + dz : pMinZ,
       dx < 0 ? pMaxX : pMaxX + dx, dy < 0 ? pMaxY : pMaxY + dy, dz < 0 ? pMaxZ : pMaxZ + dz)
@@ -723,7 +663,6 @@ export class PlayerSim {
     dz = this.offZ(pMinX, pMinY, pMinZ, pMaxX, pMaxY, pMaxZ, dz)
     pMinZ += dz; pMaxZ += dz
 
-    // step up
     if (SIM.stepHeight > 0 && (b.onGround || (dy !== oldVelY && oldVelY < 0)) && (dx !== oldVelX || dz !== oldVelZ)) {
       const oldVelXCol = dx
       const oldVelYCol = dy
@@ -736,7 +675,7 @@ export class PlayerSim {
         oldVelX < 0 ? oMinX + oldVelX : oMinX, oMinY, oldVelZ < 0 ? oMinZ + oldVelZ : oMinZ,
         oldVelX < 0 ? oMaxX : oMaxX + oldVelX, oMaxY + sdy, oldVelZ < 0 ? oMaxZ : oMaxZ + oldVelZ)
 
-      // BB1 = old box, BB2 = old box; BB_XZ = old box extended by (dx, 0, dz)
+      // Compare step clearance over the swept footprint and the original footprint.
       let b1MinX = oMinX; let b1MinY = oMinY; let b1MinZ = oMinZ; let b1MaxX = oMaxX; let b1MaxY = oMaxY; let b1MaxZ = oMaxZ
       let b2MinX = oMinX; let b2MinY = oMinY; let b2MinZ = oMinZ; let b2MaxX = oMaxX; let b2MaxY = oMaxY; let b2MaxZ = oMaxZ
       const xzMinX = dx < 0 ? oMinX + dx : oMinX
@@ -786,7 +725,6 @@ export class PlayerSim {
       }
     }
 
-    // setPositionToBB
     b.x = pMinX + hw
     b.y = pMinY
     b.z = pMinZ + hw
@@ -802,7 +740,7 @@ export class PlayerSim {
     }
   }
 
-  /** One tick of index.js simulatePlayer for the normal-movement branch. */
+  /** Advance one normal-movement tick using prismarine-physics' update order. */
   step (b: SimBody, c: SimControl): void {
     if (this.touchesLiquid(b) || (KERNEL_HAZARD && this.touchesHazard(b))) { b.inLiquid = true; return }
 
@@ -813,7 +751,6 @@ export class PlayerSim {
     if (c.jump) {
       if (b.jumpTicks > 0) b.jumpTicks--
       if (b.onGround && b.jumpTicks === 0) {
-        // (off honey, as prismarine reads it: SIM_HONEY)
         const power = (this.kindAt(b.x, Math.floor(b.y) - 0.5, b.z) & SIM_HONEY) !== 0 ? SIM.jumpVelocity * HONEY_JUMP : SIM.jumpVelocity
         b.vy = vanillaJump && b.vy > power ? b.vy : power
         if (c.sprint) {
@@ -833,7 +770,6 @@ export class PlayerSim {
       forward *= SIM.sneakSpeed
     }
 
-    // moveEntityWithHeading, normal movement
     let acceleration: number
     let inertia: number
     const under = this.sid(Math.floor(b.x), Math.floor(b.y - 1), Math.floor(b.z))
@@ -850,7 +786,7 @@ export class PlayerSim {
       if (c.sprint) acceleration += SIM.airborneAcceleration * 0.3
     }
 
-    // applyHeading: vel += strafe * right + forward * look, right = (-hz, hx)
+    // The heading's right vector is (-hz, hx).
     let mag = Math.sqrt(strafe * strafe + forward * forward)
     if (mag >= 0.01) {
       mag = acceleration / Math.max(mag, 1)
@@ -877,18 +813,17 @@ export class PlayerSim {
   }
 }
 
-/** prismarine-physics' slipperiness by block name (index.js blockSlipperiness); 0 = the default 0.6. */
+/** Slipperiness by block name; zero means the default 0.6. */
 const SLIP_BY_NAME: Record<string, number> = { slime_block: 0.8, ice: 0.98, packed_ice: 0.98, frosted_ice: 0.98, blue_ice: 0.989 }
 
-/** Slipperiness of a block type for SimWorld.slip (0 = the default). */
+/** Slipperiness for a block type; zero means the default 0.6. */
 export function simSlipOf (name: string): number {
   return SLIP_BY_NAME[name] ?? 0
 }
 
 /**
- * SIM_* kind bits of a block state: climbable (index.js isOnLadder), liquid
- * (water, lava and prismarine's waterLike set, or any waterlogged state),
- * slime, what breaks a fall, and a fire's or a cobweb's cell.
+ * SIM_* flags for climbables, liquids, slime, fall cushions, beds, honey and hazards.
+ * Waterlogged states count as liquid even when their block name does not.
  */
 export function simKindOf (name: string, waterlogged: boolean): number {
   return (name === 'ladder' || name === 'vine' || name === 'scaffolding' || name.endsWith('_vines') || name.endsWith('_vines_plant') ? SIM_CLIMBABLE : 0) |
@@ -902,10 +837,8 @@ export function simKindOf (name: string, waterlogged: boolean): number {
 }
 
 /**
- * A SimWorld's per-state tables from a LUT's shape table and a registry
- * (slipperiness and kinds by block name). `stateAt` is the caller's.
- * `waterlogged(stateId)` marks the states prismarine counts as water
- * (index.js getWaterInBB reads `block.isWaterlogged`).
+ * Build per-state shape, slipperiness and kind tables; the caller supplies stateAt.
+ * `waterlogged(stateId)` marks states that prismarine-physics treats as water.
  */
 export function simTables (
   lut: { shapeStarts: Int32Array, shapeCounts: Uint8Array, shapeData: Float32Array, maxStateId: number },
@@ -931,7 +864,7 @@ export function simTables (
   }
 }
 
-/** A SimWorld's per-state tables straight from a LUT that carries them (lut.ts simSlip / simKind). */
+/** Build per-state simulation tables from a LUT with slipperiness and kind data. */
 export function simTablesFromLut (
   lut: { shapeStarts: Int32Array, shapeCounts: Uint8Array, shapeData: Float32Array, simSlip: Float64Array, simKind: Uint8Array }
 ): Omit<SimWorld, 'stateAt'> {

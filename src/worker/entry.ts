@@ -1,9 +1,5 @@
-// Worker-thread solver host. Receives LUT tables once per profile change and
-// per-solve snapshot views (SharedArrayBuffer-backed — zero copy), runs the
-// solver in ~tick-sized slices posting interim 'partial' results (so the bot
-// can walk a partial path while thinking, upstream-style), and honors a
-// shared cancel flag between slices. The event loop of the BOT process is
-// never blocked by a solve — that failure class is structurally gone here.
+// Shared snapshot views keep solving off the bot thread without copying the world.
+// Slices stream partial paths and check cancellation between batches.
 import { parentPort } from 'node:worker_threads'
 import { Solver } from '../solver.js'
 import { GoalAdapter } from '../goalAdapter.js'
@@ -29,7 +25,7 @@ interface LutMessage {
   shapeStarts: Int32Array
   shapeCounts: Uint8Array
   shapeData: Float32Array
-  /** The physics kernel's per-state tables (lut.ts simSlip / simKind); absent from older hosts. */
+  /** Optional physics tables for per-state slipperiness and block kind. */
   simSlip?: Float64Array
   simKind?: Uint8Array
 }
@@ -60,17 +56,17 @@ interface SolveMessage {
   searchRadius: number
   sliceMs: number
   cancelBuf: SharedArrayBuffer
-  /** References dig tables previously sent via DigMessage (canDig only). */
+  /** Fingerprint of dig tables sent via DigMessage (canDig only). */
   digFingerprint: string | null
   /** The bot's body for the physics kernel (allowParkourPhysics): hitbox and walking speed. */
   body?: { halfWidth: number, height: number, speed: number }
-  /** Run the hop pipeline on a boundary-limited failure too (WorkerSolveRequest.hopsOnBoundary). */
+  /** Allow hops in the first boundary-limited box; grown boxes make follow-up floods expensive. */
   hopsOnBoundary?: boolean
   /** Solve on the JavaScript reference core instead of the wasm core (PathfinderOptions.core). */
   core?: 'wasm' | 'js'
   /** The body's exact feet position when on the ground (hopPipeline.ts startRest). */
   startPos?: { x: number, y: number, z: number }
-  /** The bot's physics keeps the faster rise on a jump (vanilla): this thread's kernel follows (playerSim.ts setVanillaJump). */
+  /** Whether the physics kernel keeps vanilla's faster jump rise, matching the bot. */
   vanillaJump?: boolean
 }
 
@@ -92,15 +88,10 @@ let lutFingerprint = ''
 /** Kernel tables of the current LUT (allowParkourPhysics). */
 let simLut: { simSlip: Float64Array, simKind: Uint8Array } | null = null
 
-// Dig tables by fingerprint — sent once per (inventory × effects × lut)
-// change instead of ~120KB per solve. Insertion-ordered; the host mirrors
-// this eviction policy (MAX_DIG_TABLES in host.ts) so both sides always
-// agree on residency.
+// Mirror the host's insertion-order eviction bound so dig-table residency stays synchronized.
 const digTables = new Map<string, { labor: Float32Array, flags: Uint8Array }>()
 
-// The wasm core loads in the background; solves that arrive before it is
-// ready (or when it is unavailable) run on the JS solver — the reference
-// implementation and permanent fallback. PF_NO_WASM=1 disables it.
+// Solves use JavaScript while wasm loads or when wasm is unavailable.
 let wasmSolver: WasmSolver | null = null
 /** A reserve request that arrived before the core was instantiated. */
 let pendingReserve = 0
@@ -142,7 +133,7 @@ function makeOracle (msg: SolveMessage): HopOracle | null {
     return (ly * m.l + lz) * m.w + lx
   }
   const body = msg.body ?? { halfWidth: 0.3, height: 1.8, speed: 0.1 }
-  return new HopOracle(
+  const oracle = new HopOracle(
     {
       ...simTablesCache.tables,
       stateAt: (x, y, z) => { const i = idx(x, y, z); return i < 0 ? -1 : states[i] },
@@ -150,18 +141,12 @@ function makeOracle (msg: SolveMessage): HopOracle | null {
     },
     (x, y, z) => { const i = idx(x, y, z); return i < 0 ? 0 : flags[i] },
     body.halfWidth, body.height, body.speed)
+  if (msg.cfg.fallVeto !== undefined) oracle.fallVeto = msg.cfg.fallVeto
+  return oracle
 }
 
-/**
- * Physics-verified hops where the search FAILED (allowParkourPhysics,
- * hopPipeline.ts): a stitched whole path to the goal, or null — in which case
- * the original failure stands. Never for a cancelled solve; for a
- * boundary-limited one only in the first box of a solve (hopsOnBoundary) —
- * a failure the table could not bridge floods its box, and grown boxes only
- * give the follow-up searches more to flood; the host grows the box when the
- * pipeline finds nothing.
- */
-/** Does the partial path end within a cell of the box's faces? */
+/** Whether the partial path ends within one cell of a snapshot boundary.
+ * Boundary-stopped paths need box growth before hop discovery. */
 function tailOnBoundary (path: ReadonlyArray<{ x: number, y: number, z: number }>, m: { x0: number, y0: number, z0: number, w: number, h: number, l: number }): boolean {
   if (path.length === 0) return false
   const t = path[path.length - 1]
@@ -179,7 +164,7 @@ function hopPipeline (
   banEdge: (from: number, to: number) => void
 ): RawSolveResult | null {
   const r = hopPipelineRun(msg, first, cancelFlag, solveFrom, reached, postPartial, snap, banEdge)
-  // (nothing stitched: the first search as the pipeline verified it, its bans kept - hopPipeline.ts verifiedPath)
+  // Keep verification bans even when no stitched path is found.
   return r.stitched ?? r.verifiedFirst
 }
 
@@ -198,15 +183,10 @@ function hopPipelineRun (
   if (first.status !== 'noPath' && first.status !== 'timeout') return none
   const oracle = makeOracle(msg)
   if (oracle === null) return none
-  // (a cancelled solve's pipeline gives up at once: its result would be dropped,
-  // and the next solve waits behind it in this thread - PF_PIPE_ABORT=0 for A/B)
+  // Cancellation stops hop work so the next solve is not held behind discarded results.
   const abortOn = process.env.PF_PIPE_ABORT !== '0'
   if (abortOn) oracle.abort = () => Atomics.load(cancelFlag, 0) !== 0
-  // A partial path that ends against the box's own faces was stopped by the
-  // box, not the terrain: growth first, or the discovery spends its share of
-  // the budget from the edge of a box that is simply too small (climb1's
-  // goal is 46 blocks up: 1.6 s standing still, where a grown box finds the
-  // whole path in 200 ms).
+  // Grow a boundary-stopped search before spending hop-discovery budget in a box that is too small.
   const skip = first.cancelled === true ? 'cancelled'
     : first.boundaryLimited && msg.hopsOnBoundary !== true ? 'boundary-limited'
       : first.boundaryLimited && tailOnBoundary(first.path, msg.meta) ? 'tail-on-boundary'
@@ -221,7 +201,6 @@ function hopPipelineRun (
   const goalCell = typeof g.x === 'number' && typeof g.y === 'number' && typeof g.z === 'number'
     ? { x: Math.floor(g.x), y: Math.floor(g.y), z: Math.floor(g.z) }
     : null
-  // (the failed search's own partial, while the pipeline runs: hopPipeline.ts streamablePrefix)
   const prefix = streamablePrefix(first, msg.start, oracle, reached, goalCell)
   if (prefix.length > 0) postPartial({ ...first, status: 'partial', path: prefix })
   let moveGen: MoveGen | null = null
@@ -249,18 +228,17 @@ function hopPipelineRun (
     deadline: performance.now() + msg.timeout,
     onVerifiedFirst: (r) => { verifiedFirst = r },
     ...(abortOn ? { cancelled: () => Atomics.load(cancelFlag, 0) !== 0 } : {}),
-    // (the bot goes on along the verified legs while the pipeline runs: plugin.ts STREAM_STITCH)
+    // Verified legs can be followed while the remaining hops are searched.
     ...(process.env.PF_STREAM_STITCH !== '0'
       ? { onStitched: (path: typeof first.path) => { if (Atomics.load(cancelFlag, 0) === 0) postPartial({ ...first, status: 'partial', path }) } }
       : {}),
     startRest: msg.startPos ?? null,
-    // (the cell planner's own edges, for the goal side: hopPipeline.ts goalSide)
     edgesFrom: (x, y, z, out) => {
       const mg = moveGen ?? (moveGen = new MoveGen(snap, msg.cfg))
       mg.generate(x, y, z, MOM_NONE)
       for (let i = 0; i < mg.outCount; i++) out.push(mg.outX[i], mg.outY[i], mg.outZ[i])
     },
-    // (a planner jump no flight lands: banned for the solves after, hopPipeline.ts verifiedPath)
+    // Keep unlandable planner edges banned in subsequent searches.
     banEdge: (a, b) => {
       const at = (c: { x: number, y: number, z: number }): number => {
         const lx = c.x - m.x0
@@ -307,9 +285,7 @@ port.on('message', (msg: InMessage) => {
     if (msg.t === 'dig') {
       digTables.delete(msg.fingerprint) // refresh insertion order
       digTables.set(msg.fingerprint, { labor: msg.labor, flags: msg.flags })
-      // The '' fingerprint (uncacheable, resent per solve) is exempt from
-      // the bound — evicting a real entry for it would desync the host's
-      // residency record.
+      // Empty fingerprints are resent, so evicting a cacheable entry here would desynchronize the host.
       const cacheable = (): number => digTables.size - (digTables.has('') ? 1 : 0)
       if (cacheable() > MAX_DIG_TABLES) {
         for (const key of digTables.keys()) {
@@ -322,7 +298,6 @@ port.on('message', (msg: InMessage) => {
     }
 
     if (msg.t === 'solve') {
-      // (the bot's own jump rule: this thread's kernel follows it)
       setVanillaJump(msg.vanillaJump === true)
       const snap = {
         meta: msg.meta,
@@ -358,7 +333,6 @@ port.on('message', (msg: InMessage) => {
         }
       }
 
-      // ── wasm fast path: coordinate goals on the Rust core ──────────────
       if (wasmSolver && msg.core !== 'js' && wasmSupportsGoal(msg.goal)) {
         try {
           const result = wasmSolver.solve(
@@ -406,12 +380,10 @@ port.on('message', (msg: InMessage) => {
           port.postMessage({ t: 'done', id: msg.id, result: hops ?? result })
           return
         } catch (error) {
-          // Fall through to the JS reference solver.
           console.warn('[bulba-pathfinder] wasm solve failed, falling back to JS:', (error as Error).message)
         }
       }
 
-      // Monomorphic evaluator for coordinate goals; adapter for the rest.
       const evaluator = fastEvaluator(msg.goal) ?? new GoalAdapter(instantiateGoal(msg.goal, world))
       const solver = new Solver(
         snap,
@@ -423,8 +395,7 @@ port.on('message', (msg: InMessage) => {
         dig
       )
 
-      // Slice loop: never blocks this worker for more than sliceMs between
-      // cancel checks; interim partial paths stream back to the host.
+      // Bound cancellation delay while streaming partial paths between slices.
       for (;;) {
         const result = solver.compute(msg.sliceMs)
         result.engine = 'js'

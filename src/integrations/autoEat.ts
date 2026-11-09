@@ -1,31 +1,6 @@
-// mineflayer-auto-eat, taught to wait for a safe moment.
-//
-// Out of the box the plugin eats from its own `physicsTick` handler the
-// instant hunger crosses its threshold. That is fine for a bot standing in a
-// field and wrong for a bot walking a path: eating swaps the main hand, and
-// item use and sprinting cancel each other in vanilla — so a bite taken at
-// take-off drops the sprint the jump needed, and a bite taken in flight lands
-// the bot short with the wrong item held. The pathfinder then replans from
-// wherever it fell.
-//
-// This adapter turns the plugin's automatic mode off and drives it through
-// the pathfinder's interrupt protocol instead: the bot lands, stops on its
-// own path, eats, and walks on from the same node. Nothing is re-planned and
-// `goto()` never rejects — from the caller's point of view the walk just took
-// a second and a half longer.
-//
-// ```js
-// import { pathfinder, autoEatIntegration } from '@bulba/pathfinder'
-// import { loader as autoEat } from 'mineflayer-auto-eat'
-//
-// bot.loadPlugin(pathfinder)
-// bot.loadPlugin(autoEat)
-// bot.loadPlugin(autoEatIntegration({ startAt: 16 }))
-// ```
-//
-// It is deliberately defensive about the plugin's own API: 3.x has shipped
-// both `enableAuto`/`disableAuto` and `enable`/`disable`, and both `opts` and
-// `options`. Whichever this bot has, the adapter finds it.
+// Eating changes the held item and cancels sprint, which can shorten a jump.
+// Wait for a grounded interrupt before eating, then resume the path.
+import type { Bot } from 'mineflayer'
 import type { InterruptOptions } from '../interrupt.js'
 
 export interface AutoEatIntegrationOptions {
@@ -35,12 +10,9 @@ export interface AutoEatIntegrationOptions {
   healthBelow?: number
   /** How often to check, in ticks. Default 20 (once a second). */
   checkEveryTicks?: number
-  /**
-   * How long to wait for a safe moment before eating anyway (ms, default
-   * 10000). A bot that is genuinely wedged still has to eat.
-   */
+  /** Maximum wait for a safe moment before eating anyway, in ms (default 10000). */
   waitForSafe?: number
-  /** Don't eat while a window is open — clicking through a chest UI. Default true. */
+  /** Skip eating while a window is open (default true). */
   skipWhenWindowOpen?: boolean
   /** Options handed to the plugin's own `eat()`. */
   eatOptions?: Record<string, unknown>
@@ -70,6 +42,8 @@ interface BotLike {
   food?: number
   health?: number
   currentWindow?: unknown
+  entity?: { isInWater?: boolean }
+  setControlState?: (control: string, state: boolean) => void
   on: (event: string, listener: (...args: unknown[]) => void) => unknown
   removeListener: (event: string, listener: (...args: unknown[]) => void) => unknown
   emit: (event: string, ...args: unknown[]) => boolean
@@ -100,13 +74,12 @@ const DEFAULTS = {
   reason: 'autoeat'
 }
 
-/**
- * Build the plugin function. Load it AFTER both the pathfinder and
- * mineflayer-auto-eat; it tolerates being loaded before auto-eat finishes
- * injecting and picks it up on the first tick it appears.
- */
+/** Build an integration loaded after pathfinder and mineflayer-auto-eat.
+ * Delayed auto-eat injection is detected on a later tick. */
 export function autoEatIntegration (options: AutoEatIntegrationOptions = {}) {
-  return function inject (bot: BotLike): void {
+  // Typed as mineflayer's Bot, so that bot.loadPlugin accepts it.
+  return function inject (botArg: Bot): void {
+    const bot = botArg as unknown as BotLike
     const opts = {
       ...DEFAULTS,
       ...stripUndefined(options),
@@ -115,6 +88,7 @@ export function autoEatIntegration (options: AutoEatIntegrationOptions = {}) {
 
     let suspensions = 0
     let eating = false
+    let swimming = false
     let ticks = 0
     let takenOver = false
     let detached = false
@@ -123,15 +97,14 @@ export function autoEatIntegration (options: AutoEatIntegrationOptions = {}) {
       return bot.autoEat ?? null
     }
 
-    /** Turn the plugin's own physicsTick eating off — we drive it ourselves. */
+    /** Disable the plugin's automatic eating so interrupts control its timing. */
     function takeOver (): void {
       const ae = autoEat()
       if (!ae || takenOver) return
       takenOver = true
       if (typeof ae.disableAuto === 'function') ae.disableAuto()
       else if (typeof ae.disable === 'function') ae.disable()
-      // Keep the plugin's own threshold from second-guessing ours if a later
-      // version re-enables itself.
+      // Keep the plugin's threshold consistent if it re-enables itself.
       const bag = ae.opts ?? ae.options
       if (bag) {
         if ('startAt' in bag) bag.startAt = opts.startAt
@@ -154,11 +127,7 @@ export function autoEatIntegration (options: AutoEatIntegrationOptions = {}) {
       return false
     }
 
-    /**
-     * Ask the pathfinder for a safe moment, then eat. The interrupt is what
-     * makes this safe: it is granted on the ground, never mid-jump, and never
-     * while `pathfinder.dig()` or another exclusive holder has the hands.
-     */
+    /** Eat during a grounded interrupt, after exclusive actions release the bot's hands. */
     async function eatNow (): Promise<boolean> {
       const ae = autoEat()
       if (!ae || eating) return false
@@ -169,6 +138,9 @@ export function autoEatIntegration (options: AutoEatIntegrationOptions = {}) {
         if (pf && typeof pf.interrupt === 'function') {
           handle = await pf.interrupt(opts.reason, { timeout: opts.waitForSafe })
         }
+        // The pause leaves every control to this holder, so keep afloat while eating in water.
+        swimming = handle !== null && bot.entity?.isInWater === true
+        if (swimming) bot.setControlState?.('jump', true)
         bot.emit('pathfinder:autoeat_start')
         await ae.eat(opts.eatOptions)
         bot.emit('pathfinder:autoeat_finish')
@@ -177,6 +149,8 @@ export function autoEatIntegration (options: AutoEatIntegrationOptions = {}) {
         bot.emit('pathfinder:autoeat_failed', err)
         return false
       } finally {
+        if (swimming) bot.setControlState?.('jump', false)
+        swimming = false
         handle?.release()
         eating = false
       }

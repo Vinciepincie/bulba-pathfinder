@@ -12,7 +12,7 @@ import { parseArgs } from 'node:util'
 import { downloadPaper, upgradeWorld, writeServerConfig } from './server.js'
 import { HOST, MC_VERSION, PORT, RUN_DIR, WORLD_DIR } from './config.js'
 
-const UA = 'bulba-pathfinder-arena/1.0 (+https://github.com/bulbastore)'
+const UA = 'bulba-pathfinder-arena/1.0 (+https://github.com/Vinciepincie/bulba-pathfinder)'
 
 /** Optional: lets a spectator on any newer client join the 1.21.11 server. */
 async function downloadViaVersion (): Promise<void> {

@@ -1,21 +1,5 @@
-// The solve pipeline around physics-verified hops (allowParkourPhysics).
-//
-// A search that FAILS (no path, or out of think time) is handed to the hop
-// oracle (hopOracle.ts), which looks for exact-physics hops out of what the
-// search reached, from the tail of its best partial path. Each candidate hop
-// is judged by what it OPENS: a follow-up search from its landing. A hop that
-// reaches the goal wins outright (of several, the quickest whole path:
-// stitchTime); otherwise the one whose follow-up gets
-// strictly closer to the goal than anything reached so far — so a hop into a
-// dead end, or onto ground the search already had, is never taken, and the
-// goal heuristic is only a tie-break (courses wind; the hop that opens the
-// way can lead away from the goal first). The winner is stitched in —
-// prefix, hop node carrying its control program, follow-up — and the round
-// repeats from its landing until the goal is reached or the budget runs out.
-//
-// The result is a whole path to the goal or nothing: a stitched path that
-// stops short is not returned, so a route the pipeline cannot finish fails
-// exactly as it did before.
+// Judge simulated hops by follow-up search progress, since a useful hop can initially lead away from the goal.
+// Keep alternative branches and return a stitched path only when it reaches the goal.
 
 import type { HopOracle } from './hopOracle.js'
 import { newBody, SIM } from './playerSim.js'
@@ -25,87 +9,51 @@ import type { RawSolveResult } from './solver.js'
 export interface HopPipelineContext {
   oracle: HopOracle
   heuristic: (x: number, y: number, z: number) => number
-  /** A full search from `start` within `timeoutMs`; afterwards `reached` answers for it. */
+  /** Full search from `start` within `timeoutMs`; `reached` then describes this search. */
   solve: (start: { x: number, y: number, z: number }, timeoutMs: number) => RawSolveResult
-  /** A search from `start` to the one cell `cell` (the way to a vantage take-off); afterwards `reached` answers for it. */
+  /** Search from `start` to `cell` within `timeoutMs`; `reached` then describes this search. */
   solveTo?: (start: { x: number, y: number, z: number }, cell: { x: number, y: number, z: number }, timeoutMs: number) => RawSolveResult
-  /** Did the LAST solve() reach this cell? */
+  /** Whether the most recent search reaches this cell. */
   reached: (x: number, y: number, z: number) => boolean
-  /** The goal's cell, when it has one (a block or near goal): where vantage take-offs are looked for. */
+  /** Goal cell, when available, used to find elevated take-offs. */
   goal?: { x: number, y: number, z: number } | null
   /** performance.now() deadline for the whole pipeline. */
   deadline: number
-  /**
-   * The cell planner's edges out of (x, y, z) as flat x,y,z triples (no
-   * momentum), and whether a cell is one a body could stand in: with both the
-   * pipeline computes the goal side (goalSide). Absent: no goal side.
-   */
+  /** Planner edges as flat x,y,z triples without momentum; with nodeLike, enables backward goal-side search. */
   edgesFrom?: (x: number, y: number, z: number, out: number[]) => void
   nodeLike?: (x: number, y: number, z: number) => boolean
-  /**
-   * The body's exact feet position when the solve started (the worker's
-   * SolveMessage.startPos): a body beside a pane rail is in a place its start
-   * node does not mean, and the stitching starts from that rest (region mode).
-   */
+  /** Exact starting feet position; uses region stitching when the body rests somewhere its planner node cannot represent. */
   startRest?: { x: number, y: number, z: number } | null
-  /**
-   * Ban the move from cell `from` to cell `to` for every solve after this
-   * one (SnapshotView.bannedEdges: both cores skip it, the cells stay open to
-   * every other move). Absent: no planner jump is verified (stitchHops
-   * verifiedPath).
-   */
+  /** Ban only the directed move from `from` to `to` in subsequent searches.
+   * When absent, planner jumps are not verified. */
   banEdge?: (from: { x: number, y: number, z: number }, to: { x: number, y: number, z: number }) => void
-  /** The first search as verified (stitchHops verifiedPath), when that changed it: what the worker posts if nothing stitches. */
+  /** Receives the verified first search when verification changes it, for use if stitching fails. */
   onVerifiedFirst?: (r: RawSolveResult) => void
-  /**
-   * A stitched way to a landing no search reached before, past STREAM_AFTER_MS
-   * of a pipeline still running, for the bot to go on along meanwhile (its legs
-   * flown and verified, each landing one a body stops on): the worker's partial.
-   */
+  /** Receives a verified prefix to a new stable landing after STREAM_AFTER_MS while stitching continues. */
   onStitched?: (path: RawPathNode[]) => void
-  /** The host has cancelled the solve: the pipeline gives up at once (its result would be dropped). */
+  /** Whether the host cancels the solve; stops the pipeline immediately. */
   cancelled?: () => boolean
 }
 
-/**
- * verifiedPath: the kernel ticks one planner jump is flown for (the executor's
- * own searches at a rest and from the stand points, plugin.ts
- * TAKEOFF_REST_TICKS / TAKEOFF_LINED_TICKS), the footing it is asked for (the
- * take-off's or the landing's stands span less than VERIFY_NARROW along the
- * jump: a strip, where the planner prices a run-up or a landing the body has
- * no room for), the bans one path may take before it stands, and the bans of
- * a whole pipeline.
- */
+/** Verification budgets and ban limits for planner jumps with narrow take-off or landing footing.
+ * A narrow strip may lack room for the planner's assumed run-up or touchdown. */
 const VERIFY_TICKS = 200_000
-/** ...and the beam after the families, from stands (the executor's for a beam at a rest, plugin.ts TAKEOFF_REST_BEAM_TICKS). */
+/** Beam budget after family searches from stand points. */
 const VERIFY_BEAM_TICKS = 300_000
 const VERIFY_NARROW = 0.35
 const VERIFY_BANS = 8
 const VERIFY_BANS_TOTAL = 16
 
-/**
- * Goal-side closure bounds: predecessors are looked for within a hop's reach
- * of a cell (GOAL_SIDE_REACH_SQ, GOAL_SIDE_UP above to GOAL_SIDE_DOWN below),
- * at most GOAL_SIDE_GEN cells generated, in GOAL_SIDE_SHARE of the budget.
- */
+/** Backward goal-side search bounds: hop reach, vertical range, generated cells and budget share. */
 const GOAL_SIDE_REACH_SQ = 6.5 * 6.5
 const GOAL_SIDE_UP = 8
 const GOAL_SIDE_DOWN = 2
 const GOAL_SIDE_GEN = 4000
 const GOAL_SIDE_SHARE = 0.15
 
-/**
- * The GOAL SIDE of a failed search: the cells the cell planner reaches the
- * goal from — a backward closure over its own edges from the goal cell,
- * generated lazily, only round what is already on the goal side and never on
- * the cells the failed search reached (none of them reaches the goal: it
- * failed). A hop that lands on the goal side completes the route; the
- * oracle's candidates are otherwise ranked by the heuristic and capped at
- * MAX_REGRESS, so a hop that leads away from the goal to get there (arena
- * opk2-1: the slot under the corridor wall, 4.8 further than its take-off)
- * was never tried, and a cave below was tried first. Null when there is no
- * goal cell or no edge generator.
- */
+/** Cells from which planner edges reach the goal, found by backward closure excluding the failed search's reach.
+ * Goal-side hops bypass heuristic retreat limits because their follow-up can complete the route.
+ * Returns null without a goal cell or edge generator. */
 export type GoalSide = ((x: number, y: number, z: number) => boolean) & { cells: XYZ[] }
 export function goalSide (ctx: HopPipelineContext, deadline: number): GoalSide | null {
   const g = ctx.goal
@@ -155,58 +103,33 @@ export function goalSide (ctx: HopPipelineContext, deadline: number): GoalSide |
 
 /** Rounds (hops) one pipeline may stitch. */
 const MAX_ROUNDS = 8
-/**
- * A pipeline still getting closer gets more time: each hop that lands nearer
- * the goal than any before (by PROGRESS_MIN) pushes the deadline to at least
- * PROGRESS_STEP_MS from then, PROGRESS_MAX_MS past the first at most. One that
- * is not stops on time (an impossible route). Arena mcc-6-1, under the race's
- * load: twelve rounds of steady progress ran out two short of the goal.
- */
+/** New best progress refreshes the remaining time to PROGRESS_STEP_MS, capped at PROGRESS_MAX_MS beyond the initial deadline.
+ * Only a new best heuristic improvement of at least PROGRESS_MIN earns more time. */
 const PROGRESS_MIN = 0.5
 const PROGRESS_STEP_MS = 2500
 const PROGRESS_MAX_MS = 6000
-/**
- * The share of what is left a carry chain over ice gets (HopOracle.chain):
- * mcc-7-2's 107-tick chain is ~0.67M kernel ticks, 2-3 s, and it is the only
- * way across - nothing lands from rest on the last pads.
- */
+/** Budget share for ice carry chains; a stationary body on an ice pad may have no viable run-up. */
 const CHAIN_SHARE = 0.85
-/** ...and the kernel work a chain may fly before it is given up (mcc-7-2's takes 0.67M): a failing chain must not take the clock. */
+/** Kernel-work limit for a chain so a failing search cannot consume the remaining deadline. */
 const CHAIN_TICKS = 1_000_000
-/**
- * ...and a REGION chain (StitchState.rest): hops between the places of nodes
- * the planner files as one (beside a pane rail, on it, beyond it), each a
- * round - a line of hoops is a dozen of them (arena mcc-6-1: 12).
- */
+/** Maximum region-chain rounds; each hop can move between places that share one planner node. */
 const MAX_REGION_ROUNDS = 20
 /** How much further from the goal (heuristic) a region hop may land and still be kept: a pane crossed inside a hoop gets no closer. */
 const REGION_SLACK = 1
 /** Nodes at the end of the best partial path the oracle takes off from. */
 const SOURCES = 8
-/**
- * A pipeline streams nothing for this long (ms): one done sooner reaches the
- * bot as a whole path before the bot could use a part of it.
- */
+/** Streaming delay in milliseconds; a quicker pipeline returns the whole path before a prefix is useful. */
 const STREAM_AFTER_MS = 150
 /** Candidate hops per round, each judged by a follow-up search. */
 const EDGES = 6
-/**
- * ...and in a region chain's round (discoverFromRest): best-first follows
- * the best of them, and the rest cost a round its time - arena mcc-6-1 under
- * load, 6 a round 5.2-6.1 s, 2 a round 2.8-3.0 s, the same 12 programs.
- */
+/** Candidate limit per region round; best-first expansion follows the best while alternatives consume discovery time. */
 const REGION_EDGES = 2
 /** Share of the remaining budget one discovery may spend. */
 const DISCOVER_SHARE = 0.5
 /** Least think time a follow-up search is given. */
 const FOLLOW_UP_MIN_MS = 20
-/**
- * Vantage take-offs (vantages()): reached cells within VANTAGE_REACH of the
- * goal horizontally (a hop's reach, a rebound's, and one more), at least
- * VANTAGE_ABOVE over the partial path's end (above anything a hop from there
- * rises to) and at most VANTAGE_OVER over the goal; the highest of each
- * column, the VANTAGES best.
- */
+/** Vantage bounds around the goal and above the partial-path end, in blocks.
+ * Keep the highest reached cell per column, capped at VANTAGES. */
 const VANTAGE_REACH = 16
 const VANTAGE_ABOVE = 3
 const VANTAGE_OVER = 10
@@ -214,15 +137,8 @@ const VANTAGES = 4
 
 type XYZ = { x: number, y: number, z: number }
 
-/**
- * Higher ground the failed search reached near the goal. The partial path
- * ends wherever the heuristic bottomed out — under a goal on a ledge, on the
- * floor right beneath it, where no hop rises far enough — while the way up
- * starts somewhere the search reached but did not end: a ladder's top edge to
- * jump off, onto slime that throws the body up there (the arena's Ten Ways
- * slime room). The highest reached cell of each column round the goal, the
- * nearest and highest first (a block of height is worth a block of reach).
- */
+/** Elevated take-offs near the goal can enable hops that the partial path's lower endpoint cannot reach.
+ * Returns the highest reached cell per column, ranked by proximity and height. */
 export function vantages (reached: (x: number, y: number, z: number) => boolean, goal: XYZ, end: XYZ, exclude: readonly XYZ[]): XYZ[] {
   const lo = end.y + VANTAGE_ABOVE
   const hi = goal.y + VANTAGE_OVER
@@ -245,11 +161,7 @@ export function vantages (reached: (x: number, y: number, z: number) => boolean,
   return out.slice(0, VANTAGES).map(v => v[0])
 }
 
-/**
- * Drop-edge take-offs (dropTakeoffs): at most DROP_TAKEOFFS of them, given
- * DROP_SHARE of a discovery's budget, each flown by the bounce family alone
- * until its first edge.
- */
+/** Limit drop-edge take-offs and their discovery budget share; try bounce searches until the first edge. */
 const DROP_TAKEOFFS = 4
 const DROP_SHARE = 0.4
 /** The slime ring a drop take-off is looked for in (hopOracle.ts BOUNCE_REACH). */
@@ -257,15 +169,8 @@ const DROP_RING = 7
 /** How high above the highest source a drop take-off may be (hopOracle.ts HOP_RISE). */
 const DROP_RISE = 2
 
-/**
- * Ledges over slime the failed search reached but its partial path walked
- * past: the highest reached cell of each column round the slime tops the
- * sources see, with a drop beside it (HopOracle.openDrop) — the way down to
- * the slime. The partial path ends wherever the heuristic bottomed out; on
- * arena mcc-3-1 that is behind a pane window, and the ledge the 9-block drop
- * onto the slime leaves from (the only take-off the physics lands from) is
- * three columns along, reached and never a source. Nearest the slime first.
- */
+/** Reached ledges above nearby slime, ranked nearest the slime first.
+ * The best partial path can pass a useful drop edge without including it among its take-off sources. */
 export function dropTakeoffs (oracle: HopOracle, reached: (x: number, y: number, z: number) => boolean, sources: readonly XYZ[]): XYZ[] {
   const tops = new Map<string, [number, number, number]>()
   for (const src of sources) for (const t of oracle.slimeTops(src.x, src.y, src.z)) tops.set(`${t[0]},${t[1]},${t[2]}`, t)
@@ -299,38 +204,17 @@ export function dropTakeoffs (oracle: HopOracle, reached: (x: number, y: number,
   return out.slice(0, DROP_TAKEOFFS).map(o => o[0])
 }
 
-/**
- * Frontier take-offs (frontierSources): at most FRONTIERS of them, looked
- * for among the reached cells within FRONTIER_SCAN of the tail horizontally
- * (FRONTIER_DOWN below its lowest node to FRONTIER_UP above its highest),
- * the FRONTIER_TESTS lowest-heuristic standable ones tested for an opening.
- */
+/** Frontier bounds around the partial-path tail; test the lowest-heuristic standable cells for openings. */
 const FRONTIERS = 4
-/**
- * ...of them the goal-side picks at most (untested for an opening: they could crowd out the take-offs that
- * open - arena mcc-8-2, four cells near a goal-side cell and none the kick leaves from). Capped, mcc-8-2
- * stitches (offline: null -> 17 nodes; the other 16 pipeline routes identical) and, with the executor's
- * slip keys, arrives on all three engines (2026-10-10; uncapped its run had fallen from P3's plate band).
- * PF_SIDE_FRONTIERS overrides it (A/B).
- */
+/** Cap untested goal-side take-offs so they cannot crowd out sources with verified openings. */
 const SIDE_FRONTIERS = process.env.PF_SIDE_FRONTIERS !== undefined ? Number(process.env.PF_SIDE_FRONTIERS) : 2
 const FRONTIER_SCAN = 8
 const FRONTIER_DOWN = 6
 const FRONTIER_UP = 4
 const FRONTIER_TESTS = 48
 
-/**
- * Take-offs the failed search reached off its partial path: reached,
- * standable cells round the tail that look out on unreached ground a hop
- * could land on (HopOracle.opens), nearest the goal first, a cell column or
- * two levels apart from the tail and from each other. The partial path
- * follows the heuristic to where it bottomed out; the way on may leave from
- * a ledge beside it (opk2-5: the grate pillar 810,233,-395 two blocks over
- * the chain the partial ends on, its jump under the shelf refused by the
- * cell planner) or from a detour that winds away first (opk2-1: the moss
- * stone 969,242,-396 whose slot drop under the corridor wall the planner
- * has no class for).
- */
+/** Reached take-offs near the tail that overlook unreached landing ground, ranked nearest the goal first.
+ * Separate sources by a column or two levels to cover ledges and detours the partial path misses. */
 export function frontierSources (oracle: HopOracle, reached: (x: number, y: number, z: number) => boolean, heuristic: (x: number, y: number, z: number) => number, sources: readonly XYZ[], side: GoalSide | null = null): XYZ[] {
   if (sources.length === 0) return []
   let x0 = Infinity; let x1 = -Infinity; let y0 = Infinity; let y1 = -Infinity; let z0 = Infinity; let z1 = -Infinity
@@ -351,7 +235,7 @@ export function frontierSources (oracle: HopOracle, reached: (x: number, y: numb
   const picks: XYZ[] = []
   const apart = (x: number, y: number, z: number, p: XYZ): boolean => Math.max(Math.abs(p.x - x), Math.abs(p.z - z)) > 1 || Math.abs(p.y - y) >= 2
   let tests = 0
-  // (first the cells a goal-side cell is within hop range of: the hop off them completes the route)
+  // Prioritize sources within hop range of a goal-side cell, since such a hop can complete the route.
   if (side != null && side.cells.length > 1) {
     for (const [x, y, z] of cells) {
       if (picks.length >= SIDE_FRONTIERS || tests >= FRONTIER_TESTS) break
@@ -373,16 +257,8 @@ export function frontierSources (oracle: HopOracle, reached: (x: number, y: numb
   return picks
 }
 
-/**
- * The part of a failed search's partial path the bot may walk while the
- * pipeline runs: up to (not including) the node nearest any level-0 off-path
- * take-off — a vantage, a drop edge — that the pipeline may stitch from, the
- * whole partial when there is none. The bot otherwise stood for the whole
- * pipeline (arena mcc-3-2: 14 ticks; mcc-4-2: 75), where a search that
- * happened to flood its box streamed partials and the bot walked from the
- * first tick, onto the same prefix the stitched path then kept. The host's
- * partial rules still hold: cut at a one-way drop, never emitted empty.
- */
+/** Walkable prefix ending before the earliest candidate off-path take-off, or the whole partial path if none.
+ * The host still cuts at one-way drops and never emits an empty prefix. */
 export function streamablePrefix (first: RawSolveResult, start: XYZ, oracle: HopOracle, reached: (x: number, y: number, z: number) => boolean, goal: XYZ | null): RawPathNode[] {
   const path = first.path
   if (path.length === 0) return []
@@ -391,10 +267,8 @@ export function streamablePrefix (first: RawSolveResult, start: XYZ, oracle: Hop
   const high = goal !== null ? vantages(reached, goal, end, sources) : []
   const cands = [...high, ...vantages(reached, end, end, [...sources, ...high]), ...dropTakeoffs(oracle, reached, sources)]
   if (cands.length === 0) return path.slice()
-  // (each candidate's nearest point of the walk - the start itself too - and
-  // the earliest of those: never past a take-off the pipeline may choose.
-  // The single nearest pair cut arena mcc-3-1 at a drop by the partial's far
-  // end, the bot walked 14 ticks west and back to the drop behind its start)
+  // Cut at the earliest of each candidate's nearest path point, including the start.
+  // Choosing only the single nearest pair can walk the bot past another usable take-off.
   let cut = path.length
   for (const c of cands) {
     let at = 0
@@ -408,23 +282,12 @@ export function streamablePrefix (first: RawSolveResult, start: XYZ, oracle: Hop
   return path.slice(0, cut)
 }
 
-/** PF_HOP_DEBUG=1: one line per pipeline round on stderr (diagnostic). */
+/** Enables per-round hop-pipeline diagnostics on stderr. */
 const DEBUG = process.env.PF_HOP_DEBUG === '1'
 
-/**
- * One state of the stitching search: a stitched prefix ending at a hop's
- * landing (`curStart`), the follow-up search from there (`cur`), how close
- * it got (`score`, its best node's heuristic), how many hops deep, and the
- * discovery level its next expansion runs:
- * 0 — vantages (goal and end) and drop-edge take-offs, the partial's tail
- *     only when those find nothing;
- * 1 — the partial's tail, when level 0 skipped it;
- * 2 — frontier take-offs off the tail (frontierSources), and hops onto the
- *     goal side (goalSide);
- * 3 — the yaw family (then the kicks, HopOracle 'kick') from the tail, then
- *     from the frontier;
- * 4 — the beam from the tail.
- */
+/** Stitched prefix, follow-up and next discovery level: 0 elevated/drop sources, 1 deferred tail,
+ * 2 frontier and goal-side sources, 3 yaw/kick then pivot searches, 4 beam.
+ * Cheaper levels run first so expensive searches do not exhaust every alternative. */
 interface StitchState {
   stitched: RawPathNode[]
   cur: RawSolveResult
@@ -433,27 +296,17 @@ interface StitchState {
   depth: number
   level: number
   tailSkipped: boolean
-  /**
-   * The exact rest the last hop came to, when the chain is in REGION mode:
-   * the hop landed beside a thin block (an under region: HopOracle.regions),
-   * where the planner's node means a place the body is not, or it was flown
-   * from such a rest. Expanded by HopOracle.discoverFromRest from this rest
-   * alone; null: the ordinary pipeline.
-   */
+  /** Exact rest for region stitching, where the planner node can represent a different footing.
+   * Expanded from this rest; null selects ordinary stitching. */
   rest: { x: number, y: number, z: number } | null
   /** The rest is in an under region: no planner follow-up from it. */
   under: boolean
-  /** 1: a fallback tried only once every ordinary state is spent (a start rest the start cell does not mean). */
+  /** Fallback tier, tried after ordinary states when the starting rest differs from the start cell's footing. */
   tier: number
-  /** Level 0 flew the carry chain over ice instead of the vantages and drop take-offs: level 1 flies them, before the tail. */
+  /** Level 1 tries elevated and drop sources before the tail when level 0 uses an ice carry chain. */
   deferL0?: boolean
-  /**
-   * The drop take-offs of a level 0 whose vantages found edges, deferred
-   * (stitchHops): sorted at the parent's level and score, they are flown
-   * once no level-0 state that got closer is left. Arena mcc-4-2's rounds
-   * spent 35-50% of the pipeline on drops while its vantage hops got
-   * closer, and no drop state is ever on its final path.
-   */
+  /** Deferred drop take-offs at the parent's level and score; try them after closer level-0 states.
+   * This preserves time for progress through elevated hops. */
   dropsOnly?: boolean
   /** A state whose follow-up reached the goal: the whole path's time (stitchTime), what the successes of one round are ranked by. */
   time?: number
@@ -462,36 +315,22 @@ interface StitchState {
 /** Ticks a unit of planner cost stands for (a block at a sprint): stitchTime. */
 const TICKS_PER_COST = 3.6
 
-/**
- * The time a stitched path takes, in units of planner cost: its programs'
- * ticks (TICKS_PER_COST) and the planner's cost for the rest. The successes
- * one round finds are ranked by it - discovery order had arena opk2-2 fly
- * a 119-tick catch with 111-tick ones beside it.
- */
+/** Estimated stitched duration in planner-cost units, combining program ticks and ordinary path costs.
+ * Ranks successful candidates so discovery order does not choose a slower route. */
 function stitchTime (path: ReadonlyArray<RawPathNode>): number {
   let t = 0
   for (const n of path) t += n.program !== null && n.program !== undefined ? n.program.ticks / TICKS_PER_COST : n.cost
   return t
 }
 
-/**
- * Best-first over the hops (improvement). The old loop committed to the
- * round's best hop and failed outright when its follow-up dead-ended: on
- * arena mcc-4-2 the hop onto a slime balloon (follow-up best h 22.4) beat
- * the hop onto the next tower's ladder (26.2), opened nothing, and the
- * pipeline returned null. Every hop whose follow-up gets strictly closer is
- * kept; the closest is expanded first (which is the old pick), the others
- * stay in reserve, and the costlier discoveries (the tail when vantages
- * found something, the yaw family, the beam) are deferred levels of the same
- * state, so every state's cheap hops are tried before any one's expensive.
- */
+/** Best-first hop stitching keeps progressing alternatives available if the closest branch dead-ends.
+ * Deferred discovery levels try cheap hops across states before expensive searches. */
 export function stitchHops (first: RawSolveResult, start: XYZ, ctx: HopPipelineContext): RawSolveResult | null {
   const t0 = performance.now()
-  // (the first search's own think time: a verified re-solve's is inside this pipeline's)
+  // Verified re-solves count inside pipeline time; only the original search time is added separately.
   const firstTime = first.time
   const h = (n: XYZ): number => ctx.heuristic(n.x, n.y, n.z)
   const last = (r: RawSolveResult, at: XYZ): XYZ => r.path.length > 0 ? r.path[r.path.length - 1] : at
-  // (progress extends the deadline: PROGRESS_*)
   const hardDeadline = ctx.deadline + PROGRESS_MAX_MS
   let bestSeen = h(last(first, start))
   /** The quickest stitched path that reached the goal so far (stitchTime): a slower success is not pushed. */
@@ -504,11 +343,8 @@ export function stitchHops (first: RawSolveResult, start: XYZ, ctx: HopPipelineC
   const chunks = new Map<string, [number, number]>()
   const addChunks = (r: RawSolveResult): void => { for (const c of r.touchedChunks) chunks.set(`${c[0]},${c[1]}`, c) }
   addChunks(first)
-  /**
-   * Do the stands of take-off `from` or landing `n` span less than
-   * VERIFY_NARROW along the jump between them (a strip)? False where either
-   * has none: the oracle has no model of that footing.
-   */
+  /** Whether take-off or landing stands span less than VERIFY_NARROW along the jump.
+   * Returns false if either has no stands, since the oracle lacks a footing model. */
   const narrowJump = (from: XYZ, n: XYZ): boolean => {
     const along = Math.abs(n.x - from.x) >= Math.abs(n.z - from.z)
     const span = (c: XYZ): number => {
@@ -528,26 +364,13 @@ export function stitchHops (first: RawSolveResult, start: XYZ, ctx: HopPipelineC
   /** Planner jumps verifiedPath has flown (they land) or banned, by from:to cells. */
   const verifiedJumps = new Set<string>()
   let bans = 0
-  /**
-   * Path `r` from `from` with its planner jumps that are no jumps banned:
-   * each one onto or off a strip (narrowJump) is flown first - from `rest`
-   * when it is the path's first move off a known rest (the body's own at a
-   * replan, a program's landing), then from its take-off's stand points on
-   * the grid of turns, as the executor searches a take-off it is stuck at
-   * (plugin.ts: at the rest, then hopLinedUp) - and one that no search run
-   * to its end lands (a budget spent is no verdict: the executor bans only an
-   * exhausted search: the families run to their end with nothing, or the
-   * beam where they ran out) is banned (ctx.banEdge) and the path searched again
-   * (`again`). Momentum chains and slime bounces are flown off the jump
-   * before them, never from rest: not asked. Arena mcc-8-2: the planner's
-   * jumps onto the strip of 3/16 panels beside the pipe fly from nowhere, and
-   * the executor gave up and re-planned three times, 3 s each, a strip cell a
-   * time, before a plan took the pipe.
-   */
+  /** Verify planner jumps on narrow footing, ban proven failures and re-solve the path.
+   * Try the known rest first, then stand points; budget exhaustion alone is no verdict.
+   * Skip momentum chains and slime bounces because their starts depend on the preceding flight. */
   const verifiedPath = (from: XYZ, rest: XYZ | null, r: RawSolveResult, again: () => RawSolveResult): RawSolveResult => {
     if (ctx.banEdge === undefined) return r
     const o = ctx.oracle
-    // one search on its own budget: did it land a flight, and did it run to its end?
+    // Track both a landed flight and an exhausted search; a timeout alone cannot disprove the jump.
     const attempt = (ticks: number, fly: () => unknown): { found: boolean, complete: boolean } => {
       o.tickLimit = o.ticksFlown + ticks
       o.noVerdict = false
@@ -580,8 +403,7 @@ export function stitchHops (first: RawSolveResult, start: XYZ, ctx: HopPipelineC
           res = attempt(VERIFY_TICKS, () => o.hopFrom(b, [n.x, n.y, n.z], ctx.deadline))
         }
         if (!res.found) {
-          // (the families run to their end with nothing are the verdict, as the
-          // executor's ban; the beam only where they ran out of budget)
+          // Completed family searches give a verdict; try the beam only when those searches exhaust their budget.
           res = attempt(VERIFY_TICKS, () => o.hop([p.x, p.y, p.z], [n.x, n.y, n.z], ctx.deadline, 'all', true))
           if (!res.found && !res.complete) {
             beamed = true
@@ -606,7 +428,6 @@ export function stitchHops (first: RawSolveResult, start: XYZ, ctx: HopPipelineC
     }
     return r
   }
-  // (the first search's planner jumps: from the body's own rest at a replan)
   {
     const r0 = first
     first = verifiedPath(start, ctx.startRest ?? null, first, () => ctx.solve(start, Math.max(FOLLOW_UP_MIN_MS, (ctx.deadline - performance.now()) * DISCOVER_SHARE)))
@@ -616,12 +437,12 @@ export function stitchHops (first: RawSolveResult, start: XYZ, ctx: HopPipelineC
       ctx.onVerifiedFirst?.(first)
     }
   }
-  // (the goal side: computed once, against the FIRST search's reach, at the first escalation that uses it)
+  // Goal-side closure must use the first search's reach, regardless of later follow-ups.
   let side: GoalSide | null | undefined
   const sideOf = (): GoalSide | null => {
     if (side === undefined) {
       const tS = performance.now()
-      // `reached` must answer for the first search: re-run it if a follow-up overwrote it
+      // Re-run the first search if a follow-up overwrites its reach.
       if (reachedFor === null || !sameCell(reachedFor, start)) {
         const r0 = ctx.solve(start, Math.max(1, ctx.deadline - performance.now()))
         reachedFor = start
@@ -641,15 +462,11 @@ export function stitchHops (first: RawSolveResult, start: XYZ, ctx: HopPipelineC
     return `${c.x},${c.y},${c.z}#${i >= 0 ? i : `${Math.round(rest.x * 16)},${Math.round(rest.y * 16)},${Math.round(rest.z * 16)}`}`
   }
   const noFollowUp = (r: RawSolveResult): RawSolveResult => ({ ...r, status: 'noPath', path: [], visitedNodes: 0, generatedNodes: 0, touchedChunks: [], cost: 0 })
-  // a body resting on a node of several places (beside a pane rail, on it):
-  // the stitching starts from the rest, in region mode - and beside the rail
-  // (an under region) the first search's partial path is from a place the
-  // body is not
+  // Region stitching starts at the actual rest; a planner path beside a rail can refer to different footing.
   if (ctx.startRest != null) {
     const r = ctx.startRest
     const hw = ctx.oracle.halfWidth
-    // the node whose place the body is in: of the columns under its box, the
-    // start's first (a body over a lip is filed under the column it stands on)
+    // Prefer the start column for an overhanging body before considering other support columns.
     const cols: Array<[number, number]> = []
     for (let cx = Math.floor(r.x - hw); cx <= Math.floor(r.x + hw); cx++) for (let cz = Math.floor(r.z - hw); cz <= Math.floor(r.z + hw); cz++) cols.push([cx, cz])
     const rank = (c: [number, number]): number => (c[0] === start.x && c[1] === start.z ? -1 : Math.hypot(c[0] + 0.5 - r.x, c[1] + 0.5 - r.z))
@@ -661,16 +478,16 @@ export function stitchHops (first: RawSolveResult, start: XYZ, ctx: HopPipelineC
       if (at === undefined) continue
       const rest = { x: r.x, y: r.y, z: r.z }
       if (at.under) {
-        // beside the block: the first search's partial path is from a place the body is not
+        // The planner path starts at different footing from this under-region rest.
         frontier[0] = { stitched: [], cur: noFollowUp(first), curStart: node, score: h(node), depth: 0, level: 0, tailSkipped: false, rest, under: true, tier: 0 }
         reachedFor = null
         regionSeen.add(placeKey(node, r))
       } else if (ctx.oracle.underStands(node.x, node.y, node.z).length > 0) {
-        // on top of a rail whose sides are places too: the ordinary pipeline AND the rest's region chain
+        // Keep both planner and region continuations when a rail's sides provide separate footing.
         frontier.push({ ...frontier[0], curStart: node, score: h(node), rest, tier: 0 })
         regionSeen.add(placeKey(node, r))
       } else if (regs.length > 1 || !sameCell(node, start)) {
-        // a place the start cell does not mean: the region chain from the rest, once the ordinary pipeline is spent
+        // Use the rest's region as a fallback when the start cell represents different footing.
         frontier.push({ ...frontier[0], curStart: node, score: h(node), rest, tier: 1 })
       }
       break
@@ -678,7 +495,7 @@ export function stitchHops (first: RawSolveResult, start: XYZ, ctx: HopPipelineC
   }
   const tried = new Set<string>()
   let expansions = 0
-  /** The closest a streamed way has got to the goal, and its legs (ctx.onStitched). */
+  /** Best heuristic reached by a streamed prefix and the hops already streamed. */
   let bestStreamed = Infinity
   let streamedHops: RawPathNode[] = []
   while (frontier.length > 0) {
@@ -703,9 +520,8 @@ export function stitchHops (first: RawSolveResult, start: XYZ, ctx: HopPipelineC
       }
     }
     if (performance.now() >= ctx.deadline || ctx.cancelled?.() === true) return null
-    // (a region state has one level: simple families from its rest)
+    // Region states use only simple families from their exact rest.
     if (st.depth >= (st.rest !== null ? MAX_REGION_ROUNDS : MAX_ROUNDS) || st.level > (st.rest !== null ? 0 : 4)) continue
-    // (level 1 is the tail when level 0 skipped it; otherwise straight on to the frontier, no re-solve)
     if (st.level === 1 && !st.tailSkipped) {
       frontier.push({ ...st, level: 2 })
       continue
@@ -714,12 +530,10 @@ export function stitchHops (first: RawSolveResult, start: XYZ, ctx: HopPipelineC
     if (tried.has(tkey)) continue
     tried.add(tkey)
     expansions++
-    // (the goal side first: it needs the first search's reach, and may re-run it)
+    // Compute goal-side candidates before a re-solve can overwrite the first search's reach.
     const sideNow = st.rest === null && (st.level === 2 || st.level === 3) ? sideOf() : null
     if (!st.under && (reachedFor === null || !sameCell(reachedFor, curStart))) {
-      // the follow-ups (or a search to one cell) overwrote what `reached` answers for
-      // (a share of what is left, as a follow-up gets: one search that floods
-      // its box must not take the whole think budget)
+      // Restore reach after follow-ups, using only a budget share so a flooding search cannot consume all remaining time.
       const resolve = (): RawSolveResult => ctx.solve(curStart, Math.max(FOLLOW_UP_MIN_MS, (ctx.deadline - performance.now()) * DISCOVER_SHARE))
       cur = resolve()
       reachedFor = curStart
@@ -737,8 +551,6 @@ export function stitchHops (first: RawSolveResult, start: XYZ, ctx: HopPipelineC
     let front: XYZ[] = []
     let tailSkipped = st.tailSkipped
     let deferNext = false
-    // higher ground the search reached near the goal, and near where it ended;
-    // then the ledges over the slime the tail sees, each to its first bounce
     const vantageEdges = (): ReturnType<HopOracle['discover']> => {
       if (ctx.solveTo !== undefined) {
         const end = last(cur, curStart)
@@ -760,19 +572,14 @@ export function stitchHops (first: RawSolveResult, start: XYZ, ctx: HopPipelineC
     }
     const offPath = (): ReturnType<HopOracle['discover']> => vantageEdges().concat(dropEdges())
     if (st.dropsOnly === true) {
-      // (a level 0's deferred drop take-offs: nothing else, no level after)
       edges = dropEdges()
     } else if (st.rest !== null) {
-      // a region chain: from the rest alone, to every place in hop range
-      // (the planner's reach only where it ran from here)
+      // Only use planner reach from this start when skipping already reached region landings.
       const skipTop = !st.under && reachedFor !== null && sameCell(reachedFor, curStart) ? ctx.reached : null
       edges = ctx.oracle.discoverFromRest(curStart, st.rest, ctx.heuristic, share(), skipTop, REGION_EDGES, 'simple')
     } else if (st.level === 0) {
-      // a partial path that ends on ice: the carry chain from the last firm
-      // node, FIRST (HopOracle.chainStart) - the tail's own hops leave from
-      // ice, where nothing stops for a run-up
-      // (only across gaps: a parkour leg in the icy run - a partial that
-      // merely ends on an ice floor is no chain)
+      // Ice gaps can require momentum from the last firm node; a hop from rest on ice loses that run-up.
+      // Require a parkour leg so an ordinary ice-floor endpoint does not trigger a carry chain.
       const all = [curStart, ...cur.path.map(n => ({ x: n.x, y: n.y, z: n.z }))]
       const ci = ctx.oracle.chainStart(all)
       if (ci >= 0 && cur.path.slice(ci).some(n => n.parkour === true)) {
@@ -784,11 +591,10 @@ export function stitchHops (first: RawSolveResult, start: XYZ, ctx: HopPipelineC
         }
       }
       if (edges.length > 0) {
-        // (the vantages and drop take-offs go to level 1, before the tail)
         tailSkipped = true
         deferNext = true
       } else {
-        // the vantages first; their drops deferred while those get closer (StitchState.dropsOnly)
+        // Defer drop searches while elevated hops continue to make progress.
         edges = vantageEdges()
         if (edges.length > 0) {
           if (ctx.solveTo !== undefined && dropTakeoffs(ctx.oracle, ctx.reached, sources).length > 0) {
@@ -804,15 +610,13 @@ export function stitchHops (first: RawSolveResult, start: XYZ, ctx: HopPipelineC
       if (st.deferL0 === true) edges = offPath()
       if (tailSkipped) edges = edges.concat(ctx.oracle.discover(sources, ctx.heuristic, share(), ctx.reached, EDGES))
     } else if (st.level === 2 || st.level === 3) {
-      // reached take-offs beside the tail: simple families, then the yaw
-      // family after the tail's (discover flies its sources last first)
-      // (and goal-side landings, worth any regress: hopPipeline.ts goalSide)
+      // Try simple frontier hops before yaw/kick escalation; goal-side landings bypass retreat limits.
       if (ctx.solveTo !== undefined) front = frontierSources(ctx.oracle, ctx.reached, ctx.heuristic, sources, sideNow)
       if (st.level === 2) {
         if (front.length > 0) edges = ctx.oracle.discover(front, ctx.heuristic, share(), ctx.reached, EDGES, 'simple', sideNow)
       } else {
         edges = ctx.oracle.discover([...front, ...sources], ctx.heuristic, share(), ctx.reached, EDGES, 'yawKick', sideNow)
-        // narrow landings off the tail's end: the pivot family, where nothing else lands (HopProgram.precise)
+        // Precision pivots handle narrow landings when other families find no hop.
         if (edges.length === 0) edges = ctx.oracle.discover(sources.slice(-2), ctx.heuristic, share(), ctx.reached, EDGES, 'pivot')
       }
     } else {
@@ -828,15 +632,11 @@ export function stitchHops (first: RawSolveResult, start: XYZ, ctx: HopPipelineC
       const left = ctx.deadline - performance.now()
       if (left <= 0 || ctx.cancelled?.() === true) break
       const target = { x: e.program.tx, y: e.program.ty, z: e.program.tz }
-      // (never a program off ice: its line-up slides, and the ones it opens
-      // are over voids - mcc-7-2's pads; the precision line-up is not there yet)
+      // Reject take-offs on ice because the required stationary line-up slides.
       if (ctx.oracle.onIce(e.fromX, e.fromY, e.fromZ)) continue
-      // where the hop's body comes to rest: beside a thin block in the cell
-      // below the node (an under region), the planner's node is a place the
-      // body is not - no planner follow-up from there, and the hop is held
-      // to that place (HopProgram.land) wherever it is flown again
+      // A rest beside a thin block below the node has no planner continuation from its actual footing.
+      // Hold replay to that region and continue through region hops.
       const rest = e.program.catchTarget ? null : ctx.oracle.restOf(e.program)
-      // (beside the block in the cell under the node, not on a low block's top: HopOracle.besideRest)
       const under = rest !== null && ctx.oracle.besideRest([target.x, target.y, target.z], rest)
       let prog = e.program
       if (under && prog.land === undefined) {
@@ -846,27 +646,22 @@ export function stitchHops (first: RawSolveResult, start: XYZ, ctx: HopPipelineC
         prog = { ...held, ticks }
       }
       const region = st.rest !== null || under
-      // an even share of what is left, one more kept for the states after: a
-      // follow-up that floods its box must not starve the candidates after it
+      // Reserve an extra share for later states so one flooding follow-up cannot starve the remaining candidates.
       let f = under ? noFollowUp(cur) : ctx.solve(target, Math.max(FOLLOW_UP_MIN_MS, left / (edges.length - ei + 1)))
       if (!under) reachedFor = target
       visited += f.visitedNodes
       generated += f.generatedNodes
-      // (its planner jumps onto and off strips, the first from the hop's own rest)
-      // (only one that could be kept: a ban never brings a follow-up closer)
+      // Verify only keepable follow-ups; banning a move cannot improve their heuristic progress.
       if (!under && (f.status === 'success' || h(last(f, target)) < bestH || region)) f = verifiedPath(target, rest, f, () => ctx.solve(target, Math.max(FOLLOW_UP_MIN_MS, (ctx.deadline - performance.now()) / (edges.length - ei + 1))))
       const score = f.status === 'success' ? -Infinity : h(last(f, target))
       const pk = region && rest !== null ? placeKey(target, rest) : ''
       if (DEBUG) console.warn(`[hops]   cand ${e.fromX},${e.fromY},${e.fromZ} -> ${target.x},${target.y},${target.z} ${prog.family} ${prog.ticks}t${rest !== null ? ` rest ${rest.x.toFixed(2)},${rest.y.toFixed(2)},${rest.z.toFixed(2)}${under ? ' UNDER' : ''}` : ''}: follow-up ${f.status} visited ${f.visitedNodes} best h ${score.toFixed(1)}`)
-      // a hop is kept only where it gets strictly closer than its state did -
-      // or, in a region chain, onto a place not landed on before, no more
-      // than REGION_SLACK further (across the pane inside a hoop)
+      // Region chains may trade limited heuristic retreat for a previously unseen place within a node.
       if (!(score < bestH) && !(region && st.rest !== null && score <= bestH + REGION_SLACK && pk !== '' && !regionSeen.has(pk))) continue
       if (pk !== '') regionSeen.add(pk)
-      // follow-ups that end at the same cell open the same ground: the first (discovery order) stands -
-      // but of those that reach the goal, a quicker one (stitchTime) is pushed too, the sort taking it first
+      // Follow-ups ending at the same cell open the same ground; retain faster successful paths too.
       const end = last(f, target)
-      // (a region hop that opens nothing for the planner: its place is what it opens)
+      // An empty planner continuation can still open a new region.
       const lk = pk !== '' && f.path.length === 0 ? pk : `${end.x},${end.y},${end.z}`
       const succeeded = f.status === 'success'
       if (seenLand.has(lk) && !succeeded) continue
@@ -880,7 +675,7 @@ export function stitchHops (first: RawSolveResult, start: XYZ, ctx: HopPipelineC
         if (at >= 0) {
           prefix = cur.path.slice(0, at + 1)
         } else {
-          // an off-path take-off (a vantage, a drop edge): the way to it, reached so there is one
+          // Off-path take-offs need a verified path from the current start.
           if (ctx.solveTo === undefined) continue
           const solveTo = ctx.solveTo
           const way = (): RawSolveResult => solveTo(curStart, from, Math.max(FOLLOW_UP_MIN_MS, (ctx.deadline - performance.now()) * DISCOVER_SHARE))
@@ -900,7 +695,7 @@ export function stitchHops (first: RawSolveResult, start: XYZ, ctx: HopPipelineC
         x: pr.tx,
         y: pr.ty,
         z: pr.tz,
-        // priced like the table prices a jump: blocks of distance plus the pad
+        // Use the planner's jump cost so stitched and ordinary paths remain comparable.
         cost: Math.hypot(pr.tx - from.x, pr.tz - from.z) + 0.5 + Math.max(0, pr.ty - from.y),
         parkour: true,
         useOne: null,
@@ -914,20 +709,15 @@ export function stitchHops (first: RawSolveResult, start: XYZ, ctx: HopPipelineC
       }
       const pushed: StitchState = { stitched, cur: f, curStart: target, score, depth: st.depth + 1, level: 0, tailSkipped: false, rest: region && rest !== null ? { x: rest.x, y: rest.y, z: rest.z } : null, under, tier: st.tier, time }
       frontier.push(pushed)
-      // (a region's place is no node the host can carry on from)
+      // The host cannot continue an ordinary planner path from a region-only rest.
       if (!succeeded && !region && (roundBest === null || score < roundBest.score)) roundBest = pushed
       if (score < bestSeen - PROGRESS_MIN) {
         bestSeen = score
         ctx.deadline = Math.max(ctx.deadline, Math.min(hardDeadline, performance.now() + PROGRESS_STEP_MS))
       }
     }
-    // The round's best kept state streamed (ctx.onStitched) when it is the one
-    // the search goes on from next - not merely the first kept past the
-    // delay, which a better sibling kept before it would leave - and nothing
-    // has reached the goal yet (a whole path is about to be returned); only
-    // on along the branch already streamed: the bot may be on its legs, and
-    // another branch is the whole path's to bring, which the host holds to
-    // the leg flown.
+    // Stream only the next state to expand, along the branch already streamed, before any full solution exists.
+    // The bot may already be following those legs, so another branch must wait for the whole path.
     if (ctx.onStitched !== undefined && roundBest !== null && bestDone === Infinity && roundBest.score < bestStreamed &&
         performance.now() - t0 >= STREAM_AFTER_MS) {
       const order = (a: StitchState, b: StitchState): number => a.tier - b.tier || a.level - b.level || a.score - b.score || (a.time ?? 0) - (b.time ?? 0)
@@ -936,9 +726,7 @@ export function stitchHops (first: RawSolveResult, start: XYZ, ctx: HopPipelineC
       if (nextUp === roundBest && hops.length > streamedHops.length && streamedHops.every((q, k) => hops[k] === q)) {
         bestStreamed = roundBest.score
         streamedHops = hops
-        // (the legs alone, to the last one's landing: the follow-up's tail is
-        // no leg - a later state may branch off before its end, and a body
-        // walked out along it is where the whole path does not go)
+        // Stream only through the last hop; later states can branch before the follow-up tail ends.
         ctx.onStitched([...roundBest.stitched])
       }
     }

@@ -1,7 +1,5 @@
-// Goal (de)serialization for the worker boundary. Only EXACT instances of
-// this package's goal classes are serializable — a user subclass (overridden
-// heuristic/isEnd) silently falls back to main-thread solving so custom
-// logic always runs, exactly like upstream.
+// Only exact built-in goal instances serialize; subclasses stay on the main thread
+// so overridden heuristics and end conditions still run.
 import { Vec3 } from 'vec3'
 import {
   Goal, GoalBlock, GoalNear, GoalXZ, GoalNearXZ, GoalY, GoalGetToBlock,
@@ -61,9 +59,7 @@ export function serializeGoal (goal: Goal): GoalDescriptor | null {
   }
   if (ctor === GoalFollow) {
     const g = goal as GoalFollow
-    // Frozen coordinates: hasChanged() runs on the live goal on the main
-    // thread and triggers a re-solve with fresh coordinates (upstream
-    // mutates mid-search; freezing per solve is strictly cleaner).
+    // Freeze coordinates per solve; the live goal's hasChanged() triggers a fresh solve.
     return { type: 'follow', x: g.x, y: g.y, z: g.z, rangeSq: g.rangeSq }
   }
   if (ctor === GoalInvert) {
@@ -91,7 +87,7 @@ export function serializeGoal (goal: Goal): GoalDescriptor | null {
       facing: g.options.facing,
       facing3D: g.options.facing3D === true,
       LOS: g.options.LOS,
-      // facesPos precomputed on the main thread (needs live world.getBlock).
+      // Face discovery needs the live world, so serialize it for the worker.
       facesPos: g.facesPos.map(([face, to, ref]) => ({
         face: { x: face.x, y: face.y, z: face.z },
         to: { x: to.x, y: to.y, z: to.z },

@@ -225,8 +225,7 @@ describe('parkour reach envelope', function () {
     const up = reachBucket(1)
     // Pillar-to-pillar (2,2) hops work from a standing start (live-verified).
     expect(fnStand(2, 2)).to.be.at.most(J_STANDING[flat])
-    // The storage-room pillar course (prod dump 2026-08-20): diagonal 1x1
-    // hops players make from a standstill — (1,3)+1, (3,3) flat, (2,2)+1.
+    // Diagonal hops between one-block supports that players make from a standstill — (1,3)+1, (3,3) flat, (2,2)+1.
     expect(fnStand(1, 3)).to.be.at.most(J_STANDING[up])
     expect(fnStand(3, 3)).to.be.at.most(J_STANDING[flat])
     expect(fnStand(2, 2)).to.be.at.most(J_STANDING[up])
@@ -272,7 +271,7 @@ describe('generated parkour table', () => {
     expect(cellSets(entry(3, 2)!)).to.deep.equal({ line: ['1,0', '1,1', '2,1', '2,2'], corner: ['0,1', '3,1'] })
     expect(cellSets(entry(2, 0)!)).to.deep.equal({ line: ['1,0'], corner: [] })
     expect(cellSets(entry(4, 0)!)).to.deep.equal({ line: ['1,0', '2,0', '3,0'], corner: [] })
-    // The prod corner jump (1,3)+1: the pillar beside the landing sits at
+    // The corner jump (1,3)+1: the pillar beside the landing sits at
     // (0,3), which the flight only nicks — it must NOT be a corridor cell.
     expect(cellSets(entry(1, 3)!)).to.deep.equal({ line: ['0,1', '1,2'], corner: ['0,2', '1,1'] })
   })

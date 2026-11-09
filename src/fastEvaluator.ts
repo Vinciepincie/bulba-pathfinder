@@ -1,10 +1,5 @@
-// Monomorphic goal evaluators for the hot solver loop. GoalAdapter routes
-// every heuristic/isEnd through a Vec3 scratch + a virtual goal method —
-// fine for custom goals, wasteful for the built-in coordinate goals whose
-// math is a handful of flops. These closures capture the constants directly;
-// identical formulas to goals.ts (which stay the source of truth for the
-// public API). Returns null for goal types that need world access
-// (lookAt/placeBlock) or arbitrary composition — those keep the adapter.
+// Built-in coordinate goals capture constants to avoid scratch-node writes and virtual calls.
+// Goals needing world access or custom logic use the adapter.
 import type { GoalDescriptor } from './types.js'
 import type { GoalEvaluator } from './solver.js'
 

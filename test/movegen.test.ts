@@ -1138,8 +1138,8 @@ describe('momentum search state (allowParkourMomentum)', () => {
     // Take-off on a bottom stair (top 1.0, class 0), landing on the low
     // step of another five cells on: 5 − 0.6 − 0.8 = 3.6 needed against
     // 3.50 usable (run row 3 at −0.5) — refused; from the lip, 3.26 — made.
-    // The executor's own gates fly it from the stale-ground tick
-    // (bench/arena/.run/scratch/execSim.ts, wood → stair → stair).
+    // The executor can launch on the tick its ground flag still reflects the
+    // previous support (wood → stair → stair).
     const world = new VoxelWorld({ x0: -3, y0: -3, z0: -3, x1: 4, y1: 8, z1: 10 })
     world.set(0, 1, 0, MANGROVE_STAIRS) // stand (0,2,0), h0 = 2
     world.set(0, 1, 5, MANGROVE_STAIRS) // stand (0,2,5), low step at 1.5

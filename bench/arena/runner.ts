@@ -2,7 +2,7 @@
 // that turns a walk into comparable numbers.
 //
 // The custom engine is loaded from its published entry point (`dist/`), not
-// from `src/`, so the benchmark exercises what production runs — worker
+// from `src/`, so the benchmark exercises what a consumer runs: worker
 // thread, wasm core and all. Running the TypeScript sources directly would
 // silently fall back to main-thread solving and flatter the result.
 import { appendFileSync, mkdirSync } from 'node:fs'
@@ -51,7 +51,7 @@ function readProperties (b: BlockLike | null): Record<string, unknown> {
 
 /**
  * `bulba` runs the reference JavaScript solver core in the worker thread;
- * `bulba-wasm` runs the production path — the Rust core in the same worker.
+ * `bulba-wasm` runs the default path: the Rust core in the same worker.
  * Both are the same algorithm and are pinned bit-identical by the package's
  * differential suite, so racing them apart measures the engine room, not the
  * search. (Both run the physics-hop pipeline, which lives in the worker: a
@@ -307,7 +307,7 @@ export function applyProfile (
     if (process.env.ARENA_NO_CUT === '1') movements.allowCornerCut = false
     // The run-up line-up and the landing-past retirement (both executor
     // only, opt-in) are ON here; ARENA_NO_RUNUP=1 / ARENA_NO_LANDRETIRE=1
-    // race the profile a conservative consumer (the shop bot) runs.
+    // race each switch off on its own, for comparison.
     movements.allowRunUp = process.env.ARENA_NO_RUNUP !== '1'
     movements.allowLandingRetire = process.env.ARENA_NO_LANDRETIRE !== '1'
     // The gait flown INTO a jump (executor only, opt-in); ARENA_NO_HOPJUMP=1 bisects it.
@@ -665,7 +665,7 @@ export class Racer {
         // until the timeout and score a death as a slow success.
         deathTimer = setInterval(() => { if (died) resolve('died') }, 100)
       })
-      const outcome = await Promise.race([
+      let outcome = await Promise.race([
         goto.then<Outcome>(() => 'arrived').catch((error: Error): Outcome => {
           result.error = error.message
           // Upstream puts the machine-readable tag in `name` and prose in
@@ -680,6 +680,8 @@ export class Racer {
       ])
       clearTimeout(timer)
       clearInterval(deathTimer)
+      // An engine that ends its goal on death rejects before the death check above sees it.
+      if (died) outcome = 'died'
       result.outcome = outcome
       result.promiseOutcome = outcome
       // goto rejecting on no-path / think-timeout leaves the goal set, and the

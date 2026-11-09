@@ -11,7 +11,7 @@ You can join and watch.
 
 Four engines are available (`--engines` picks a subset): `upstream`, `bulba`
 (the JavaScript reference core in the worker), `bulba-wasm` (the Rust core in
-the same worker — what production runs) and `bulba-nohop`, which is `bulba`
+the same worker, the default) and `bulba-nohop`, which is `bulba`
 with the sprint-hop gait switched off (and with it the kernel-driven executor:
 it walks the legacy gates). Every bulba engine plans with the physics-hop
 pipeline, which lives in the worker. Racing a feature against its own twin on the
@@ -22,9 +22,10 @@ nothing on a staircase.
 ## Requirements
 
 - Java 21+ (Paper 1.21.11)
-- Node 18+
-- A copy of 2b2t spawn. Any World Downloader archive works: point the trimmer
-  at the `.zip` directly, or at an unpacked save folder.
+- Node 22+
+- A copy of 2b2t spawn. The trimmer reads a World Downloader `.zip` directly,
+  or an unpacked save folder. The saved routes were recorded on the download
+  `routes.json` names; another copy of spawn may differ in places.
 - ~1.5 GB free disk (trimmed world 78 MB, Paper + upgraded world the rest)
 
 ## Quick start
@@ -55,8 +56,8 @@ npm run arena:race -- --from 91,145,150 --to 19,132,176 --wait-for 1
 
 Add `--save-route r02` to keep it.
 
-Everything generated lives in `bench/arena/.run/` (gitignored). Only
-`routes.json` is committed.
+Everything generated lives in `bench/arena/.run/` (gitignored), except
+`history.json`, the per-route record kept beside `routes.json`.
 
 ## No plugin required
 
@@ -200,7 +201,7 @@ from a law of nature into a one-line physics bug.
 
 ⚠ After a livelock the connection stays in a sticky refusing state, so the
 probe parks in spectator and waits for a quiet window between cases. Without
-that only the first case in a batch is trustworthy — it cost an hour once.
+that only the first case in a batch is trustworthy.
 
 ### Route history
 
@@ -216,8 +217,8 @@ running", and that only exists across runs.
   slices; the custom engine solves in a worker. In a shared process the
   upstream slices would stall the other bot's packet handling, and the
   wall-clock number would measure the harness.
-- **The built package.** The custom engine is loaded from `dist/`, exactly
-  what production runs (worker thread, wasm core). Loading `src/` through tsx
+- **The built package.** The custom engine is loaded from `dist/`, as a
+  consumer runs it (worker thread, wasm core). Loading `src/` through tsx
   silently falls back to main-thread solving.
 - **Identical movement rules**: no digging, no block placement, no scaffolding,
   same `maxDropDown`, same think timeout. The deliberate differences are
@@ -357,7 +358,8 @@ with the same digest trimmed the same terrain and can compare numbers.
 Routes below are block-for-block copies of published parkour maps. Only the
 signs are in this repo: the blocks are the map authors' work and live in the
 local arena world, like the hand-built `parkouradv1`. Rebuilding the arena
-world from the 2b2t download removes them.
+world from the 2b2t download removes them, so a fresh arena can race only
+the 2b2t routes. Run those with `--routes`.
 
 #### `parkour-simple`: Hielke Maps
 
@@ -410,9 +412,8 @@ courses are at arena x 690–732 (the first map, z −410…−30) and x 770–9
 Stage 1 of the second map is header jumps under a two-high roof, cave vines
 and a 2+1 neo onto the finish; stage 2 a sixty-block drop onto slime and
 the bounce up; stage 3 a slope of logs, fences and soul sand; stage 5
-copper trapdoors (headers), grates, chains and dripleaves. The timers are
-scripts beside the trace tools (`opkTimes.cjs`, `opk2Times.cjs`), from a
-`PF_EXEC_TRACE`.
+copper trapdoors (headers), grates, chains and dripleaves. Stage times come
+from a `PF_EXEC_TRACE`.
 
 `PF_DUMP_NOPATH=<dir>` makes every bulba engine write each terminal no-path
 solve to `<dir>/pf-nopath-<engine>.jsonl` — the exact snapshot, start, goal
@@ -454,7 +455,7 @@ translation layer.
 | --- | --- | --- |
 | `--edit` | off | author routes in-world with signs instead of racing |
 | `--signs` | off | race the `!PF` signs in the world, not `routes.json` |
-| `--engines upstream,bulba-wasm` | all four | pick which engines race: `upstream`, `bulba` (JS core in the worker), `bulba-wasm` (Rust core in the worker — production), `bulba-nohop` (`bulba` with the sprint-hop gait off, the A/B for it) |
+| `--engines upstream,bulba-wasm` | all four | pick which engines race: `upstream`, `bulba` (JS core in the worker), `bulba-wasm` (Rust core in the worker, the default), `bulba-nohop` (`bulba` with the sprint-hop gait off, the A/B for it) |
 | `--from x,y,z --to x,y,z` | — | race one ad-hoc route, no route book needed |
 | `--save-route <id>` | — | also append that ad-hoc route to `routes.json` |
 | `--routes r01,r02` | all | pick routes by id |

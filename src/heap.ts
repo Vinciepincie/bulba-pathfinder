@@ -1,7 +1,5 @@
-// Array-backed binary min-heap over (node:int32, f:float64) pairs with
-// lazy deletion — no decrease-key: improved nodes are pushed again and stale
-// entries are skipped on pop via the solver's closed check. Grow-only
-// buffers, zero allocation on the hot path.
+// Improved nodes are pushed again; the solver skips stale entries on pop.
+// Grow-only buffers avoid allocation while capacity is sufficient.
 export class MinHeap {
   private nodes: Int32Array
   private fs: Float64Array
@@ -31,7 +29,6 @@ export class MinHeap {
     const nodes = this.nodes
     const fs = this.fs
     let i = this.n++
-    // Sift up.
     while (i > 0) {
       const parent = (i - 1) >> 1
       if (fs[parent] <= f) break
@@ -51,7 +48,6 @@ export class MinHeap {
     this.poppedF = fs[0]
     const n = --this.n
     if (n > 0) {
-      // Move the last element down from the root.
       const node = nodes[n]
       const f = fs[n]
       let i = 0

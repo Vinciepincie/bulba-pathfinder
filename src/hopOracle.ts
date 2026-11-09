@@ -1,42 +1,8 @@
-// Physics-verified hops (improvement, allowParkourPhysics): the jumps the
-// table model cannot express, found by flying them in the exact kernel
-// (src/playerSim.ts, bit-identical to prismarine-physics) against the exact
-// collision boxes of the snapshot.
-//
-// The table (parkourTable.ts) plans a jump from a handful of numbers per cell
-// — flags, a height byte, a catch class, a thin footprint — and a fixed set
-// of flight lines per offset. That is fast and it covers ordinary parkour,
-// but a line through a 2/16 pane post needs an offset the set does not have,
-// a jump round an L-wall needs a flight that turns, and a run along a ledge
-// that turns into the jump at the lip is no straight line at all. Here the
-// question "can a body get from this stand to that one" is answered by the
-// physics itself.
-//
-// A CONTROL PROGRAM is three phases, each steered by a heading — toward a
-// point (re-aimed every tick) or along a fixed direction: the RUN on the
-// ground until the jump fires (pressed on tick `jumpAt`), the first air
-// phase for `turnAir` air ticks (or until a slime rebound), the second air
-// phase to touchdown. Forward and sprint are held throughout. Every jump a
-// player makes between two stands is some program of this shape; the search
-// tries them in families, simplest first:
-//
-//   straight  one point for all three phases (run at it, jump, keep aiming)
-//   run-turn  run along an axis, then aim at the landing
-//   air-turn  aim at a waypoint beside the line, turn to the landing mid-air
-//   yaw       fixed headings off the bearing: run and first air phase on one,
-//             turn onto the other (the neo: out along the pillar's face,
-//             back in behind it — the executor's old runtime script search)
-//   bounce    at a slime top below until the rebound, then at the landing
-//             (a drop into a slime pit and up onto a ladder)
-//
-// A program is accepted only if it lands and STAYS (eight ticks of letting go)
-// and it still does so from start positions nudged ROBUST_NUDGE either way —
-// the tolerance the executor's line-up is given (plugin.ts program branch).
-// Where no family lands, a beam over per-tick controls (beamSearch). The
-// whole design, and what it measured: docs/PhysicsHops.md.
+// The fixed jump table cannot represent curved flights or every thin landing.
+// Simulated programs must stay on the landing and tolerate nudged starts.
 
 import { PlayerSim, newBody, copyBody, SIM, SIM_CLIMBABLE, SIM_SLIME, SIM_LIQUID, SIM_HAZARD, isVanillaJump } from './playerSim.js'
-import { fallDamagePoints, SAFE_FALL } from './fallDamage.js'
+import { fallDamagePoints, FALL_VETO, SAFE_FALL } from './fallDamage.js'
 import type { SimBody, SimControl, SimWorld } from './playerSim.js'
 
 /** How one phase of a program is steered: at a point, re-aimed every tick, or along a fixed unit direction. */
@@ -46,58 +12,38 @@ export interface Heading {
   z: number
 }
 
-/** A control program: what the executor replays, tick for tick, from rest at (sx, sy, sz) — or, a LIVE one, from exactly `start`. */
+/** A tick-for-tick control program from rest at (sx, sy, sz), or from the exact live `start` state. */
 export interface HopProgram {
   sx: number
   sy: number
   sz: number
-  /** A live program's exact first state (the body where the executor stood when it was found); absent: from rest at the start point. */
+  /** Exact initial body state for a live program; absent when starting from rest at the start point. */
   start?: SimBody
-  /** A live program's first yaw: its headings are then the ones bot.look turns to (HopOracle.face). */
+  /** Initial live yaw, used to reproduce bot.look's heading rounding. */
   yaw0?: number
-  /** mcc-6-2: make room at the flush rest before the suffix runs and jumps. Forward held, at most four ticks. */
+  /** Supported retreat to make room at a landing flush against a wall; forward held for at most four ticks. */
   groundPrefix?: Array<{ yaw: number, sprint: boolean, sneak: boolean }>
-  /** A beam program's controls, tick for tick: [yaw to look at (NaN: none), key flags (F_FWD | F_SPRINT | F_JUMP)] pairs; the phases above are then unused. */
+  /** Per-tick [yaw (NaN: no look), key flags (F_FWD | F_SPRINT | F_JUMP)] pairs for a beam program; replaces phase controls. */
   seq?: number[]
-  /** Touch and go: a landing short of the node starts the next leg (a beam program's chain of jumps) instead of ending the flight. */
+  /** A touchdown short of the target starts the next leg instead of ending the flight. */
   legs?: boolean
   /** Heading on the ground, until the jump fires. */
   run: Heading
   /** Tick (from the start) the jump is pressed on; held until the body leaves the ground. */
   jumpAt: number
-  /**
-   * The jump is pressed on the LATCHED tick instead: the first tick, from
-   * `jumpAt` on, that starts on the ground with nothing under the box
-   * (PlayerSim.carried) — the run's Y move went first, against the edge it
-   * was leaving. The last tick a jump can be taken off a lip, and an event,
-   * not a count: a start a few hundredths along the run gets there a tick
-   * sooner or later and still jumps from it (the 'leave' family).
-   */
+  /** Jump on the first grounded tick at or after `jumpAt` with no support under the box.
+   * Y moves first, so this is the last tick a jump can leave the lip; an event avoids dependence on the starting offset. */
   jumpOnLeave?: boolean
   /** Heading for the first `turnAir` air ticks (or until a slime rebound). */
   air1: Heading
-  /**
-   * A KICK: the jump is pressed already facing `air1` (from tick `jumpAt`
-   * on), so the sprint-jump boost goes along it, not along the run - a run
-   * along a strip's axis turned into its jump at the lip (arena mcc-8-2's
-   * hanger pipes: a body on the far side of a post from its arm, kicked out
-   * past the next post's other side).
-   */
+  /** Face `air1` from `jumpAt` so the sprint-jump boost follows the jump heading rather than the run. */
   kick?: boolean
-  /**
-   * A PRECISION program (the pivot family): it lands only from within about
-   * a hundredth of its start, so it is held to LIVE_NUDGE and flown only from
-   * the exact line-up (HopOracle.lineUp), never from a walking one.
-   */
+  /** Precision program verified with LIVE_NUDGE and flown only from the exact line-up, never a walking line-up. */
   precise?: boolean
   turnAir: number
   /** Heading after the turn, to touchdown. */
   air2: Heading
-  /**
-   * A bounce CHAIN: the heading held after the first rebound until the
-   * second (at the next slime top), and so on; `air2` after the last. Absent:
-   * `air2` from the first rebound on.
-   */
+  /** Headings after successive slime rebounds; `air2` applies after the last, or after the first when absent. */
   bounces?: Heading[]
   /** Sprint held throughout (a walking jump otherwise). */
   sprint: boolean
@@ -109,45 +55,24 @@ export interface HopProgram {
   tz: number
   catchTarget: boolean
   family: string
-  /**
-   * Taken off from a climbable: the body hangs on a ladder or a vine, the
-   * run is the push off it (horizontal speed clamped to the ladder's 0.15,
-   * jump held climbs), and the program has fired once the body is off it and
-   * airborne.
-   */
+  /** Take off from a ladder or vine: horizontal speed is clamped to 0.15 and holding jump climbs.
+   * The program fires once the body leaves the climbable and becomes airborne. */
   climb?: boolean
-  /** The landing is a slime top: sneak on the touchdown tick (sneakLanding), or the block throws the body back up. */
+  /** Sneak on slime touchdown to suppress its rebound. */
   slimeLand?: boolean
-  /**
-   * A DEEP bounce (deepSlimeTops: slime more than BOUNCE_DROP below the
-   * take-off, a fall any miss of which kills): flown with the climb-on, gated
-   * by its committed window (commitGate), and re-verified every tick live.
-   */
+  /** Bounce from slime more than BOUNCE_DROP below take-off, checked by commitGate and re-verified live each tick. */
   deep?: boolean
-  /** Jump held on the grounded tick after a rebound: vanilla keeps the rebound and adds the sprint boost (playerSim.ts isVanillaJump). */
+  /** Hold jump on the grounded tick after a rebound; vanilla preserves the rebound and adds the sprint boost. */
   reboundJump?: boolean
-  /** A deep bounce's abort targets (commitGate): the pool's slime tops a block and a half inside it, steered at by the executor's basin (plugin.ts). */
+  /** Abort targets inside a deep bounce's slime pool, at least a block and a half from its edge. */
   basin?: Array<[number, number, number]>
-  /**
-   * A REGION landing (stitchHops on a node whose stands fall apart): the
-   * rest the program was planned to come to. A landing counts only in that
-   * rest's region of the node — the stands a body walks to from it
-   * (HopOracle.regionOf) — not anywhere nodeY files under the node: beside a
-   * pane rail, the floor east of it, the rail's top and the floor west of it
-   * are one planner node and three places.
-   */
+  /** Required resting place within the landing node; only its walk-connected region counts as a landing.
+   * A pane rail and the floors on either side share a planner node but form separate regions. */
   land?: { x: number, y: number, z: number }
 }
 
-/**
- * Sneak on this tick? A program landing on a slime top presses it on the
- * touchdown tick only — prismarine's moveEntity reverses a vertical collision
- * on slime unless sneaking, and sneak held any longer costs 70% of the air
- * control. Decided from the state the tick starts in (the kernel and the
- * executor both have it): in the air, coming down, the feet reaching the
- * landing's top this tick, the box over the landing column — Y moves first,
- * from where the tick starts.
- */
+/** Whether to sneak on slime touchdown to suppress the rebound; longer sneaking costs 70% of air control.
+ * Uses the tick's initial state because Y moves before horizontal motion. */
 export function sneakLanding (p: HopProgram, onGround: boolean, x: number, y: number, z: number, vy: number, hw: number): boolean {
   if (p.slimeLand !== true || onGround || vy >= 0 || y < p.ty - 1e-9 || y + vy > p.ty + 1e-9) return false
   return x + hw > p.tx && x - hw < p.tx + 1 && z + hw > p.tz && z - hw < p.tz + 1
@@ -162,44 +87,30 @@ export interface HopEdge {
 
 interface Stand { x: number, y: number, z: number, catch: boolean, under?: boolean }
 
-/** A place on a node: stands a body walks between (HopOracle.regions). `under`: beside a thin block in the cell below, where the planner never stands. */
+/** Walk-connected stands on a node. `under` marks rests beside a thin block in the cell below, outside the planner's footing. */
 export interface Region { stands: Stand[], y: number, under: boolean }
 
 /** Start-position nudge every accepted program must survive, per axis (blocks). */
 export const ROBUST_NUDGE = 0.03
-/**
- * ...and a LIVE program's: its replay starts from the very state it was
- * found from and turns the very yaws (HopOracle.face), so only a model's
- * last hair of mismatch is left to cover.
- */
+/** Live start-position tolerance in blocks; exact-state replay only needs to cover model mismatch. */
 export const LIVE_NUDGE = 0.01
 const LIVE_NUDGE_SAFE = process.env.PF_LIVE_NUDGE_SAFE !== '0'
-// mcc-6-2's second neo needs room before its ordinary live flight.
+// Enables supported retreats before live jumps from flush landings.
 export const LIVE_PREFIX = process.env.PF_LIVE_PREFIX !== '0'
 export const LIVE_PREFIX_TICKS = 80_000
 const PREFIX_EXPIRED = Symbol('prefix budget')
-/**
- * A goal-side bridge (discover's goalSide) is held to this nudge: it is a hop
- * the pipeline would not try without the exemption, and the ones it opens
- * are over voids (arena opk2-1's slot drop holds at 0.06 by an air-turn 13t;
- * a 6-block ice jump on mcc-7-2 that 14 of all brute-force starts land does not).
- */
+/** Stricter start-position tolerance for goal-side bridges, which can cross voids. */
 const SIDE_NUDGE = 0.06
 /** Letting go after touchdown: ticks the body must stay on the landing node. */
 export const STAY_TICKS = 8
-/**
- * A region program down over its column off its place's level settles into it:
- * the executor no-keys sneaks there (plugin.ts), and the program's ticks run on to
- * the level. Priced at the touchdown, mcc-6-1's 3t bonk onto a stair top (11 to its
- * place) beat a 7t walk-off that was there first. PF_REGION_SETTLE=0 off.
- */
+/** Enables settling region landings to their required level before counting arrival ticks. */
 export const REGION_SETTLE = process.env.PF_REGION_SETTLE !== '0'
-/** PF_NEIGHBOUR_CARRY=0: a landing must be carried by its own column's boxes (A/B of HopOracle.carriedAt). */
+/** Allows neighbouring collision boxes to support a landing over its own column. */
 const NEIGHBOUR_CARRY = process.env.PF_NEIGHBOUR_CARRY !== '0'
-/** Feet heights in a climbable's cell (above its floor) a planned take-off from it hangs at (padsAt). */
+/** Planned climbable take-off heights above the cell floor. */
 const HANG_HEIGHTS = [0.1, 0.6]
 
-/** LutFlags bits (types.ts) the node convention needs. */
+/** LutFlags bits required by the planner's node convention. */
 const F_SAFE = 1
 const F_PHYSICAL = 2
 const F_CLIMBABLE = 8
@@ -213,25 +124,19 @@ export function headingDir (h: Heading, bx: number, bz: number): [number, number
   return d > 1e-9 ? [dx / d, dz / d] : null
 }
 
-/** The heading a program steers by, given its phase counters (HopOracle.fly's order). */
+/** The heading for the program's current phase counters. */
 export function programHeading (p: HopProgram, fired: boolean, air: number, rebounds: number, t: number): Heading {
-  // (`t` the program's tick, required: a kick replayed with the boost along the run falls)
+  // A kick's sprint boost must follow the jump heading.
   if (!fired) return p.kick === true && t >= p.jumpAt ? p.air1 : p.run
   if (rebounds === 0) return air < p.turnAir ? p.air1 : p.air2
-  // after rebound k: the chain's k-th heading (at the next slime), then the landing's
   return p.bounces !== undefined && rebounds <= p.bounces.length ? p.bounces[rebounds - 1] : p.air2
 }
 
 const point = (x: number, z: number): Heading => ({ fixed: false, x, z })
 const dir = (x: number, z: number): Heading => ({ fixed: true, x, z })
 
-/**
- * The programs of one family that share a run heading, as a tree: the run
- * (and the first air phase, which keeps the run's heading) branches on the
- * jump tick, the flight on the turn tick, the turn on the second heading.
- * Every value list is ascending where the tree walks it incrementally
- * (jumpAts, turnAirs).
- */
+/** Programs sharing a run heading branch on jump tick, turn tick, then landing heading.
+ * Incrementally traversed tick lists must be ascending. */
 interface ProgramClass {
   run: Heading
   /** A kick class: the first air heading, pressed from the jump tick on (HopProgram.kick). */
@@ -252,45 +157,32 @@ interface ProgramClass {
 
 type Family = 'straight' | 'run-turn' | 'air-turn' | 'yaw' | 'bounce' | 'leave' | 'kick' | 'pivot'
 
-// Straight and run-turn turn onto their second heading at take-off (turnAir
-// 0); straight's second heading is its first.
 const NO_TURN = [0]
 const STRAIGHT_JUMP_AT = [0, 1, 2, 3, 4, 5, 6, 8, 10]
 const RUN_TURN_JUMP_AT = [1, 2, 3, 4, 5, 6, 8]
 const AXES8: ReadonlyArray<[number, number]> = [[1, 0], [-1, 0], [0, 1], [0, -1], [Math.SQRT1_2, Math.SQRT1_2], [Math.SQRT1_2, -Math.SQRT1_2], [-Math.SQRT1_2, Math.SQRT1_2], [-Math.SQRT1_2, -Math.SQRT1_2]]
 const AIR_TURN_JUMP_AT = [0, 2, 4, 6]
-/** The leave family (HopProgram.jumpOnLeave): armed from the start, turned at take-off or a few air ticks on. */
+/** The leave family arms immediately and turns at take-off or shortly after it. */
 const LEAVE_AT = [0]
 const LEAVE_TURN = [0, 2, 4]
 const AIR_TURN_TICKS = [2, 4, 6, 8]
-// The yaw family's grid (radians off the bearing to the landing), measured on
-// a one-block neo: the run along the pillar's face goes out 0.15-0.9, the
-// turn comes back 0.3-1.5 within the first few air ticks, and the jump is
-// taken after a run of up to 14 ticks. Gentlest first.
+// Yaw offsets in radians from the landing bearing, gentlest first, for turns around pillars.
 const YAW_RUN = [0, 0.15, -0.15, 0.3, -0.3, 0.45, -0.45, 0.6, -0.6, 0.9, -0.9]
 const YAW_TURN = [0, 0.3, -0.3, 0.6, -0.6, 0.9, -0.9, 1.2, -1.2, 1.5, -1.5]
 const YAW_TURN_TICKS = [1, 2, 3, 4, 6, 8]
 const YAW_JUMP_AT = [0, 1, 2, 3, 4, 6, 8, 10, 12, 14]
-// The kick family's grid: runs along the world axes within 60 degrees of the
-// bearing (KICK_AXIS_COS), leaning toward the landing's side (radians), kicks
-// off the axis toward it, every jump tick to the end of a four-block run (the
-// strip's lip is wherever the run leaves it), the turns after. Measured on
-// mcc-8-2: kicks of 0.35-1.22 with leans of 0-0.26 all still plan it.
+// Kick runs follow world axes within 60 degrees of the landing bearing.
+// Leaning toward the landing and turning at the lip allow a run along a narrow strip.
 const KICK_AXES: ReadonlyArray<[number, number]> = [[1, 0], [-1, 0], [0, 1], [0, -1]]
 const KICK_AXIS_COS = 0.5
 const KICK_LEAN = [0, 0.09, 0.17, 0.26]
 const KICK_OUT = [0.35, 0.52, 0.7, 0.87, 1.05]
 const KICK_JUMP_AT = Array.from({ length: 17 }, (_, i) => i)
 const KICK_TURN_TICKS = [1, 2, 3, 4, 5, 6, 8]
-// mcc-8-2: a body beside a kick's lane needs to steer back onto it.
-// PF_LANE_KICK=0: the live search's old families and budgets (A/B).
+// Enables steering back onto a planned kick lane during live searches.
 export const LANE_KICK_TICKS = process.env.PF_LANE_KICK === '0' ? 0 : 40_000
-// The pivot family (HopProgram.precise): a run along a world axis toward the
-// landing (a strip or a rail runs along one), the jump pressed facing
-// PIVOT_JUMP off the bearing (at least PIVOT_MIN off the run: the sprint-jump
-// boost goes along the facing, HopProgram.kick's replay), then turned onto
-// PIVOT_TURN. For narrow landings alone (PIVOT_NARROW): arena mcc-7-1's 3/16
-// trapdoor strips, whose jump faces some 80 degrees off the run.
+// Pivot runs follow a world axis but face away from it at take-off to redirect the sprint boost.
+// These precision programs are reserved for narrow landings.
 const PIVOT_JUMP = Array.from({ length: 38 }, (_, i) => (i % 2 === 0 ? 1 : -1) * (0.3 + 0.05 * Math.floor(i / 2)))
 const PIVOT_MIN = 0.25
 const PIVOT_TURN = [0, 0.3, -0.3, 0.6, -0.6, 0.9, -0.9, 1.2, -1.2, 1.5, -1.5, 1.8, -1.8, 2.1, -2.1, 2.4, -2.4]
@@ -307,14 +199,11 @@ function spanOf (ps: ReadonlyArray<{ x: number, z: number }>, axis: number): num
   for (const q of ps) { const v = axis === 0 ? q.x : q.z; lo = Math.min(lo, v); hi = Math.max(hi, v) }
   return ps.length === 0 ? 0 : hi - lo
 }
-// Slime bounces: aim at a slime top until the rebound, then at the landing.
-// Slime tops within BOUNCE_REACH (horizontally) of both the take-off and
-// the landing and up to BOUNCE_DROP below the take-off, the nearest
-// BOUNCE_SLIMES by the two legs together.
+// Bounce candidates are slime tops within reach of both legs, ranked by their combined distance.
 const BOUNCE_REACH = 7
 const BOUNCE_DROP = 14
 const BOUNCE_SLIMES = 12
-/** DEEP bounces (HopProgram.deep): slime more than BOUNCE_DROP below the take-off, down to this. */
+/** Maximum drop below take-off for deep bounce candidates, in blocks. */
 const BOUNCE_DROP_LONG = 72
 /** How far (blocks, horizontally) a sprint jump carries while falling `drop` below its take-off: an over-estimate (0.6 a tick at take-off, a block of slack). */
 const fallMemo = new Map<number, number>()
@@ -334,25 +223,12 @@ function fallReach (drop: number): number {
 const BOUNCE_JUMP_AT = [0, 1, 2, 3, 4, 6, 8, 12]
 /** How far short of a slime top's centre (blocks, along the way in) the bounce family's first phase also aims. */
 const BOUNCE_SHORT = [0, 0.3]
-/**
- * Bounce CHAINS, for a landing no single rebound reaches (HopProgram.bounces):
- * the first slimes tried, the next slimes tried from each rebound, and how
- * many slimes may follow the first.
- */
+/** Candidate limits for bounce chains when a single rebound cannot reach the landing. */
 const BOUNCE_CHAIN_FIRST = 4
-/**
- * How far (blocks, horizontally) one rebound off a slime top can carry a
- * body that came down `drop` above it, to a landing `rise` above it: the
- * fall from the take-off (a jump), the rebound flown back up to the
- * landing's height, and the air speed gained over those ticks from a running
- * 0.4 — an over-estimate by construction (air acceleration at its sprinting
- * best, a block of slack), -1 when the rebound does not reach that height.
- * BOUNCE_REACH is a fixed 7; a nine-block drop throws the body more than
- * nine, and a ladder 7.5-8.5 from the slime (arena mcc-3-1) was only ever
- * tried as a chain — at ten times the search cost, and never found.
- */
+/** Optimistic rebound reach from fall height `drop` to landing height `rise`, or -1 if unreachable.
+ * Assumes sprint air acceleration from speed 0.4 and adds one block of slack. */
 const reboundMemo = new Map<number, number>()
-/** A deep bounce's reach: reboundReach, widened by the sprint boost a rebound jump adds where the bot's physics keeps the rebound (vanilla: 0.2 decaying 0.91 a tick, at most 2.3 blocks). */
+/** Deep rebound reach plus vanilla's sprint boost: 0.2 decaying by 0.91 per tick, bounded by 2.3 blocks. */
 function deepReach (drop: number, rise: number): number {
   const r = reboundReach(drop, rise)
   return r < 0 ? r : r + (isVanillaJump() ? 2.3 : 0)
@@ -392,34 +268,28 @@ function reboundReach (drop: number, rise: number): number {
 }
 const BOUNCE_CHAIN_NEXT = 3
 const BOUNCE_CHAIN = 2
-/** advance(): fly to the next rebound (a finite mark no air count reaches). */
+/** Finite mark beyond any air count, so advance stops at the next rebound. */
 const TO_NEXT_REBOUND = Number.MAX_SAFE_INTEGER
 
 const FAMILIES: Record<HopFamilies, readonly Family[]> = {
   simple: ['straight', 'run-turn', 'air-turn', 'bounce'],
   yaw: ['yaw'],
-  // (the hop pipeline's escalation: the yaw family, then the kicks where it lands nothing)
   yawKick: ['yaw', 'kick'],
   kick: ['kick'],
-  // (the pipeline's narrow-landing step alone: never live, where 0.5M ticks a strip is too slow)
+  // Pivots stay out of the ordinary live sweep; seeded searches give them a separate budget.
   pivot: ['pivot'],
-  // (the deep ring's landings, discover(): deep bounces alone, classes() deepOnly)
+  // Deep landing candidates use only deep bounce classes.
   deep: ['bounce'],
-  // (the bounce family before the yaw family's grid, as in `simple`: it
-  // costs nothing where no slime is in reach, and a live search that runs
-  // out of time must not have spent it all on the neos first)
+  // Try cheap bounce candidates before the yaw grid so live searches leave time for slime routes.
   all: ['straight', 'run-turn', 'air-turn', 'bounce', 'yaw', 'leave'],
-  // (the beam alone: HopOracle.hop)
   beam: [],
-  // (the slime ring alone: discover() from drop-edge take-offs, hopPipeline.ts dropTakeoffs)
   bounce: ['bounce']
 }
 
-/** A flight in progress: the body and the counters a program steers by (the executor keeps the same). */
-/** `top`: the highest the body has been since its last support (the fall veto: tickFlight). */
+/** Flight body and phase counters; `top` tracks peak height since support for the fall-damage veto. */
 interface Flight { b: SimBody, t: number, fired: boolean, air: number, rebounds: number, yaw: number, leg: number, top: number }
 
-/** A first state the search flies from: a body at rest on a stand point, or a live one (`live` = its exact state). */
+/** Initial search state: at rest on a stand, or at an exact live body state. */
 interface Pad { f: Flight, live: SimBody | undefined }
 
 const newFlight = (): Flight => ({ b: newBody(0, 0, 0), t: 0, fired: false, air: 0, rebounds: 0, yaw: NaN, leg: 0, top: -Infinity })
@@ -446,30 +316,18 @@ const LEG_MIN = 1
 export const F_FWD = 1
 export const F_SPRINT = 2
 export const F_JUMP = 4
-/**
- * mineflayer's bot.look step: a yaw change is rounded to whole steps of
- * 0.15° (conversions.fromNotchianPitch(0.15), computed the same way).
- */
+/** bot.look rounds yaw changes to whole 0.15-degree steps. */
 export const LOOK_STEP = ((((Math.PI / 180) * -0.15 + Math.PI) % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2) - Math.PI
 
-/** A state of the beam search, and the control that led to it. */
-/** A state of the beam search — an ensemble of bodies, each flying or down (landing ticks) — and the control that led to it. */
+/** Beam state: an ensemble of flying or landed bodies and the control that reaches it. */
 interface BeamNode { fs: Flight[], done: number[], parent: number, want: number, flags: number, pad: number, score: number, wp: number }
-/**
- * The beam (HopOracle.beamSearch): states kept per tick (of them, at most
- * BEAM_WIDTH_GROUND still before take-off — kept apart, or the first jumps
- * off crowd out every later one), ticks at most, headings off the bearing
- * to the landing, the speed a rank assumes to the landing before take-off
- * (sprint-jumping's, an optimistic bound like the airborne ranks' exact
- * landing tick), how far (blocks) a landing disc may miss the column and
- * live, and what a disc that holds the centre only at a stretch costs per
- * block.
- */
+/** Reserve grounded beam states so early jumps cannot crowd out later take-offs.
+ * Ranks use optimistic sprint-jump speed and landing-disc margins. */
 const BEAM_WIDTH = 160
 const BEAM_WIDTH_GROUND = 60
 export const BEAM_DEPTH = 80
 const BEAM_OFFSETS = [0, 0.15, -0.15, 0.35, -0.35, 0.6, -0.6, 0.9, -0.9, 1.25, -1.25, 1.65, -1.65, 2.2, -2.2, Math.PI]
-/** ...and the world axes, whatever the bearing: blocks line up on them, and a run along a rail or a ledge holds one exactly. */
+/** World axes keep runs aligned with rails and ledges regardless of the landing bearing. */
 const BEAM_AXES = [0, Math.PI / 2, Math.PI, -Math.PI / 2]
 const BEAM_SPEED = 0.36
 const BEAM_SLACK = 0.02
@@ -483,21 +341,12 @@ const BEAM_SPRINT_SPEED = 0.28
 const BEAM_FOOTING = 3
 /** Landings per layer the beam re-flies for robustness (the rest of a layer's are near copies). */
 const BEAM_CHECKS_PER_LAYER = 24
-/** PF_BEAM_DEBUG=1: one line per beam layer on stderr (diagnostic). */
+/** Enables per-layer beam diagnostics on stderr. */
 const BEAM_DEBUG = typeof process !== 'undefined' && process.env.PF_BEAM_DEBUG === '1'
-/**
- * The beam's detour field (DetourField): a beam with no corridor ranks a
- * body by the way round what stands between it and the landing column, not
- * the straight line through it. PF_BEAM_DETOUR=0: the straight line (A/B).
- */
+/** Enables ranking by obstacle detours when the beam has no corridor. */
 const BEAM_DETOUR = typeof process === 'undefined' || process.env.PF_BEAM_DETOUR !== '0'
-/**
- * Its grid step (blocks), the margin round the pads and the column, the most
- * blocks either side of the column, the clearance a body may jump over (a
- * box under the higher level plus this is no obstacle), the step between the
- * body heights tried, the most a detour counts (a point the grid cannot
- * reach: demoted, never dropped), and the least that counts at all.
- */
+/** Detour grid spacing, bounds, jump clearance and height sampling, in blocks.
+ * Unreachable points receive a capped penalty rather than being discarded. */
 const DETOUR_STEP = 0.125
 const DETOUR_MARGIN = 3
 const DETOUR_HALF = 7
@@ -506,13 +355,8 @@ const DETOUR_DY = 0.5
 const DETOUR_CAP = 6
 const DETOUR_EPS = 0.05
 
-/**
- * What a detour round the obstacles adds to the straight way to a landing
- * column, over a grid of points (HopOracle.detourField): at each point the
- * free-space octile geodesic to the column less the octile line, 0 outside
- * the grid. A point inside an obstacle (the body cannot stand there at any
- * height tried) reads the least of its free neighbours, or DETOUR_CAP.
- */
+/** Obstacle detour cost: free-space octile distance minus the unobstructed distance; zero outside the grid.
+ * Blocked points use the cheapest free neighbour or DETOUR_CAP. */
 class DetourField {
   constructor (readonly x0: number, readonly z0: number, readonly nx: number, readonly nz: number, readonly free: Uint8Array, readonly excess: Float32Array) {}
 
@@ -543,21 +387,8 @@ const octile = (dx: number, dz: number): number => {
   return Math.max(a, b) + (Math.SQRT2 - 1) * Math.min(a, b)
 }
 
-/**
- * A beam state's dedupe key. In the air: position to 1/16, velocity to 1/64
- * (vertical 1/32). Before take-off, position to 1/8 and velocity to 1/20: the
- * ground share is spread over PLACES — the corner a neo leaves from ranks
- * worse on distance than the spot pressed into the pillar, and fine velocity
- * variants of that one spot would otherwise fill the share — but not over
- * speed, which a chain across a stepping stone lives on.
- */
-/**
- * The beam's merge class of a flight, as BEAM_KEY_LEN integers into `out` at
- * `at`: before take-off the ground position in eighths and the horizontal
- * velocity in twentieths; in the air the position in sixteenths and the
- * velocity (and whether it is down) - the same classes the string key had,
- * with no string built per child (beamSearch's hottest line).
- */
+/** Quantized beam merge key: coarse ground positions preserve take-off variety; velocity preserves chain momentum.
+ * Air positions and velocities use finer bins; integer tuples avoid allocating strings per child. */
 function beamKeyInto (f: Flight, out: Int32Array, at: number): void {
   const b = f.b
   if (!f.fired) {
@@ -571,7 +402,7 @@ function beamKeyInto (f: Flight, out: Int32Array, at: number): void {
   out[at + 4] = Math.round(b.vx * 64); out[at + 5] = Math.round(b.vy * 32); out[at + 6] = Math.round(b.vz * 64)
 }
 const BEAM_KEY_LEN = 7
-/** beamKeyInto's integers folded to one number (a Map key; equal tuples, equal hash - collisions compared exactly). */
+/** Hash of the beam key; collisions are resolved by comparing the full tuples. */
 function beamHash (k: Int32Array, at: number): number {
   let h = 0x811c9dc5
   for (let i = 0; i < BEAM_KEY_LEN; i++) h = Math.imul(h ^ k[at + i], 0x01000193)
@@ -579,7 +410,7 @@ function beamHash (k: Int32Array, at: number): number {
 }
 /** Ticks jump may be held without taking off (a ceiling, a ladder) before the program is given up. */
 const JUMP_GRACE = 6
-/** climb2: a ceiling eats the rise, but the jump still re-arms its cooldown. PF_BONK_FIRE=0: velocity only. */
+/** Enables detecting jump firing through cooldown re-arming when a ceiling blocks the rise. */
 export const BONK_FIRE = process.env.PF_BONK_FIRE !== '0'
 export function jumpRearmed (before: number | undefined, after: number | undefined, cooldown: number = SIM.autojumpCooldown): boolean {
   return BONK_FIRE && before !== undefined && after === cooldown && before < cooldown
@@ -589,21 +420,12 @@ const MAX_RUN = 40
 /** Ticks a leave program may run before its body comes off the edge it runs at. */
 const LEAVE_RUN = 20
 const MAX_AIR = 60
-/**
- * Rebounds that each buy MAX_AIR more air ticks, past a bounce chain's own
- * (tickFlight). Uncapped, a reboundJump flight trapped over slime never ran
- * out of air and advance() spun on the main thread. PF_REBOUND_CAP=0: uncapped.
- */
+/** Caps rebound air-time credits so a body trapped over slime cannot bounce forever. */
 const REBOUND_CAP = process.env.PF_REBOUND_CAP !== '0'
 const REBOUND_CREDIT = 4
-/** A touchdown taken as the landing without a stay (goLanding, a chain twin's leg end) must not touch lava/fire: PF_TOUCH_WET=0 off. */
+/** Enables hazard checks on touch-and-go landings. */
 const TOUCH_WET = process.env.PF_TOUCH_WET !== '0'
-/**
- * The most ticks any one flight may run (tickFlight), legs and rebounds and all.
- * Each leg of a touch-and-go flight restarts its own limits, so a beam ensemble
- * twin pinned under a climb2 roof with jump held (re-fired by BONK_FIRE on every
- * bonk) or at a wall flew for ever. The longest program seen is ~131t. PF_FLIGHT_CAP=0: none.
- */
+/** Enables a total flight limit because touch-and-go legs reset their own limits. */
 export const FLIGHT_CAP = process.env.PF_FLIGHT_CAP !== '0'
 export const FLIGHT_TICKS_MAX = 600
 /** A bounce's first air phase lasts to the rebound: a finite mark past any flight, so advance() stops there. */
@@ -614,18 +436,13 @@ const airAccel = (sprint: boolean): number => (SIM.airborneAcceleration + (sprin
 /** Headings aimHeadings sweeps (a full turn), and how far inside the column a touchdown must be. */
 const AIM_STEPS = 720
 const AIM_EDGE = 0.001
-/**
- * A landing is the body SUPPORTED by its node's block: the box over the
- * column by this much at least, the centre up to 0.2 outside it (what the
- * planner's shifted lines land on, Move.takeoff — 8-1's strip past a two-high
- * post has no landing with the centre inside at all).
- */
+/** Minimum footprint overlap with the landing column; the body's centre may remain outside it. */
 export const LAND_OVERLAP = 0.1
 const AIM_COS = Float64Array.from({ length: AIM_STEPS }, (_, i) => Math.cos((i / AIM_STEPS) * 2 * Math.PI))
 const AIM_SIN = Float64Array.from({ length: AIM_STEPS }, (_, i) => Math.sin((i / AIM_STEPS) * 2 * Math.PI))
 /** Where across a landing arc the extra headings go, and how far (sweep steps) from the best one they must be. */
 const AIM_SPREAD = [0.2, 0.8]
-/** The search's reach test (HopOracle.canReach); PF_REACH_PRUNE=0 turns it off for A/B runs. */
+/** Enables pruning flights that cannot reach the landing. */
 const REACH_PRUNE = typeof process === 'undefined' || process.env.PF_REACH_PRUNE !== '0'
 const AIM_DISTINCT = 4
 
@@ -652,35 +469,27 @@ export class HopOracle {
   private readonly probe = newBody(0, 0, 0)
   private readonly aimPicked = new Int32Array(8)
   private readonly ctl: SimControl = { forward: false, back: false, left: false, right: false, jump: false, sprint: false, sneak: false, hx: 0, hz: -1 }
-  /** mcc-7-2's chain: a moving line-up checks its own controls on a bounded share, never a live search. */
+  /** Moving line-up checks replay controls on a bounded budget instead of running a live search. */
   private anchorDeadline: number | null = null
   private prefixBudget: { end: number, deadline: number } | null = null
   /** The body's half-width (the kernel's). */
   get halfWidth (): number { return this.sim.halfWidth }
   /** Kernel ticks flown by the last discover() (diagnostics). */
   ticksFlown = 0
-  /**
-   * Did the last hop() give no verdict: stopped on its deadline, or had no
-   * stand to land on or take off from (a landing the model does not know is
-   * not a jump the physics refuses)? False: every program of every family
-   * flew, and what came back is the answer.
-   */
+  /** The last hop search has no verdict: its budget expires or a take-off or landing stand is unavailable.
+   * False means all requested families finish searching. */
   noVerdict = false
-  /** The last hop() had no stand to fly from or to: the oracle is blind here, which says nothing of the jump (noVerdict is set too). */
+  /** The last hop lacks a take-off or landing stand; also sets noVerdict, since this does not disprove the jump. */
   noStand = false
-  /**
-   * A budget in kernel ticks, on top of the deadline (0: none). A live
-   * search is stopped by its work, not by the clock: the same body in the
-   * same place gets the same answer whatever else the machine is doing. By
-   * the clock a search flew 30 000 ticks or 110 000 in its 40 ms, and the
-   * one program that lands arena opk-6's second jump was found or missed by
-   * a few flights — missed, the bot stood twelve seconds re-solving.
-   */
+  /** Kernel tick budget in addition to the deadline; 0 disables it.
+   * A work limit keeps live-search results independent of machine load. */
   tickLimit = 0
   /** discover(): the hop being flown is a goal-side bridge (robust() holds it to SIDE_NUDGE). */
   private sideBridge = false
-  /** The beam's detour field (BEAM_DETOUR; a test switches it per oracle). */
+  /** Obstacle detour ranking enabled for this oracle. */
   beamDetour = BEAM_DETOUR
+  /** Reject touchdowns costing this many health points or more; lowered by a health floor. */
+  fallVeto = FALL_VETO
 
   constructor (world: SimWorld, flagsAt: (x: number, y: number, z: number) => number, halfWidth: number, height: number, speedBase = 0.1) {
     this.world = world
@@ -703,11 +512,7 @@ export class HopOracle {
     return top
   }
 
-  /**
-   * Is (x, y, z) at the edge of a drop: a cardinal neighbour with no box at
-   * feet, head or below, and nothing to stand on there or a block lower — the
-   * lip a body walks or jumps off (hopPipeline.ts dropTakeoffs)?
-   */
+  /** Whether a cardinal neighbour has no collision at feet, head or below, and no footing a block lower. */
   openDrop (x: number, y: number, z: number): boolean {
     for (const [ex, ez] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
       const nx = x + ex
@@ -718,10 +523,7 @@ export class HopOracle {
     return false
   }
 
-  /**
-   * Does node (x, y, z) stand on ice (slipperiness 0.9 or more under it)?
-   * A program from it starts from a line-up that slides (hopPipeline.ts).
-   */
+  /** Whether the node rests on ice with slipperiness at least 0.9, where a line-up slides. */
   onIce (x: number, y: number, z: number): boolean {
     const s = this.sim.stateAt(x, y - 1, z)
     return s >= 0 && this.world.slip[s] >= 0.9
@@ -733,12 +535,7 @@ export class HopOracle {
     return s >= 0 && this.world.shapeStart[s] >= 0 && this.world.shapeCount[s] > 0
   }
 
-  /**
-   * The planner's node for a body resting with its feet at `feetY` in column
-   * (x, z): the feet cell, one up when that cell holds a PHYSICAL block that
-   * is not a thin floor — upstream puts a slab's or a dirt path's node on top
-   * of the block, not in it.
-   */
+  /** Planner node for a body at `feetY`: one cell above a physical block unless it is a thin floor. */
   nodeY (x: number, feetY: number, z: number): number {
     const fy = Math.floor(feetY + 1e-9)
     const f = this.flagsAt(x, fy, z)
@@ -747,7 +544,7 @@ export class HopOracle {
     return physical && !thinFloor ? fy + 1 : fy
   }
 
-  // mcc-6-2: stand discovery and landing holds share the retreat's hard allowance.
+  // Stand discovery and landing checks share the retreat's hard budget.
   private kernelStep (b: SimBody, c: SimControl, counted = true): void {
     const budget = this.prefixBudget
     if (budget !== null && (this.ticksFlown >= budget.end || performance.now() > budget.deadline ||
@@ -777,20 +574,11 @@ export class HopOracle {
       if ((this.kindAt(x, y, z) & SIM_CLIMBABLE) !== 0) {
         out.push({ x: x + 0.5, y, z: z + 0.5, catch: true })
       } else if (this.shaped(x, y, z) || this.shaped(x, y - 1, z) || this.shaped(x, y - 2, z)) {
-        // (nothing to stand on within reach of the node: open air, a pit)
-        // Dropped from just above the feet cell's own boxes (a thin floor):
-        // from any higher, a ceiling two blocks up (a hoop's top, a
-        // headhitter) has the body start embedded in it.
-        // ...and above what reaches up into it from the cell below: a fence
-        // or a wall is a box 1.5 tall, its top half a block into the feet
-        // cell, and a body dropped from the cell's floor started inside it —
-        // no stand on any post (parkouradv1's fence posts: every take-off
-        // search onto one came back empty, and the run-up line-up flew them)
+        // Drop from just above the support boxes to avoid starting inside a ceiling, fence or wall.
         const drop = y + Math.max(this.cellTop(x, y, z), this.cellTop(x, y - 1, z) - 1) + 0.001
         const tryAt = (ox: number, oz: number): void => {
           const b = newBody(x + ox, drop, z + oz)
-          // a body dropped INTO a pane or a panel falls through it and
-          // "rests" embedded; start clear of everything
+          // Start clear of every box; a body dropped inside a pane or panel can fall through and appear to rest embedded.
           if (this.sim.collides(b)) return
           if (!this.settle(b)) return
           if (Math.floor(b.x) !== x || Math.floor(b.z) !== z) return
@@ -799,10 +587,7 @@ export class HopOracle {
           if (!out.some(p => Math.abs(p.x - b.x) < 0.05 && Math.abs(p.z - b.z) < 0.05)) out.push({ x: b.x, y: b.y, z: b.z, catch: false })
         }
         for (const ox of [0.2, 0.5, 0.8]) for (const oz of [0.2, 0.5, 0.8]) tryAt(ox, oz)
-        // and over the carrying cells' own boxes, by the box overlap a
-        // landing needs (overCol): a thin ledge — an open trapdoor's top
-        // edge is 3/16 wide, spiral3-b lands on one — meets no point of the
-        // grid above
+        // Sample support edges too: the grid can miss narrow ledges such as an open trapdoor's top edge.
         const w = this.world
         const e = this.sim.halfWidth - LAND_OVERLAP
         for (const yy of [y - 1, y]) {
@@ -810,8 +595,7 @@ export class HopOracle {
           if (s < 0 || w.shapeStart[s] < 0) continue
           for (let k = 0; k < w.shapeCount[s]; k++) {
             const o = (w.shapeStart[s] + k) * 6
-            // (off each edge by the overlap margin, both ways: beside a ledge
-            // a neighbour's box may leave a window a few hundredths wide)
+            // A neighbouring box can leave only a narrow window beside the ledge.
             const x0 = w.boxes[o]; const x1 = w.boxes[o + 3]
             const z0 = w.boxes[o + 2]; const z1 = w.boxes[o + 5]
             for (const ox of [(x0 + x1) / 2, x0 - e, x0 + e, x1 - e, x1 + e]) {
@@ -821,11 +605,7 @@ export class HopOracle {
             }
           }
         }
-        // ...and BESIDE what stands in the feet and head cells, dropped from
-        // the support's own top: a fence post on a plank strip leaves a
-        // sliver the body can stand on, hanging over the strip's edge, and
-        // every point of the grid above is inside the post or the fence over
-        // it (arena opk-1: no stand at all on its first strip, so no hop to it)
+        // Sample beside obstacles too: a post can leave a standable sliver outside every grid point.
         const low = y + Math.max(0, this.cellTop(x, y - 1, z) - 1) + 0.001
         const hw = this.sim.halfWidth
         const tryLow = (ox: number, oz: number): void => {
@@ -837,8 +617,7 @@ export class HopOracle {
           if (this.sim.collides(b) || !this.sim.supportedIn(b, x, z)) return
           if (!out.some(p => Math.abs(p.x - b.x) < 0.05 && Math.abs(p.z - b.z) < 0.05)) out.push({ x: b.x, y: b.y, z: b.z, catch: false })
         }
-        // (the offsets of every box's faces, crossed: a post with arms — a
-        // cross of boxes — leaves only the cell's corners free)
+        // Cross box-face offsets to find corners left free by posts with arms.
         const oxs = new Set<number>([0.5])
         const ozs = new Set<number>([0.5])
         for (const yy of [y, y + 1]) {
@@ -850,9 +629,7 @@ export class HopOracle {
             for (const oz of [w.boxes[o + 2] - hw - 0.01, w.boxes[o + 5] + hw + 0.01]) if (oz > 0.01 && oz < 0.99) ozs.add(oz)
           }
         }
-        // (only over a support with a full top: off a fence or a post the
-        // sliver is a perch no take-off leaves from — opk-6's fence arm, where
-        // the next jump found nothing and the bot gave up and replanned)
+        // Require a full support top; a sliver off a fence or post can leave no room for take-off.
         let fullTop = false
         {
           const s = this.sim.stateAt(x, y - 1, z)
@@ -871,15 +648,8 @@ export class HopOracle {
     return out
   }
 
-  /**
-   * Where the feet come down through height `landY`, flying from `b` with
-   * heading `h` held (forward, sprint as `sprint`) and NOTHING in the way: the
-   * kernel's air kinematics without collision — a dozen multiply-adds a
-   * tick, no block reads. Null when the body is not coming down there within
-   * MAX_AIR. Collisions only ever shorten or deflect a flight, so a program
-   * whose unobstructed landing misses the node by more than BALLISTIC_MISS is
-   * not worth flying on (the pre-screen).
-   */
+  /** Unobstructed touchdown at `landY` under heading `h`, or null if not reached within MAX_AIR.
+   * Used to reject flights whose landing misses by more than BALLISTIC_MISS. */
   private ballisticLanding (b: SimBody, h: Heading, sprint: boolean, landY: number): [number, number] | null {
     let x = b.x; let y = b.y; let z = b.z
     let vx = b.vx; let vy = b.vy; let vz = b.vz
@@ -897,26 +667,8 @@ export class HopOracle {
     return null
   }
 
-  /**
-   * The fixed headings that bring the rest of this flight down in column
-   * (tx, tz) and to REST near its centre, unobstructed. Held along a fixed
-   * unit heading u, the flight's air kinematics are affine in u: the feet
-   * come down (at the tick the vertical motion alone decides) at C + R·u,
-   * and a body let go there slides on to C' + R'·u — two circles about the
-   * drift points. So the headings that land are arcs of the first circle,
-   * found by sweeping the angle the column spans; each arc gives a few
-   * headings (below), and the kernel then flies them for real.
-   */
-  /**
-   * Where an airborne body comes down through height `landY`, forward held on
-   * any mix of headings and nothing in the way: at step s (the vertical
-   * motion alone decides it) within r of the drift point (cx, cz) — on the
-   * circle for a fixed heading, x_s = x0 + v0·sum + a·u·(sum + (s - sum)/(1 -
-   * drag)), anywhere inside for a mix. [s, cx, cz, r, cx1, cz1, r1] in a
-   * scratch array — the last three the disc a step earlier, where the
-   * crossing tick begins — or null when the body is not coming down through
-   * landY.
-   */
+  /** Unobstructed landing disc at `landY`: [tick, cx, cz, radius, previous cx, previous cz, previous radius], or null.
+   * Fixed headings land on its circle; mixed headings land inside. The previous disc locates support before Y moves. */
   private landingDisc (b: SimBody, sprint: boolean, landY: number): Float64Array | null {
     let y = b.y
     let vy = b.vy
@@ -939,23 +691,15 @@ export class HopOracle {
     d[1] = b.x + b.vx * sum
     d[2] = b.z + b.vz * sum
     d[3] = a * (sum + (s - sum) / (1 - drag))
-    // and a step earlier: prismarine moves Y first, so what carries the
-    // body is what is under it when the crossing tick BEGINS
+    // Y moves first, so support is determined at the start of the crossing tick.
     d[4] = b.x + b.vx * sum1
     d[5] = b.z + b.vz * sum1
     d[6] = a * (sum1 + (s - 1 - sum1) / (1 - drag))
     return d
   }
 
-  /**
-   * Can a flight from airborne `b` still come down in column (tx, tz) at
-   * level `ty` or above? The most ground it covers before it has fallen
-   * past that level — forward held on any headings — is the speed it carries
-   * and its air acceleration, summed over the ticks the fall takes, and
-   * nothing in the way adds to either. (PF_REACH_PRUNE=0 flies everything,
-   * for A/B runs: the programs found are the same.) The level is search()'s
-   * reachY, a step lower where a step-up can carry the body onto the landing.
-   */
+  /** Whether the remaining fall time, carried speed and air acceleration can reach the landing column.
+   * Uses a lower landing level when a step-up can carry the body onto it. */
   private canReach (b: SimBody, sprint: boolean, tx: number, ty: number, tz: number): boolean {
     let y = b.y
     let vy = b.vy
@@ -968,7 +712,7 @@ export class HopOracle {
     const drag = SIM.airborneInertia
     const sum = (1 - Math.pow(drag, n)) / (1 - drag)
     const reach = Math.hypot(b.vx, b.vz) * sum + airAccel(sprint) * (n - drag * sum) / (1 - drag)
-    // (to the column widened by what a box may hang over its edge: overCol)
+    // Allow the footprint to overhang the column by the landing overlap margin.
     const e = this.sim.halfWidth - LAND_OVERLAP
     const dx = Math.max(tx - e - b.x, 0, b.x - tx - 1 - e)
     const dz = Math.max(tz - e - b.z, 0, b.z - tz - 1 - e)
@@ -1001,12 +745,7 @@ export class HopOracle {
   /** The search's owner has given it up (the worker's cancel flag): every search ends as if out of time. */
   abort: (() => boolean) | null = null
 
-  /**
-   * Fixed headings that bring the rest of this flight down (unobstructed) on
-   * each stand point the landing disc's circle passes near: toward it from
-   * the drift point. A strip's window is narrower than the column
-   * aimHeadings aims into (the pivot family). Appended to `out`.
-   */
+  /** Append fixed headings toward stands near the landing circle; narrow strips need finer aim than column targeting. */
   private pointAims (b: SimBody, sprint: boolean, landY: number, lands: readonly Stand[], out: Heading[]): void {
     const disc = this.landingDisc(b, sprint, landY)
     if (disc === null) return
@@ -1029,8 +768,7 @@ export class HopOracle {
     const r = disc[3]
     const a = airAccel(sprint)
     const drag = SIM.airborneInertia
-    // the slide: the landing tick's air drag, then ground friction on the
-    // landing block to rest — velocity (drag · w_{s-1}) times 1/(1 - slip·0.91)
+    // Rest drift includes landing-tick air drag, then ground friction: velocity times 1/(1 - slip*0.91).
     const under = this.sim.stateAt(tx, Math.floor(landY - 1), tz)
     const slip = under >= 0 && this.world.slip[under] > 0 ? this.world.slip[under] : SIM.defaultSlipperiness
     const slide = drag / (1 - slip * SIM.airborneInertia)
@@ -1039,10 +777,7 @@ export class HopOracle {
     const rr = r + slide * a * (q1 + (1 - q1) / (1 - drag))
     const rcx = cx + slide * q1 * b.vx
     const rcz = cz + slide * q1 * b.vz
-    // the circle meets the column only if its radius lies between the
-    // nearest and the farthest the column comes to the drift point; then the
-    // arcs lie within the angle the column spans from there
-    // the column widened by what a box may hang over its edge (overCol)
+    // A landing arc exists only where the circle crosses the column, widened by the allowed footprint overhang.
     const e = this.sim.halfWidth - LAND_OVERLAP
     const lox = tx - e - cx
     const hix = lox + 1 + 2 * e
@@ -1093,11 +828,8 @@ export class HopOracle {
         outAt = j
       }
     }
-    // per arc (a full turn is walked from just past a miss, so no arc wraps):
-    // the touchdown furthest inside the column (what a start or heading
-    // error eats into), the rest nearest the centre, and two more spread
-    // across the arc — an obstacle (the pillar a neo turns round) cuts into
-    // an arc from one side, and the kernel flight says which part is clear
+    // Sample the deepest touchdown, the most central rest and two spread headings per arc.
+    // Obstacles can block part of an otherwise valid landing arc.
     const from = base + (n === AIM_STEPS ? outAt + 1 : 0)
     let j = 0
     while (j < n) {
@@ -1134,12 +866,8 @@ export class HopOracle {
     return { b, t: 0, fired: false, air: 0, rebounds: 0, yaw: NaN, leg: 0, top: b.y }
   }
 
-  /**
-   * A body HANGING on a climbable with its feet at (x, y, z): held there the
-   * way the executor holds it — sneak and no keys, which on a ladder keeps
-   * the body from sliding (prismarine clamps vy at 0) — one tick, so it
-   * carries the hold's own velocity. Null if (x, y, z) is not on a climbable.
-   */
+  /** Initial climbable hold: sneak with no movement for one tick to retain its hold velocity.
+   * Ladders clamp vertical speed to zero; returns null outside a climbable. */
   private hang (x: number, y: number, z: number): Flight | null {
     const b = newBody(x, y, z)
     if (!this.sim.onClimbable(b)) return null
@@ -1151,13 +879,8 @@ export class HopOracle {
     return { b, t: 0, fired: false, air: 0, rebounds: 0, yaw: NaN, leg: 0, top: b.y }
   }
 
-  /**
-   * The first states a hop from node (x, y, z) flies from: a body at rest on
-   * each of its stand points, or — a climbable — hanging on it, pressed
-   * against the ladder's face as a climb leaves it, at two heights in the
-   * cell. (The executor takes off from wherever its climb has the body, by a
-   * live search: these are what a planned hop is proved from.)
-   */
+  /** Initial states at each stand, or hanging against a climbable at two heights.
+   * Planned hops use these states; live take-offs use the body's exact state. */
   private padsAt (x: number, y: number, z: number): Pad[] {
     const out: Pad[] = []
     for (const s of this.stands(x, y, z)) {
@@ -1196,9 +919,8 @@ export class HopOracle {
     return !catchTarget && (this.kindAt(t[0], t[1] - 1, t[2]) & SIM_SLIME) !== 0
   }
 
-  // mcc-6-2's neo lands flush against a wall: its inward twin starts inside
-  // the wall and flies a path no live body can. Keep both sides if neither
-  // is clear, and every twin of a start already overlapping a box.
+  // A body flush against a wall cannot use an inward nudge that starts inside it.
+  // Keep both sides when neither is clear, or when the original start already overlaps a box.
   private requiredNudges (p: Pick<HopProgram, 'start'>, n: number): Array<[number, number]> {
     const offsets: Array<[number, number]> = [[n, 0], [-n, 0], [0, n], [0, -n]]
     const start = p.start
@@ -1221,12 +943,8 @@ export class HopOracle {
     return { b, t: 0, fired: false, air: 0, rebounds: 0, yaw: p.yaw0 ?? NaN, leg: 0, top: b.y }
   }
 
-  /**
-   * Fly program `p` from its first state nudged by (nx, nz): ticks to a
-   * landing that stays on (tx, ty, tz), or -1. `track`, when given, receives
-   * the position after every tick up to touchdown. The reference the search
-   * (and the executor's replay) must agree with.
-   */
+  /** Replay `p` from its nudged start; returns ticks to a stable landing or -1.
+   * `track` receives positions after each tick up to touchdown. */
   fly (p: HopProgram, nx = 0, nz = 0, track: number[] | null = null): number {
     const f = this.origin(p, nx, nz)
     if (f === null) return -1
@@ -1234,15 +952,8 @@ export class HopOracle {
     return r === FLYING ? -1 : r
   }
 
-  /**
-   * THE flight loop: step flight `f` under program `p`, in place, until it
-   * ends — ticks to a landing that stays, or -1 — or reaches its mark and
-   * returns FLYING: on the ground at tick `groundUntil`, or once taken off,
-   * at `airUntil` air ticks (a finite `airUntil` also marks a slime rebound,
-   * where the program turns early). fly() runs it without marks; the search
-   * runs it between marks, from copies, which is the same flight because the
-   * kernel is deterministic.
-   */
+  /** Advance the deterministic flight in place until landing, failure or a ground/air phase mark.
+   * Returns landing ticks, -1 or FLYING; a finite air mark also stops at a slime rebound. */
   private advance (f: Flight, p: HopProgram, groundUntil: number, airUntil: number, track: number[] | null): number {
     const b = f.b
     const c = this.ctl
@@ -1253,7 +964,6 @@ export class HopOracle {
       if (this.anchorDeadline !== null && this.expired(this.anchorDeadline)) return -1
       if (f.fired) {
         if (f.air >= airUntil || (f.rebounds > rebounds0 && airUntil !== Infinity)) return FLYING
-        // the pre-screen, as the program commits to its last heading
         if (f.air === p.turnAir && f.rebounds === 0 && !p.catchTarget && !b.onGround && !this.comesDownNear(b, p)) return -1
       } else if (f.t >= groundUntil) {
         return FLYING
@@ -1275,10 +985,8 @@ export class HopOracle {
           (p.reboundJump === true && f.fired && f.rebounds > 0 && b.onGround)
       }
       c.sneak = sneakLanding(p, b.onGround, b.x, b.y, b.z, b.vy, this.sim.halfWidth)
-      // a deep bounce caught on a climbable in the target's column below it:
-      // jump held climbs it (vanilla, prismarine's climbUsingJump, the kernel:
-      // a free-hanging vine curtain has no wall to press into), steered at the
-      // column's centre - its own keys there slide it off, 26 blocks down
+      // Hold jump and steer toward the column centre to climb a caught vine curtain.
+      // Without a wall to press against, the flight's own keys can slide the body off.
       if (p.deep === true && p.catchTarget && f.fired && b.y < p.ty && Math.floor(b.x) === p.tx && Math.floor(b.z) === p.tz && this.sim.onClimbable(b)) {
         const dx = p.tx + 0.5 - b.x
         const dz = p.tz + 0.5 - b.z
@@ -1291,13 +999,8 @@ export class HopOracle {
     }
   }
 
-  /**
-   * Face heading (hx, hz): exactly — or, when the flight knows its yaw (a
-   * live program), the way the executor's bot.look turns: mineflayer moves
-   * the yaw in whole LOOK_STEPs from where it is, and prismarine takes the
-   * heading from that yaw. So a live program flies the headings the replay
-   * will, to the bit.
-   */
+  /** Face (hx, hz), rounding known live yaw to bot.look's LOOK_STEP increments.
+   * This keeps simulated headings identical to replay headings. */
   private face (f: Flight, c: SimControl, hx: number, hz: number): void {
     if (Number.isNaN(f.yaw)) { c.hx = hx; c.hz = hz; return }
     this.turnTo(f, c, Math.atan2(-hx, -hz))
@@ -1320,11 +1023,7 @@ export class HopOracle {
     c.back = false; c.left = false; c.right = false; c.sneak = false
   }
 
-  /**
-   * One tick of a flight under the controls in this.ctl: the step, the
-   * phase counters, and whether the flight has ended — ticks to a landing on
-   * (tx, ty, tz) that stays, -1, or FLYING.
-   */
+  /** Step a flight and its phase counters under this.ctl; returns stable-landing ticks, -1 or FLYING. */
   private tickFlight (f: Flight, p: HopProgram, track: number[] | null): number {
     const b = f.b
     const jumpTicks = b.jumpTicks
@@ -1332,19 +1031,17 @@ export class HopOracle {
     if (track !== null) track.push(b.x, b.y, b.z)
     const t = f.t++
     if (b.inLiquid) return -1
-    // (every flight ends: a touch-and-go leg pinned under a roof re-fires on each bonk - FLIGHT_CAP)
+    // Repeated ceiling bonks can reset leg limits without ending the flight.
     if (FLIGHT_CAP && t >= FLIGHT_TICKS_MAX) return -1
-    // a touchdown that costs FALL_VETO or more is no landing, whatever it lands on
-    // (sneaking as the program presses it: onto slime that is the whole fall)
+    // Sneaking onto slime takes the whole fall, so its touchdown is subject to the fall-damage veto.
     if (b.onGround) {
-      if (b.y < f.top - SAFE_FALL && fallDamagePoints(f.top - b.y, 0, this.kindAt(Math.floor(b.x), Math.floor(b.y - 0.2), Math.floor(b.z)), this.ctl.sneak, true) >= FALL_VETO) return -1
+      if (b.y < f.top - SAFE_FALL && fallDamagePoints(f.top - b.y, 0, this.kindAt(Math.floor(b.x), Math.floor(b.y - 0.2), Math.floor(b.z)), this.ctl.sneak, true) >= this.fallVeto) return -1
       f.top = b.y
     } else if (b.y > f.top || this.sim.onClimbable(b)) {
       f.top = b.y
     }
     if (!f.fired) {
-      // (off a climbable, the take-off is the body leaving it: jump held
-      // there only climbs, and a push off it never gets near 0.3 either way)
+      // Holding jump on a climbable only climbs; take-off occurs when the body leaves it.
       const onClimb = p.climb === true && !b.onGround && this.sim.onClimbable(b)
       if (b.vy > 0.3 || (!b.onGround && b.vy < -0.3) || (p.climb === true && !b.onGround && !onClimb) ||
           (!onClimb && jumpRearmed(jumpTicks, b.jumpTicks))) f.fired = true
@@ -1357,7 +1054,7 @@ export class HopOracle {
       }
       return FLYING
     }
-    // (each rebound buys more air, but only so many: a rebound-jump body boxed in over slime bounces for ever - REBOUND_CAP)
+    // A body boxed in over slime can rebound forever without a cap.
     const credit = REBOUND_CAP ? Math.min(f.rebounds, REBOUND_CREDIT + (p.bounces?.length ?? 0)) : f.rebounds
     if (++f.air > MAX_AIR * (1 + credit + (p.deep === true ? 1 : 0))) return -1
     const inCol = Math.floor(b.x) === p.tx && Math.floor(b.z) === p.tz
@@ -1368,61 +1065,38 @@ export class HopOracle {
       if (b.vy > 0.05 && (this.kindAt(Math.floor(b.x), Math.floor(b.y - 0.2), Math.floor(b.z)) & SIM_SLIME) !== 0) {
         if (LIVE_PREFIX && (this.prefixBudget !== null || p.groundPrefix !== undefined)) return -1
         f.rebounds++
-        // (a nudged twin of a chain only has to get this far: robust())
         if (this.reboundIsLanding && f.rebounds === 1) return TOUCH_WET && this.sim.touchesWet(b) ? -1 : t + 1
         return FLYING
       }
       if (!this.overCol(b, p.tx, p.tz) || this.nodeY(p.tx, b.y, p.tz) !== p.ty) {
         if (p.legs !== true) return -1
-        // (a nudged twin of a chain only has to get this far — a real leg's
-        // end, a block or more from its start, not a hop on the spot: robust())
+        // A nudged chain twin must finish a real leg, at least a block from its start, rather than hop in place.
         if (this.touchIsLanding && Math.hypot(b.x - p.sx, b.z - p.sz) >= LEG_MIN) return TOUCH_WET && this.sim.touchesWet(b) ? -1 : t + 1
-        // touch and go: down short of the node, and the next leg starts here
         f.fired = false
         f.air = 0
         f.rebounds = 0
         f.leg = f.t
         return FLYING
       }
-      // (a stone the plan goes on from: its touchdown is the landing, not a stop on it - hopChain)
+      // A chain stone needs a touchdown that preserves momentum rather than a stop.
       if (this.goLanding) {
-        // (the kernel tests liquid and fire before it moves: a twin's last move into lava is seen only here - TOUCH_WET)
+        // The kernel checks hazards before moving, so the final move into lava needs a separate check.
         if (TOUCH_WET && this.sim.touchesWet(b)) return -1
         if (this.touch !== null) copyBody(this.touch, b)
         return t + 1
       }
       const offLevel = this.offLevel(b, p)
       if (!this.stays(b, p)) return -1
-      // (at its place only once settled there: the arrival the executor retires, not the touch)
+      // Arrival ticks include settling to the required region's level.
       return offLevel ? t + 1 + (this.stayAt >= 0 ? this.stayAt + 1 : STAY_TICKS) : t + 1
     }
     if (b.y < Math.min(p.sy, p.ty) - 14 - (p.deep === true ? BOUNCE_DROP_LONG : 0)) return -1
     return FLYING
   }
 
-  /**
-   * The general search, for the jumps no program family flies — a neo off a
-   * one-wide stair onto a pane rail, a slot threaded after a rebound: a beam
-   * over per-tick controls in the exact kernel. Each tick either faces a
-   * heading off the bearing to the landing (BEAM_OFFSETS) with forward and
-   * sprint held, jumping or not while grounded, or coasts (no keys).
-   *
-   * Every state is an ENSEMBLE: the body, and the same body nudged LIVE_NUDGE
-   * either way on each axis, all flown on the same controls (a beam program is
-   * precision work — the executor re-derives it live from the exact rest
-   * state rather than replay it from a line-up, so the live tolerance is the
-   * one it has to meet). A state lives
-   * while all of them do and lands when all of them have — so what the beam
-   * finds is robust by construction, where a beam over the body alone finds
-   * a precise jump's one fragile line first and nothing else.
-   *
-   * An airborne body is judged by its landing disc — held on any mix of
-   * headings, it comes down within R of its drift point C (the flight is
-   * affine in the headings: landingDisc) — so one whose disc misses the
-   * landing column is dead, and a state ranks by its worst body's sooner
-   * landing. Breadth-first by tick: the first layer that lands holds the
-   * quickest programs, replayed tick for tick (HopProgram.seq).
-   */
+  /** Beam search over per-tick controls for flights outside the program families.
+   * Each state includes nudged twins on identical controls, so accepted programs satisfy LIVE_NUDGE.
+   * Ranks use the worst body's earliest landing; breadth-first layers find the quickest robust programs. */
   private beamSearch (pads: readonly Pad[], lands: readonly Stand[], t: [number, number, number], deadline: number, corridor: ReadonlyArray<{ x: number, y: number, z: number }> = [], land?: { x: number, y: number, z: number }, depthLimit = BEAM_DEPTH): HopProgram | null {
     if (pads.length === 0 || lands.length === 0) return null
     const catchTarget = lands[0].catch
@@ -1430,8 +1104,7 @@ export class HopOracle {
     const tcx = t[0] + 0.5
     const tcz = t[2] + 0.5
     const c = this.ctl
-    // the waypoints on the way (the planner's partial path, when a chain has
-    // to follow it) and the landing last, with the length left after each
+    // Corridor waypoints preserve the momentum chain along the planner's partial path.
     const way: Array<[number, number, number]> = [...corridor.map(n => [n.x, n.y, n.z] as [number, number, number]), [t[0], landY, t[2]]]
     const tail = new Float64Array(way.length)
     for (let i = way.length - 2; i >= 0; i--) tail[i] = tail[i + 1] + Math.hypot(way[i + 1][0] - way[i][0], way[i + 1][2] - way[i][2])
@@ -1439,19 +1112,16 @@ export class HopOracle {
       while (wp < way.length - 1 && Math.hypot(way[wp][0] + 0.5 - b.x, way[wp][2] + 0.5 - b.z) <= BEAM_WAYPOINT && Math.abs(way[wp][1] - b.y) < 1.5) wp++
       return wp
     }
-    // what tickFlight reads the landing and the fall limit from
     const tpl: HopProgram = {
       sx: 0, sy: pads[0].f.b.y, sz: 0, run: point(tcx, tcz), jumpAt: Infinity, air1: point(tcx, tcz), turnAir: Infinity,
       air2: point(tcx, tcz), sprint: true, ticks: 0, tx: t[0], ty: t[1], tz: t[2], catchTarget, family: 'beam', legs: true,
-      // (a source's pads are all of a kind: a climbable's hang, a floor's rests)
       climb: this.climbing(pads[0].f.b), slimeLand: this.slimeLanding(t, catchTarget), land
     }
-    // (a beam to the landing alone ranks by the way round what is in it: BEAM_DETOUR)
     const field = corridor.length === 0 ? this.detourField(t, landY, pads) : null
     const nodes: BeamNode[] = []
     let layer: number[] = []
     pads.forEach((pad, i) => {
-      // the ensemble, the way robust() will fly the program: its start, nudged
+      // Use the same nudged ensemble as robustness verification.
       const start: HopProgram = { ...tpl, sx: pad.f.b.x, sy: pad.f.b.y, sz: pad.f.b.z, start: pad.live, yaw0: Number.isNaN(pad.f.yaw) ? undefined : pad.f.yaw }
       const nudges = this.requiredNudges(start, LIVE_NUDGE)
       const fs: Flight[] = [flightInto(newFlight(), pad.f)]
@@ -1464,7 +1134,6 @@ export class HopOracle {
       layer.push(nodes.length - 1)
     })
     const found: HopProgram[] = []
-    // (merge classes: beamHash -> the children holding it, their tuples in keys)
     const seen = new Map<number, number[]>()
     let keys = new Int32Array(1024 * BEAM_KEY_LEN)
     for (let depth = 0; depth < depthLimit && layer.length > 0 && found.length === 0; depth++) {
@@ -1476,9 +1145,8 @@ export class HopOracle {
         const lead = n.fs[0]
         const n0x = pads[n.pad].f.b.x
         const n0z = pads[n.pad].f.b.z
-        // (jump held on a climbable climbs: a choice before the push off it too)
+        // Jump on a climbable can gain height before pushing off.
         const grounded = n.fs.some((f, k) => n.done[k] === FLYING && (f.b.onGround || (tpl.climb === true && !f.fired && this.sim.onClimbable(f.b))))
-        // headings off the bearing to the next waypoint
         const aim = way[n.wp]
         const bearing = Math.atan2(aim[2] + 0.5 - lead.b.z, aim[0] + 0.5 - lead.b.x)
         const nh = BEAM_OFFSETS.length + BEAM_AXES.length
@@ -1497,9 +1165,9 @@ export class HopOracle {
             let dead = false
             let flying = 0
             for (let k = 0; k < n.fs.length && !dead; k++) {
-              // (a body down already, or let go: never stepped again, so shared, not copied)
+              // Landed bodies are no longer stepped, so their states can be shared.
               if (done[k] !== FLYING) { fs.push(n.fs[k]); continue } // landed already: the replay has moved on
-              // past the end of the lead's first real leg a chain's twins are released (robust())
+              // Release chain twins after the lead body completes its first real leg.
               if (k > 0 && fs[0].leg > 0 && Math.hypot(fs[0].b.x - n0x, fs[0].b.z - n0z) >= LEG_MIN) { done[k] = RELEASED; fs.push(n.fs[k]); continue }
               const f = flightInto(newFlight(), n.fs[k])
               fs.push(f)
@@ -1513,7 +1181,6 @@ export class HopOracle {
             if (dead) continue
             const child: BeamNode = { fs, done, parent: ni, want, flags, pad: n.pad, score: 0, wp: reach(fs[0].b, n.wp) }
             if (flying === 0) {
-              // every body down on the node: the program, flown as robust() will
               const p = this.beamProgram(nodes, child, pads, tpl, done[0])
               const ticks = this.robust(p)
               if (ticks >= 0) found.push({ ...p, ticks })
@@ -1528,8 +1195,7 @@ export class HopOracle {
             }
             if (score === Infinity) continue
             child.score = score
-            // (the merge class: one child a class, the better-scored - exactly as by
-            // the string key; a hash shared by different classes keeps them apart)
+            // Keep the best child per full merge tuple; hash collisions must not merge distinct classes.
             const at = children.length * BEAM_KEY_LEN
             if (keys.length < at + BEAM_KEY_LEN) { const grown = new Int32Array(Math.max(keys.length * 2, at + BEAM_KEY_LEN)); grown.set(keys); keys = grown }
             beamKeyInto(fs[0], keys, at)
@@ -1562,7 +1228,6 @@ export class HopOracle {
       layer = []
       let ground = 0
       const taken = new Uint8Array(children.length)
-      // the best, at most BEAM_WIDTH_GROUND of them still before take-off...
       for (let i = 0; i < children.length && layer.length < BEAM_WIDTH; i++) {
         if (!children[i].fs[0].fired) {
           if (ground >= BEAM_WIDTH_GROUND) continue
@@ -1572,7 +1237,7 @@ export class HopOracle {
         nodes.push(children[i])
         layer.push(nodes.length - 1)
       }
-      // ...and that ground share whatever the airborne ranks: a later take-off is always an option
+      // Reserve ground states even when airborne states rank better, so later take-offs remain possible.
       for (let i = 0; i < children.length && ground < BEAM_WIDTH_GROUND; i++) {
         if (taken[i] === 1 || children[i].fs[0].fired) continue
         ground++
@@ -1584,23 +1249,9 @@ export class HopOracle {
     return found.length > 0 ? found[0] : null
   }
 
-  /**
-   * The beam's rank of a state: its time so far and the soonest it could be
-   * down on the node (lower is better). Before take-off, and for a catch
-   * (which may come on the way up): the distance at BEAM_SPEED. In the air,
-   * the landing disc: the tick it comes down, and when the disc holds the
-   * column nothing more (the nearer it holds the centre, the more room to
-   * steer). When it does not, this leg comes down short and the rest is
-   * another (touch and go): the distance the disc leaves, at BEAM_SPEED —
-   * which is a jump chain's speed, so a leg in the air ranks as the progress
-   * it is, not as a detour (a chain of ice pads is legs that each fall short
-   * of the last, and a surcharge on them left the beam standing on the first).
-   * `t` is the next waypoint when the beam follows a corridor, and `after` the
-   * corridor's length beyond it. With a detour field (to the landing alone,
-   * BEAM_DETOUR) the distance is the way round what is in it; and a body in
-   * the air whose straight line is blocked ranks by that way, not by its
-   * disc, which is blind to the obstacle the body is about to meet.
-   */
+  /** Optimistic arrival-time rank using the landing disc in air and sprint-jump speed for remaining legs.
+   * Falling short can be progress in a momentum chain; detour costs account for obstacles the disc ignores.
+   * `t` is the next corridor waypoint and `after` is the remaining corridor length. */
   private beamScore (f: Flight, t: [number, number, number], landY: number, catchTarget: boolean, after: number, field: DetourField | null = null): number {
     const b = f.b
     const tcx = t[0] + 0.5
@@ -1617,8 +1268,7 @@ export class HopOracle {
     }
     const disc = this.landingDisc(b, true, landY)
     if (disc === null) {
-      // falling, and already under the landing: it cannot get back up —
-      // unless the column it drops down holds a slime top to rebound off
+      // A falling body below the landing can only recover if slime below it provides a rebound.
       if (b.vy < 0 && b.y < landY - 0.5 && !this.slimeUnder(b)) return Infinity
       return f.t + toGo / BEAM_SPEED + climb
     }
@@ -1626,8 +1276,7 @@ export class HopOracle {
     const cx = disc[1]
     const cz = disc[2]
     const r = disc[3]
-    // what carries the body is under it as the crossing tick begins (the
-    // disc a step earlier), within its half-width of the column
+    // Support uses the previous disc because Y moves before horizontal motion.
     const cx1 = disc[4]
     const cz1 = disc[5]
     const r1 = disc[6]
@@ -1636,9 +1285,7 @@ export class HopOracle {
     const nz = Math.max(t[2] - hw, Math.min(cz1, t[2] + 1 + hw))
     const gap = Math.hypot(nx - cx1, nz - cz1) - r1
     if (gap > BEAM_SLACK) {
-      // short of the column: at best it comes down at the (earlier) disc's
-      // point nearest it — a leg, if something there can carry the body,
-      // and otherwise a fall with nothing under it
+      // A short flight can become another leg only if something supports its nearest reachable touchdown.
       const d = Math.hypot(tcx - cx1, tcz - cz1)
       const px = d > 1e-9 ? cx1 + ((tcx - cx1) / d) * r1 : cx1
       const pz = d > 1e-9 ? cz1 + ((tcz - cz1) / d) * r1 : cz1
@@ -1648,18 +1295,9 @@ export class HopOracle {
     return f.t + s + after / BEAM_SPEED + BEAM_MISS_WEIGHT * Math.max(0, Math.hypot(tcx - cx, tcz - cz) - r)
   }
 
-  /**
-   * The beam's detour field to landing column `t` (DetourField), over a grid
-   * round the pads and the column: a point is free when a body centred there
-   * clears every collision box at some height from the lower of the pads and
-   * the landing to the higher plus DETOUR_CLEAR (a one-high step or a slab is
-   * jumped, a pane or a fence is not), and its detour is the octile geodesic
-   * over free points to the column (widened by what a landing may hang over)
-   * less the octile line. Null when no point is blocked, or no detour counts:
-   * the beam ranks as it always has. The work is charged to ticksFlown.
-   * Arena opk-2: two panes across a one-wide strip, where the straight line
-   * ranked the bodies diving at the first pane as landing.
-   */
+  /** Build obstacle detour costs over a grid between the pads and landing, charging work to ticksFlown.
+   * A point is free if the body clears boxes at any sampled height, including jump clearance.
+   * Returns null when no obstacle or meaningful detour exists. */
   private detourField (t: [number, number, number], landY: number, pads: readonly Pad[]): DetourField | null {
     if (!this.beamDetour) return null
     const w = this.world
@@ -1689,14 +1327,11 @@ export class HopOracle {
     const nz = Math.round((z1 - z0) / DETOUR_STEP) + 1
     const n = nx * nz
     this.ticksFlown += Math.ceil(n / 4)
-    // the heights a point is blocked at (a box overlaps the body's there), counted
     const blocked = new Uint16Array(n)
     const mark = new Uint16Array(n)
     let heights = 0
     let any = false
-    // (every DETOUR_DY from the lower level to the higher plus the clearance,
-    // and the levels the bodies stand at: a landing under a head-hitter is
-    // free at its floor alone)
+    // Include exact stand heights so a landing under a low ceiling can be free only at its floor.
     const ys: number[] = [hi, landY]
     for (let y = lo; y < hi; y += DETOUR_DY) ys.push(y)
     for (const p of pads) ys.push(p.f.b.y)
@@ -1713,7 +1348,6 @@ export class HopOracle {
             for (let q = 0; q < w.shapeCount[st]; q++) {
               const o = (w.shapeStart[st] + q) * 6
               if (cy + w.boxes[o + 4] <= fy + 1e-7 || cy + w.boxes[o + 1] >= fy + height - 1e-7) continue
-              // the points strictly inside the box widened by the half-width
               const i0 = Math.max(0, Math.floor((cx + w.boxes[o] - hw - x0) / DETOUR_STEP) + 1)
               const i1 = Math.min(nx - 1, Math.ceil((cx + w.boxes[o + 3] + hw - x0) / DETOUR_STEP) - 1)
               const j0 = Math.max(0, Math.floor((cz + w.boxes[o + 2] - hw - z0) / DETOUR_STEP) + 1)
@@ -1740,7 +1374,6 @@ export class HopOracle {
       if (free[k] === 0) walls = true
     }
     if (!walls) return null
-    // Dijkstra from the column (its points seeded at their octile to the centre)
     const cx = t[0] + 0.5
     const cz = t[2] + 0.5
     const reach = hw - LAND_OVERLAP
@@ -1788,7 +1421,7 @@ export class HopOracle {
         push(g[k], k)
       }
     }
-    // (no free point to land at: the field has nothing to rank by)
+    // No free landing point leaves the field without a destination.
     if (hn === 0) return null
     const diag = DETOUR_STEP * Math.SQRT2
     while (hn > 0) {
@@ -1805,7 +1438,7 @@ export class HopOracle {
           if (ii < 0 || jj < 0 || ii >= nx || jj >= nz) continue
           const kk = jj * nx + ii
           if (free[kk] === 0) continue
-          // (no corner cut between two blocked points)
+          // Do not cut a diagonal corner between blocked points.
           if (di !== 0 && dj !== 0 && (free[j * nx + ii] === 0 || free[jj * nx + i] === 0)) continue
           const v = key + (di !== 0 && dj !== 0 ? diag : DETOUR_STEP)
           if (v < g[kk]) { g[kk] = v; push(v, kk) }
@@ -1827,11 +1460,7 @@ export class HopOracle {
     return new DetourField(x0, z0, nx, nz, free, excess)
   }
 
-  /**
-   * The ticks a grounded body still needs to reach sprinting speed toward
-   * (px, pz), at the acceleration of the block it is on (ice is slow to get
-   * going): what a slow body pays over a fast one at the same place.
-   */
+  /** Ticks needed to reach sprint speed toward (px, pz), using the current block's acceleration. */
   private spinUp (b: SimBody, px: number, pz: number): number {
     const dx = px - b.x
     const dz = pz - b.z
@@ -1844,7 +1473,7 @@ export class HopOracle {
     return (BEAM_SPRINT_SPEED - along) / Math.max(accel * (1 - slip) * 3, 1e-3)
   }
 
-  /** Could a body coming down at (x, z) through height `y` be carried by something — a box under its footprint within BEAM_FOOTING below? */
+  /** Whether a collision box within BEAM_FOOTING below `y` can support the body's footprint at (x, z). */
   private footing (x: number, y: number, z: number): boolean {
     const hw = this.sim.halfWidth
     for (let yy = Math.floor(y - 1e-6); yy >= Math.floor(y) - BEAM_FOOTING; yy--) {
@@ -1895,19 +1524,18 @@ export class HopOracle {
     return mx * mx + mz * mz <= BALLISTIC_MISS * BALLISTIC_MISS
   }
 
-  /** After touchdown: let go (sneak, no keys) and check the body is still on the node. */
   /** The body's box over column (tx, tz) by LAND_OVERLAP at least (a catch is in its column: the caller's test). */
   private overCol (b: SimBody, tx: number, tz: number): boolean {
     const e = 0.5 + this.sim.halfWidth - LAND_OVERLAP
     return Math.abs(b.x - tx - 0.5) < e && Math.abs(b.z - tz - 0.5) < e
   }
 
-  /** A region program down off its place's level, which the executor settles (plugin.ts): not a deep flight, not a beam's sequence. */
+  /** Whether a non-deep, non-sequence region landing needs to settle to its required level. */
   private offLevel (b: SimBody, p: HopProgram): boolean {
     return REGION_SETTLE && p.land !== undefined && p.deep !== true && p.seq === undefined && Math.abs(b.y - p.land.y) >= 0.5
   }
 
-  /** The stay tick the last stays() came down at its region's level (-1: not): REGION_SETTLE's price. */
+  /** Tick when the last stays() settles at the required region level, or -1. */
   private stayAt = -1
   private stays (b: SimBody, p: HopProgram): boolean {
     if (this.touch !== null) copyBody(this.touch, b)
@@ -1920,33 +1548,21 @@ export class HopOracle {
       this.kernelStep(b, c, this.anchorDeadline !== null)
       if (this.stayAt < 0 && p.land !== undefined && b.onGround && Math.abs(b.y - p.land.y) < 0.5) {
         this.stayAt = k
-        // (the next leg leaves from where the price says it arrived, not the stair top it slid off)
+        // The next leg must start where the arrival tick places the body.
         if (off && this.touch !== null) copyBody(this.touch, b)
       }
     }
     c.sneak = false
     if (p.catchTarget) return Math.floor(b.x) === p.tx && Math.floor(b.z) === p.tz && b.y >= p.ty - 1.001 && b.y < p.ty + 1
-    // (a landing that slid into liquid did not stay: the kernel freezes a
-    // body at liquid contact, so it would "stay" in the lava beside the
-    // ledge it came down on — arena opk-9)
+    // Liquid contact freezes the kernel body, so a slide into liquid can falsely appear stable.
     if (b.inLiquid) return false
     if (!this.overCol(b, p.tx, p.tz)) return false
     return b.onGround && this.nodeY(p.tx, b.y, p.tz) === p.ty && this.carriedAt(b, p.tx, p.ty, p.tz) &&
       (p.land === undefined || this.inRegion(b, p))
   }
 
-  /**
-   * Is a body at rest carried at node (tx, ty, tz): by its column's own boxes
-   * (PlayerSim.supportedIn) - or centred over the column, on a neighbour's
-   * box no more than a step above the node's own stands, with the column's
-   * own footing under its box a step down at most (footingUnder: off the
-   * neighbour it comes down on it). Arena mcc-8-2's strip of 3/16 panels runs
-   * beside a closed trapdoor 0.19 higher: every hop onto the strip comes down
-   * on the trapdoor by box overlap, centred over the strip's column, and
-   * none was a landing - the bot stood, gave up and re-planned three times
-   * (9 s) for the one cell its gait could reach. The executor arrives there
-   * as it does (plugin.ts progLanded).
-   */
+  /** Whether the landing column supports the body, directly or through a neighbour at most a step above.
+   * Neighbour support also requires footing in the landing column within a step below. */
   private carriedAt (b: SimBody, tx: number, ty: number, tz: number): boolean {
     if (this.sim.supportedIn(b, tx, tz)) return true
     if (!NEIGHBOUR_CARRY || Math.floor(b.x) !== tx || Math.floor(b.z) !== tz || !this.sim.carried(b)) return false
@@ -1955,11 +1571,8 @@ export class HopOracle {
     return b.y >= floor && b.y <= floor + SIM.stepHeight && this.footingUnder(b, tx, tz)
   }
 
-  /**
-   * Does a box of column (tx, tz) lie under body `b`'s box, its top at the
-   * feet or up to a step below? (A rest on the take-off's own lip, centred
-   * past a gap from the node's footing, has none: carriedAt.)
-   */
+  /** Whether landing-column footing lies under the body within a step below its feet.
+   * A body resting on the take-off lip across a gap has no such footing. */
   private footingUnder (b: SimBody, tx: number, tz: number): boolean {
     const w = this.world
     const hw = this.sim.halfWidth
@@ -1976,22 +1589,16 @@ export class HopOracle {
     return false
   }
 
-  /**
-   * Lands from the start AND from every nudged start: the tolerance the
-   * executor's line-up gets — or LIVE_NUDGE, for a live program and for a
-   * beam program, which the executor never replays from a line-up but
-   * re-derives from the body's exact rest state (plugin.ts program branch).
-   */
+  /** Verify the program from its start and all required nudges.
+   * Live and beam programs use LIVE_NUDGE because replay starts from the exact body state. */
   private robust (p: HopProgram): number {
     const t0 = this.fly(p)
     if (t0 < 0) return -1
-    // (a precise program is flown only from the exact line-up: HopOracle.lineUp)
+    // Precision programs require the exact line-up.
     const n = p.start !== undefined || p.seq !== undefined || p.precise === true ? LIVE_NUDGE : this.sideBridge ? SIDE_NUDGE : ROBUST_NUDGE
-    // a chain (touch and go) is held to its first touch-down: past it the
-    // replay is the kernel's own flight to the bit, and twins nudged a
-    // hundredth apart part ways over a few bounces as any two players would
+    // Chain twins only need the first touchdown; small nudges diverge across multiple rebounds.
     this.touchIsLanding = p.legs === true
-    // a bounce chain likewise to its first rebound, off the slime it aims at
+    // Bounce-chain twins likewise stop at the first rebound.
     this.reboundIsLanding = p.bounces !== undefined && p.bounces.length > 0
     try {
       for (const [nx, nz] of this.requiredNudges(p, n)) {
@@ -2001,18 +1608,13 @@ export class HopOracle {
       this.touchIsLanding = false
       this.reboundIsLanding = false
     }
-    // (a deep bounce: its committed window too - inside robust(), so a
-    // rejected program lets the search go on to a slower take-off)
+    // Check the deep bounce's committed window here so rejection can leave slower candidates available.
     if (p.deep === true && !this.commitGate(p)) return -1
     return t0
   }
 
-  /**
-   * The abort a deep bounce's executor flies (plugin.ts 'basin'): steer at the
-   * nearest of the pool's inside tops (HopProgram.basin), no sprint, jump or sneak, until down. Is
-   * the first touchdown from flight state `f` (a copy) on slime, a block and
-   * a half inside the pool?
-   */
+  /** Whether aborting from `f` by steering without sprint, jump or sneak lands inside the slime pool.
+   * Targets the nearest basin point and requires at least a block and a half of edge clearance. */
   private abortsOnSlime (f: Flight, tops: ReadonlyArray<[number, number, number]>): boolean {
     const b = f.b
     const c = this.ctl
@@ -2048,33 +1650,22 @@ export class HopOracle {
     return true
   }
 
-  /**
-   * The committed window of deep bounce `p` (the review of arena opk2-2): the
-   * ticks from the last one the executor's abort (abortsOnSlime) still lands
-   * on slime to the landing. Live, every tick up to it re-flies the rest from
-   * the body as it is (deepVerdict), so what the window must stand is what
-   * arises inside it: at every one of its ticks the velocity kicked COMMIT_VEL
-   * either way on each axis, and on entering it the body moved COMMIT_POS
-   * either way on x and z, must still arrive on the program's own keys (half
-   * a block at every tick fails every program on opk2-2: a teleport ticks
-   * before a one-wide catch misses by construction). And the rebound must
-   * come down a block and a half inside the pool. Scanned, not bisected: the
-   * margin has holes.
-   */
+  /** Verify the deep bounce's non-abortable ticks against velocity nudges and position nudges on entry.
+   * Earlier ticks are re-verified live; the rebound must land inside the slime pool.
+   * Scan rather than bisect because abortable intervals can have holes. */
   private commitGate (p: HopProgram): boolean {
     const f = this.origin(p, 0, 0)
     if (f === null) return false
-    // (steered at the pool's inside: the nearest top of all is its rim)
+    // The nearest slime top may be on the rim, so aborts target interior points.
     const tops = this.deepSlimeTops(Math.floor(p.sx), Math.floor(p.sy + 1e-9), Math.floor(p.sz))
       .filter(t => this.inPool(t[0] + 0.5, t[1], t[2] + 0.5))
     if (tops.length === 0) return false
-    // the flight, a state per tick (before it), to its landing
     const states: Flight[] = []
     let reboundAt = -1
     for (let i = 0; i < 2000; i++) {
       states.push(flightInto(newFlight(), f))
       const before = f.rebounds
-      // (one tick a call: before the fire the air mark is 0, met on the fire tick itself)
+      // Advance one tick at a time; the zero air mark is met on the firing tick.
       const r = this.advance(f, p, f.t + 1, f.fired ? f.air + 1 : 0, null)
       if (f.rebounds > before && reboundAt < 0) {
         reboundAt = states.length
@@ -2086,9 +1677,8 @@ export class HopOracle {
       }
     }
     if (reboundAt < 0) return false
-    // every tick off the ground the abort no longer lands from holds against
-    // the disturbances (the moves on entering such a stretch only: the
-    // abortable ticks between are re-flown live from the body as it is)
+    // Check velocity disturbances on every non-abortable tick and position disturbances only on entry.
+    // Abortable intervals between them are re-verified live.
     let committed = false
     for (let i = 0; i < states.length; i++) {
       const st = states[i]
@@ -2107,12 +1697,8 @@ export class HopOracle {
     return true
   }
 
-  /**
-   * A deep bounce's live check (plugin.ts, every tick of its replay): from
-   * body `body` at the replay's counters, does the rest of program `p` still
-   * arrive, and does the abort (abortsOnSlime, at HopProgram.basin) still
-   * come down inside the pool? Both flown in copies.
-   */
+  /** Recheck the remaining deep bounce and its basin abort from the current live state.
+   * Both simulations use copies of the body. */
   deepVerdict (p: HopProgram, body: SimBody, t: number, fired: boolean, air: number, rebounds: number, yaw: number): { arrives: boolean, abortable: boolean } {
     const f = newFlight()
     copyBody(f.b, body)
@@ -2133,11 +1719,7 @@ export class HopOracle {
     return this.robust(p)
   }
 
-  /**
-   * The slime tops a body taking off from cell (x, y, z) could come down on:
-   * columns within BOUNCE_REACH whose first collision box below the take-off
-   * (within BOUNCE_DROP) is a slime block. [x, y, z] of the block.
-   */
+  /** Slime block coordinates within BOUNCE_REACH whose first collision below take-off is within BOUNCE_DROP. */
   slimeTops (x: number, y: number, z: number): Array<[number, number, number]> {
     const k = ((x & 0x3ff) << 20) | ((y & 0x3ff) << 10) | (z & 0x3ff)
     const hit = this.slimeCache.get(k)
@@ -2157,21 +1739,15 @@ export class HopOracle {
     return out
   }
 
-  /**
-   * The DEEP slime tops a body taking off from cell (x, y, z) could come down
-   * on: columns within the fall's reach whose first collision box below the
-   * take-off is a slime block more than BOUNCE_DROP down (to
-   * BOUNCE_DROP_LONG; arena opk2-2's pool is 61 below its arch). Apart from
-   * slimeTops: the chains and the shallow classes never see them.
-   */
+  /** Slime tops within fall reach, more than BOUNCE_DROP and at most BOUNCE_DROP_LONG below take-off.
+   * Kept separate from shallow bounce and chain candidates. */
   deepSlimeTops (x: number, y: number, z: number): Array<[number, number, number]> {
     const k = ((x & 0x3ff) << 20) | ((y & 0x3ff) << 10) | (z & 0x3ff)
     const hit = this.deepSlimeCache.get(k)
     if (hit !== undefined) return hit
     const out: Array<[number, number, number]> = []
     const R = Math.ceil(fallReach(BOUNCE_DROP_LONG))
-    // (no floor but the drop's: a grid is a box in the worker but only a cache
-    // window live, where the world goes on below it; unloaded cells read empty)
+    // A live grid is only a cache window; unloaded cells below it appear empty.
     const floor = y - BOUNCE_DROP_LONG
     for (let dx = -R; dx <= R; dx++) {
       for (let dz = -R; dz <= R; dz++) {
@@ -2196,10 +1772,7 @@ export class HopOracle {
       }
       if (walk) for (const a of aims) yield { run: point(a[0], a[1]), sprint: false, jumpAts: STRAIGHT_JUMP_AT, turnAirs: NO_TURN, air2s: [point(a[0], a[1])], aim: false }
     } else if (family === 'leave') {
-      // off a lip on the latched tick: at the landing (and its stands), or
-      // along an axis, then aimed at the landing from the take-off on; and
-      // the same turned a few air ticks later (a body coming off a strip
-      // across its width wants its push turned onto the landing)
+      // Turn a run across a strip's width toward the landing at the lip or shortly after take-off.
       const air2s = aims.slice(0, 3).map(a => point(a[0], a[1]))
       for (const sprint of [true, false]) {
         for (const a of aims) yield { run: point(a[0], a[1]), sprint, jumpAts: LEAVE_AT, turnAirs: LEAVE_TURN, air2s, aim: true, leave: true }
@@ -2207,8 +1780,7 @@ export class HopOracle {
       }
     } else if (family === 'kick') {
       if (hint !== undefined) {
-        // mcc-8-2: a parallel run keeps the landing's sideways miss.
-        // Aim past the plan's take-off, measured before its jump tick moves.
+        // A parallel run preserves sideways error; aim past the planned take-off to return to its lane.
         const f = this.origin(hint, 0, 0)
         if (f === null || this.advance(f, hint, hint.jumpAt, 0, null) !== FLYING ||
             f.fired || !f.b.onGround || f.t !== hint.jumpAt) return
@@ -2229,10 +1801,7 @@ export class HopOracle {
         }
         return
       }
-      // a run along a world axis (the strip a body is on), turned into the
-      // jump at the lip: the jump pressed already facing KICK_OUT off the
-      // axis toward the landing's side, held KICK_TURN_TICKS, then the
-      // landing's; the run itself may lean KICK_LEAN toward that side
+      // Face away from the strip's axis at take-off to redirect the sprint boost toward the landing.
       const bearing = Math.atan2(tcz - st.z, tcx - st.x)
       const bx = Math.cos(bearing)
       const bz = Math.sin(bearing)
@@ -2251,8 +1820,6 @@ export class HopOracle {
         }
       }
     } else if (family === 'pivot') {
-      // a run along a world axis toward the landing, the jump pressed facing
-      // off it (replayed as a kick), then turned
       const bearing = Math.atan2(tcz - st.z, tcx - st.x)
       const air2s = PIVOT_TURN.map(o => dir(Math.cos(bearing + o), Math.sin(bearing + o)))
       for (const [ux, uz] of runAxes) {
@@ -2280,27 +1847,17 @@ export class HopOracle {
         }
       }
     } else if (family === 'bounce') {
-      // the slime tops nearest by both legs; the first heading holds to the rebound
       const all = this.slimeTops(Math.floor(st.x), Math.floor(st.y + 1e-9), Math.floor(st.z))
         .map(([x, y, z]) => [x, z, Math.hypot(x + 0.5 - st.x, z + 0.5 - st.z) + Math.hypot(tcx - x - 0.5, tcz - z - 0.5), y])
-      // the tops whose rebound may carry to the landing: within BOUNCE_REACH,
-      // or as far as the rebound off that top physically throws a body
-      // (reboundReach) — a widening, never a narrowing of the fixed ring
+      // Keep the fixed bounce ring and also allow tops whose calculated rebound reaches farther.
       let tops = all.filter(t => Math.hypot(tcx - t[0] - 0.5, tcz - t[1] - 0.5) <=
         Math.max(BOUNCE_REACH, reboundReach(st.y - (t[3] + 1), ty - (t[3] + 1))))
-      // no rebound from here carries to the landing: a chain (chainOn), off
-      // the slimes nearest by both legs
       const chain = tops.length === 0
-      // (where only the widened reach admits a top, the chains the fixed
-      // ring would have flown come after its direct classes, as before)
+      // Try direct widened-reach candidates before chains from the fixed ring.
       const chainsToo = !chain && !all.some(t => Math.hypot(tcx - t[0] - 0.5, tcz - t[1] - 0.5) <= BOUNCE_REACH)
       tops = (chain ? all : tops).sort((p, q) => p[2] - q[2]).slice(0, chain ? BOUNCE_CHAIN_FIRST : BOUNCE_SLIMES)
       const air2s = [point(tcx, tcz)]
-      // at the slime's centre, and short of it along the way in: a take-off
-      // that carries (a jump, a fall from a ledge's end) lands past a centre
-      // it aims at, and one off the centre throws the rebound elsewhere —
-      // a bounce is two landings, and the first one is a choice too
-      // (the deep family: none of these)
+      // Aim short as well as centrally: carried momentum can overshoot the first touchdown and redirect the rebound.
       for (const sprint of this.deepOnly ? [] : walk ? [true, false] : [true]) {
         for (const [x, z] of tops) {
           const cx = x + 0.5
@@ -2311,7 +1868,6 @@ export class HopOracle {
           }
         }
       }
-      // DEEP bounces (deepSlimeTops), after every shallow and chain class
       const deep = this.deepSlimeTops(Math.floor(st.x), Math.floor(st.y + 1e-9), Math.floor(st.z))
         .map(([x, y, z]) => [x, z, Math.hypot(x + 0.5 - st.x, z + 0.5 - st.z) + Math.hypot(tcx - x - 0.5, tcz - z - 0.5), y])
         .filter(t => Math.hypot(tcx - t[0] - 0.5, tcz - t[1] - 0.5) <= Math.max(BOUNCE_REACH, deepReach(st.y - (t[3] + 1), ty - (t[3] + 1))))
@@ -2341,8 +1897,7 @@ export class HopOracle {
       }
     } else {
       const bearing = Math.atan2(tcz - st.z, tcx - st.x)
-      // the aimed turns are the unobstructed landings; the grid adds the ones
-      // a collision helps home (a slide along the pillar into the landing)
+      // The grid includes headings that need a collision to slide into the landing.
       const air2s = grid ? YAW_TURN.map(b => dir(Math.cos(bearing + b), Math.sin(bearing + b))) : []
       for (const sprint of walk ? [true, false] : [true]) {
         for (const a of YAW_RUN) {
@@ -2352,28 +1907,17 @@ export class HopOracle {
     }
   }
 
-  /**
-   * Every program of one family from these first states to node `t`, flown
-   * as a tree — the run once per class, a copy per jump tick, the first air
-   * phase once per jump tick, a copy per turn tick and second heading — then
-   * the quickest robust one. A tick of the run is shared by every jump taken
-   * after it and every flight after that, so the family costs its branches,
-   * not its programs × their length.
-   */
+  /** Search one family's programs as a tree, sharing run and first-air ticks across later branches.
+   * Returns the quickest robust program. */
   private search (pads: readonly Pad[], lands: readonly Stand[], t: [number, number, number], family: Family, deadline: number, walk: boolean, grid: boolean, land?: { x: number, y: number, z: number }, hint?: HopProgram, pick?: (found: HopProgram[]) => HopProgram | null): HopProgram | null {
     const tcx = t[0] + 0.5
     const tcz = t[2] + 0.5
     const catchTarget = lands[0].catch
     const landY = lands[0].y
-    // (the reach test's height: the lowest stand of the target column - a
-    // slab's, a closed trapdoor's or a pipe's node is a cell above its top,
-    // a carpet's or a wall top's below it; the node's y pruned flights that
-    // land on mcc-8-2's pipes, feet 279.19 under nodes at 280)
+    // Use the lowest stand height for reach pruning; the planner node can sit above the actual support top.
     let reachY = lands.reduce((m, s) => Math.min(m, s.y), Infinity)
-    // (a step lower where a box a step under the landing stands in or beside
-    // its column: a body coming down on it steps up onto the landing - arena
-    // mcc-8-2, off a 3/16 panel up the pipe's 0.19; the hop the bot stood
-    // nine seconds for. Not a catch: that holds the body in its column.)
+    // Allow a lower approach where neighbouring footing can step up onto the landing.
+    // Climbable catches require the body to remain in their column.
     if (!catchTarget && this.stepUnder(t[0], t[2], reachY)) reachY -= SIM.stepHeight
     const aimsRaw: Array<[number, number]> = [[tcx, tcz], ...lands.map(p => [p.x, p.z] as [number, number])]
     const aims = aimsRaw.filter((p, i) => aimsRaw.findIndex(q => Math.abs(q[0] - p[0]) < 0.05 && Math.abs(q[1] - p[1]) < 0.05) === i)
@@ -2384,9 +1928,8 @@ export class HopOracle {
     const slimeLand = this.slimeLanding(t, catchTarget)
     let runAxes: ReadonlyArray<[number, number]> = AXES8
     if (family === 'pivot') {
-      // a pivot is for a NARROW landing (a strip, a ledge, a rail): its stands lie on a line
       if (catchTarget || Math.min(spanOf(lands, 0), spanOf(lands, 1)) >= PIVOT_NARROW) return null
-      // and runs along a narrow take-off's length (the body cannot run across it)
+      // A narrow take-off allows a run along its length only.
       const px = spanOf(pads.map(q => q.f.b), 0)
       const pz = spanOf(pads.map(q => q.f.b), 1)
       if (pz < PIVOT_NARROW && px >= PIVOT_NARROW) runAxes = [[1, 0], [-1, 0]]
@@ -2396,13 +1939,11 @@ export class HopOracle {
     for (const pad of pads) {
       const st = pad.f.b
       const climb = this.climbing(st)
-      // The reach test (canReach) holds for a flight that only falls: not
-      // where slime may throw it back up, nor off a climbable it may regain.
+      // Reach pruning assumes a falling flight; slime rebounds and climbable recovery invalidate that bound.
       const falls = REACH_PRUNE && family !== 'bounce' && !climb && !slimeLand &&
         this.slimeTops(Math.floor(st.x), Math.floor(st.y + 1e-9), Math.floor(st.z)).length === 0
       for (const cls of this.classes(family, st, aims, tcx, tcz, walk, grid, t[1], runAxes, hint)) {
         if ((++n & 3) === 0 && this.expired(deadline)) { this.noVerdict = true; return select() }
-        // the run (no jump) and the first air phase (no turn) of this class
         const base: HopProgram = {
           sx: st.x, sy: st.y, sz: st.z, start: pad.live, yaw0: Number.isNaN(pad.f.yaw) ? undefined : pad.f.yaw, run: cls.run, jumpAt: Infinity, air1: cls.kick ?? cls.run, turnAir: Infinity, air2: cls.kick ?? cls.run, kick: cls.kick !== undefined ? true : undefined, precise: family === 'pivot' ? true : undefined,
           sprint: cls.sprint, ticks: 0, tx: t[0], ty: t[1], tz: t[2], catchTarget, family, climb, slimeLand, land, deep: cls.deep === true ? true : undefined
@@ -2411,21 +1952,21 @@ export class HopOracle {
         for (const j of cls.jumpAts) {
           if (hint !== undefined && this.expired(deadline)) { this.noVerdict = true; return select() }
           if (this.advance(run, base, j, 0, null) !== FLYING) break
-          // ran off an edge before tick j: no later jump tick is pressed either
+          // Leaving the edge before this jump tick also rules out every later jump tick.
           const walkedOff = run.fired
           const pj: HopProgram = cls.leave === true ? { ...base, jumpAt: j, jumpOnLeave: true } : { ...base, jumpAt: j }
-          // (a take-off the landing is out of reach of: no turn brings it in)
+          // No turn can recover a take-off already out of reach.
           if (this.advance(flightInto(launch, run), pj, Infinity, 0, null) === FLYING &&
               (!falls || this.canReach(launch.b, cls.sprint, t[0], reachY, t[2]))) {
             flightInto(air, launch)
             for (const k of cls.turnAirs) {
               const ra = this.advance(air, pj, Infinity, k, null)
               if (ra !== FLYING) {
-                // ended on the first heading: every later turn is this program
+                // A flight ending before the turn is identical for every later turn tick.
                 if (ra >= 0) found.push({ ...pj, turnAir: k, ticks: ra })
                 break
               }
-              // flown out of reach on the first heading: so is every later turn
+              // A later turn cannot recover a flight already out of reach on its first heading.
               if (falls && !this.canReach(air.b, cls.sprint, t[0], reachY, t[2])) break
               aimed.length = 0
               if (cls.aim) {
@@ -2433,7 +1974,7 @@ export class HopOracle {
                 else this.aimHeadings(air.b, cls.sprint, t[0], t[2], landY, aimed)
               }
               if (family === 'pivot' && !catchTarget) this.pointAims(air.b, cls.sprint, landY, lands, aimed)
-              // (a deep bounce flown twice where the bot's physics keeps a rebound: and with the rebound jump)
+              // Try both rebound controls where the physics preserves rebound velocity when jump is held.
               const rjs = cls.deep === true && air.rebounds > 0 && isVanillaJump() ? REBOUND_JUMPS : NO_REBOUND_JUMP
               for (let h = 0; h < cls.air2s.length + aimed.length; h++) {
                 for (const rj of rjs) {
@@ -2443,7 +1984,7 @@ export class HopOracle {
                 }
               }
               if (cls.chain === true && air.rebounds === 1) this.chainOn(air, { ...pj, turnAir: k }, [], t, landY, catchTarget, cls.sprint, found, deadline)
-              // a rebound turns every program with a later turn tick here
+              // A rebound turns every program whose scheduled turn comes later.
               if (air.rebounds > 0) break
             }
           }
@@ -2454,15 +1995,8 @@ export class HopOracle {
     return select()
   }
 
-  /**
-   * A bounce chain on from rebound `at` (the flight of program `pj`, whose
-   * chain so far is `chain`): at each slime top it could come down on next
-   * (nextSlimes) until that rebound, then at the landing — the point and the
-   * aimed headings, as at a first rebound — or, BOUNCE_CHAIN allowing, on to
-   * another slime. Landings go to `found`. (A chain of rebounds loses little
-   * height to drag, so a room of slime a drop starts is crossed rebound by
-   * rebound: the arena's Ten Ways slime room, west wall to east.)
-   */
+  /** Extend a bounce chain toward reachable slime tops, then the landing, within BOUNCE_CHAIN.
+   * Rebounds lose little height to drag, allowing successive slime crossings. Appends landings to `found`. */
   private chainOn (at: Flight, pj: HopProgram, chain: readonly Heading[], t: [number, number, number], landY: number, catchTarget: boolean, sprint: boolean, found: HopProgram[], deadline: number): void {
     const tcx = t[0] + 0.5
     const tcz = t[2] + 0.5
@@ -2493,12 +2027,8 @@ export class HopOracle {
     }
   }
 
-  /**
-   * The slime tops a body rebounding at `b` could come down on next: under
-   * the apex of its rebound, within BOUNCE_REACH, not the one it is on — the
-   * last of a chain within BOUNCE_REACH of the landing too — nearest by both
-   * legs, the BOUNCE_CHAIN_NEXT best. [x, z] of each.
-   */
+  /** Next slime tops below the rebound apex and within BOUNCE_REACH, excluding the current top.
+   * The final bounce must also be within reach of the landing; returns [x, z] for the nearest candidates. */
   private nextSlimes (b: SimBody, tcx: number, tcz: number, last: boolean): Array<[number, number]> {
     let y = b.y
     let vy = b.vy
@@ -2513,13 +2043,8 @@ export class HopOracle {
       .map(([x, z]): [number, number] => [x, z])
   }
 
-  /**
-   * The quickest of these landings that is also robust (ties: the first
-   * found, the simplest). Past the budget the found ones are still checked,
-   * for QR_GRACE_TICKS more: dropped unverified, a program found at 102k of
-   * a 100k budget came and went with where the expiry check fell (arena
-   * opk-6's yaw 15t; 2026-10-10 audit, the finds of a 200k budget at 100k).
-   */
+  /** Select the quickest robust landing, breaking ties by discovery order.
+   * Reserve QR_GRACE_TICKS for verification so budget expiry does not discard unverified finds. */
   private quickestRobust (found: HopProgram[], deadline: number): HopProgram | null {
     const order = found.map((p, i) => i).sort((a, b) => found[a].ticks - found[b].ticks || a - b)
     let stop = Infinity
@@ -2547,19 +2072,16 @@ export class HopOracle {
   /** A touchdown over the node is the landing, the body going on at once (hopChain). */
   private goLanding = false
 
-  /**
-   * Does program `p`'s landing hurt (fallDamagePoints over the fall from the
-   * top of its flight)? For one flight (singleFlight): a chain's legs each
-   * start their own fall. False when it does not land.
-   */
+  /** Whether one flight lands with enough fall damage to hurt, measured from its peak height.
+   * Chain legs start separate falls; returns false when there is no landing. */
   landingHurts (p: HopProgram, whole = true): boolean {
-    // (a catch hangs on its climbable: no landing, no fall)
+    // A climbable catch has no touchdown or fall damage.
     if (p.catchTarget) return false
     const track: number[] = []
     if (this.fly(p, 0, 0, track) < 0 || track.length < 6) return false
     let top = p.sy
     for (let i = 0; i < track.length; i += 3) {
-      // (a climbable touched on the way ends the fall there, as the server counts it)
+      // Touching a climbable ends the fall, as on the server.
       if ((this.kindAt(Math.floor(track[i]), Math.floor(track[i + 1]), Math.floor(track[i + 2])) & SIM_CLIMBABLE) !== 0) top = track[i + 1]
       else top = Math.max(top, track[i + 1])
     }
@@ -2567,7 +2089,7 @@ export class HopOracle {
     const y = track[track.length - 2]
     const z = track[track.length - 1]
     const kind = this.kindAt(Math.floor(x), Math.floor(y - 0.2), Math.floor(z))
-    // (a slime landing is sneaked onto, as the replay does - sneakLanding - and takes the whole fall)
+    // Slime touchdown is sneaked onto, so the whole fall applies.
     const sneaking = p.slimeLand === true && (kind & SIM_SLIME) !== 0
     return fallDamagePoints(top - y, Math.max(0, track[track.length - 5] - y), kind, sneaking, whole) >= 1
   }
@@ -2583,11 +2105,8 @@ export class HopOracle {
     }
   }
 
-  /**
-   * The quickest next leg's ticks from body `b` (a touchdown, moving) to node
-   * `t`, the simple families, within NEXT_LEG_TICKS of kernel work; -1 if
-   * none lands.
-   */
+  /** Ticks for the quickest simple next leg from moving touchdown `b` to `t`, or -1.
+   * Search work is limited to NEXT_LEG_TICKS. */
   private nextLegTicks (b: SimBody, t: [number, number, number], deadline: number): number {
     const lands = this.stands(t[0], t[1], t[2])
     if (lands.length === 0) return -1
@@ -2607,19 +2126,8 @@ export class HopOracle {
     }
   }
 
-  /**
-   * Of take-off programs `cands` (the robust ones within NEXT_SLACK of the
-   * quickest, `best`), the one whose landing leaves the quickest next leg to
-   * node `next`: ticks plus that leg's (distinct touchdowns only, at most
-   * NEXT_CANDS). The quickest stands unless another's total is strictly
-   * less - one with no next leg found counts as none. Only where the
-   * quickest comes down all but stopped (NEXT_PINNED: pinned on a post, a
-   * wall): one that keeps its speed goes on as quick as any, and the
-   * ranking's search work (a fifth to a half more per take-off) buys nothing.
-   * The speed is the one along the way to `next`: arena opk-2's second neo
-   * came down at 0.122, sideways, 0.057 of it toward the finish, and ran four
-   * ticks to get going (PF_NEXT_ALONG=0: the whole speed, for A/B).
-   */
+  /** Choose the lowest total of arrival ticks and next-leg ticks among near-quickest robust candidates.
+   * Only rank pinned touchdowns: retained speed toward `next` usually makes further search unnecessary. */
   private nextLegPick (best: HopProgram, cands: HopProgram[], next: [number, number, number], deadline: number): HopProgram {
     const pool = cands.filter(p => p.ticks <= best.ticks + NEXT_SLACK).sort((p, q) => p.ticks - q.ticks)
     if (pool.length < 2) return best
@@ -2650,16 +2158,8 @@ export class HopOracle {
     return pickTotal < bestTotal ? pick : best
   }
 
-  /**
-   * A robust program from node `r` to node `t`, from rest at one of r's
-   * stand points: the quickest of the first family that lands, or null.
-   * `families`: the simple ones ('simple', what a discovery weighs every
-   * candidate with), the yaw family alone ('yaw', for the jumps known to
-   * need it), all of them, or the beam alone ('beam', beamSearch). Families go simplest first: a simpler program
-   * that lands is worth more than a tick or two. `grid`: the yaw family
-   * also turns onto a fixed grid of headings, not only the aimed ones (the
-   * executor's take-off searches, one node at a time).
-   */
+  /** Robust hop from a stand on `r` to `t`, or null; returns the quickest of the first family that lands.
+   * `families` selects the search families; simpler programs take priority. `grid` adds fixed yaw headings. */
   hop (r: [number, number, number], t: [number, number, number], deadline: number, families: HopFamilies = 'simple', grid = false, corridor: ReadonlyArray<{ x: number, y: number, z: number }> = [], depthLimit = BEAM_DEPTH): HopProgram | null {
     this.noVerdict = true
     this.noStand = true
@@ -2686,25 +2186,15 @@ export class HopOracle {
   /** hop() on the deep family: classes('bounce') yields its deep classes alone. */
   private deepOnly = false
 
-  /**
-   * Does program `p` come down on its own landing in one flight, robustly? A
-   * touch-and-go program (HopProgram.legs: every beam program) holds its nudged
-   * twins only to their first touchdown (robust), and the first touchdown may
-   * be short of the node: a skip past a planned node must land past it, every
-   * twin (plugin.ts SKIP_AHEAD).
-   */
+  /** Whether every nudged start lands on the target in one flight.
+   * Touch-and-go verification normally stops twins at the first touchdown, which can fall short of the target. */
   singleFlight (p: HopProgram): boolean {
     if (p.legs !== true) return true
     return this.robust({ ...p, legs: false }) >= 0
   }
 
-  /**
-   * Program `p` re-anchored at body `b` as it is (yaw `yaw`): the same
-   * controls, flown from here — the program, live, if it still lands robustly
-   * (LIVE_NUDGE), else null. The executor's first resort at a lined-up rest:
-   * a line-up leaves the body a few hundredths off the planned start, which
-   * most programs shrug off, and then no search is needed at all.
-   */
+  /** Re-anchor the same controls at body `b` and known `yaw`; returns null unless they remain robust.
+   * A small line-up offset can then reuse a planned program without another search. */
   anchored (p: HopProgram, b: SimBody, yaw = NaN): HopProgram | null {
     const q: HopProgram = {
       ...p,
@@ -2718,16 +2208,8 @@ export class HopOracle {
     return ticks >= 0 ? { ...q, ticks } : null
   }
 
-  /**
-   * The exact line-up: one or two one-tick sneaking presses from body `b`
-   * at rest (yaw `yaw`), each turned in whole LOOK_STEPs as bot.look turns,
-   * coasted to rest, whose rest re-anchors precision program `p`
-   * (anchored()). A planned beam chain or pivot lands only from within a
-   * hundredth or so of its start, finer than a walking line-up places a body
-   * (a press moves its rest ~0.06); the kernel places it to a few
-   * thousandths. The presses' yaws, the rest they leave and the program
-   * from it, or null.
-   */
+  /** Find one or two sneaking presses, rounded to LOOK_STEP, whose settled rest re-anchors `p`.
+   * Precision programs need finer placement than a walking line-up; returns presses, rest and program, or null. */
   lineUp (p: HopProgram, b: SimBody, yaw: number, deadline: number, moving?: { reach: number, tried: boolean }): { yaws: number[], delay?: number, rest: SimBody, prog: HopProgram } | null {
     if (moving !== undefined) {
       moving.tried = false
@@ -2735,7 +2217,7 @@ export class HopOracle {
     }
     const c = this.ctl
     const steps = Math.round((2 * Math.PI) / Math.abs(LOOK_STEP))
-    // (the yaw after m more LOOK_STEPs from y: HopOracle.turnTo's arithmetic, so the replay's looks reproduce it to the bit)
+    // Match turnTo arithmetic so replay reproduces each rounded yaw exactly.
     const turned = (y: number, m: number): number => y + m * LOOK_STEP
     const press = (q: SimBody, y: number): void => {
       c.forward = true; c.back = false; c.left = false; c.right = false; c.jump = false; c.sprint = false; c.sneak = true
@@ -2758,14 +2240,12 @@ export class HopOracle {
       const err = Math.hypot(q.x - p.sx, q.z - p.sz)
       if (err < LINEUP_ACCEPT && Math.abs(q.y - p.sy) < 1e-6) cands.push({ err, yaws, rest: q })
     }
-    // one press, every LINEUP_STRIDE-th heading
     for (let k = 0; k < steps && !this.expired(deadline); k += LINEUP_STRIDE) {
       const y = turned(yaw, k)
       const q = copyBody(newBody(0, 0, 0), b)
       press(q, y)
       if (coast(q)) keep(q, [y])
     }
-    // two presses: the second at the start from about where the first leaves the body
     const ex = p.sx - b.x
     const ez = p.sz - b.z
     for (let k = 0; k < steps && !this.expired(deadline); k += 2 * LINEUP_STRIDE) {
@@ -2783,7 +2263,7 @@ export class HopOracle {
       }
     }
     cands.sort((u, v) => u.err - v.err)
-    // (the best one is always verified: a sweep that ran to the budget keeps its find)
+    // Always verify the best candidate even if the sweep exhausts its budget.
     for (let i = 0; i < cands.length && i < LINEUP_VERIFY && (i === 0 || !this.expired(deadline)); i++) {
       const cd = cands[i]
       const q = this.anchored(p, cd.rest, cd.yaws[cd.yaws.length - 1])
@@ -2792,12 +2272,11 @@ export class HopOracle {
     return null
   }
 
-  // mcc-7-2's chain need not stop before lining up: aim from the glide's rest.
-  // 'tried' spends the approach's one search only once that rest is near;
-  // the presses still start at b, not at the predicted rest.
+  // Aim from the predicted glide rest but start presses at the current body state.
+  // Spend the approach's single search only when that rest is near.
   private movingLineUp (p: HopProgram, b: SimBody, yaw: number, deadline: number, moving: { reach: number, tried: boolean }): ReturnType<HopOracle['lineUp']> {
     const clone = (q: SimBody): SimBody => copyBody(newBody(0, 0, 0), q)
-    // anchored() changes this.ctl; mcc-7-2's next coast must release every key.
+    // anchored() mutates this.ctl; coasting must use independent controls with every movement key released.
     const c: SimControl = { forward: false, back: false, left: false, right: false, jump: false, sprint: false, sneak: true, hx: 0, hz: -1 }
     const safe = (q: SimBody): boolean => {
       if (!q.onGround || q.vy > 0 || q.inLiquid || Math.abs(q.y - p.sy) > 1e-6 || !this.sim.carried(q)) return false
@@ -2818,7 +2297,7 @@ export class HopOracle {
       if (look !== undefined) { c.hx = -Math.sin(Math.PI - look); c.hz = Math.cos(Math.PI - look) }
       this.sim.step(q, c)
       this.ticksFlown++
-      // mcc-8-2's panel can set onGround on the tick the box slides off it.
+      // onGround can remain set on the tick the body slides off a thin panel.
       return safe(q)
     }
     const coast = (q: SimBody): number => {
@@ -2841,8 +2320,7 @@ export class HopOracle {
     const glideTicks = coast(glide)
     if (glideTicks < 0 || Math.hypot(glide.x - p.sx, glide.z - p.sz) > moving.reach) return null
     moving.tried = true
-    // (the prefix held from the nudged bodies too, not the exact one alone: a
-    // coast that skims a 3/16 panel's edge by less than LIVE_NUDGE is no line-up)
+    // Verify the prefix from nudged starts too; a coast skimming a panel edge can be too fragile.
     const holds = (delay: number, yaws: number[]): boolean => {
       for (const [nx, nz] of [[LIVE_NUDGE, 0], [-LIVE_NUDGE, 0], [0, LIVE_NUDGE], [0, -LIVE_NUDGE]]) {
         const q = clone(b)
@@ -2868,7 +2346,7 @@ export class HopOracle {
       const err = Math.hypot(q.x - p.sx, q.z - p.sz)
       if (err < LINEUP_ACCEPT) cands.push({ ticks: delay + yaws.length + ticks, err, delay, yaws, rest: q })
     }
-    // Leave work for the checks: mcc-7-2's long chain must fit the same 60k.
+    // Reserve enough budget to check the candidate controls.
     const searchEnd = this.tickLimit > 0 ? this.ticksFlown + Math.floor((this.tickLimit - this.ticksFlown) * 0.75) : Infinity
     const searching = (): boolean => this.ticksFlown < searchEnd && !this.expired(deadline)
     for (let presses = 1; presses <= 2 && searching(); presses++) {
@@ -2905,7 +2383,7 @@ export class HopOracle {
     return best
   }
 
-  // mcc-6-2: onGround alone can outlive the support, and a hazard is tested before the kernel moves.
+  // onGround can outlive support, and the kernel checks hazards before moving.
   private prefixSafe (b: SimBody, y: number): boolean {
     if (!b.onGround || b.vy > 0 || b.inLiquid || Math.abs(b.y - y) > 1e-6 ||
         this.sim.collides(b) || !this.sim.carried(b) || this.sim.onClimbable(b)) return false
@@ -2932,7 +2410,7 @@ export class HopOracle {
     return this.prefixSafe(f.b, y)
   }
 
-  // mcc-6-2: retreat from the collision face, with a planned stand only a directional hint.
+  // Retreat from the collision face; a planned stand supplies only a direction.
   private prefixYaws (b: SimBody, t: readonly [number, number, number], yaw: number, hint?: HopProgram): number[] {
     const out: number[] = []
     const keys = new Set<number>()
@@ -2973,7 +2451,7 @@ export class HopOracle {
     return out
   }
 
-  /** mcc-6-2: a short supported retreat, then one ordinary jump from the body it leaves. */
+  /** Try a short supported retreat followed by an ordinary jump from its endpoint. */
   hopPrefix (b: SimBody, t: [number, number, number], deadline: number, yaw: number,
     land?: { x: number, y: number, z: number }, hint?: HopProgram): HopProgram | null {
     if (!LIVE_PREFIX || this.prefixBudget !== null || !Number.isFinite(yaw) || Math.hypot(b.vx, b.vz) >= 0.01 ||
@@ -3010,7 +2488,7 @@ export class HopOracle {
           }
         }
       }
-      // mcc-6-2's known flight turns in the air; leave work for every endpoint and for verification.
+      // Leave budget for air turns from every retreat endpoint and for verification.
       const families: Array<[Family, number]> = [['air-turn', 6], ['run-turn', 1], ['straight', 1], ['yaw', 1]]
       let jobs = prefixes.length * 9
       for (const [family, weight] of families) {
@@ -3021,7 +2499,7 @@ export class HopOracle {
           const stop = this.ticksFlown + share
           this.tickLimit = this.ticksFlown + Math.floor(share * 0.75)
           this.search([prefix.pad], lands, t, family, deadline, true, true, land, undefined, found => {
-            // mcc-6-2: verify the original twins, never new nudges at the retreat's endpoint.
+            // Verify the original nudged starts through the retreat, rather than introducing new nudges at its endpoint.
             this.tickLimit = stop
             found.sort((a, b) => a.ticks - b.ticks)
             for (const suffix of found) {
@@ -3056,34 +2534,20 @@ export class HopOracle {
     }
   }
 
-  /**
-   * A robust LIVE program to node `t` from body state `b` exactly as it is
-   * (the executor's take-off, where no gate would fly the jump): every
-   * family (the yaw family on the grid of turns too), walking jumps too, and
-   * the quickest that lands — the body is already where the program starts,
-   * so there is no line-up to weigh it against. `yaw`: the body's yaw now,
-   * which makes the headings the ones the replay's bot.look will turn to
-   * (NaN: unknown). When no family lands, the beam (beamSearch). Null if
-   * nothing lands.
-   */
+  /** Robust live hop from exact body state `b` to `t`, including walking jumps and optional beam fallback.
+   * `yaw` reproduces bot.look rounding (NaN: unknown). Returns the quickest landing found, or null. */
   hopFrom (b: SimBody, t: [number, number, number], deadline: number, yaw = NaN, land?: { x: number, y: number, z: number }, next?: [number, number, number], beam = true,
     seed?: ReadonlyArray<'kick' | 'pivot'>, seedTicks = 0, seedFirst = true, hint?: HopProgram): HopProgram | null {
-    // (a planned region landing's live search lands in that region: HopProgram.land)
+    // Keep a planned region landing's live search in that region.
     const lands = land !== undefined ? this.regionOf(t, land) : this.stands(t[0], t[1], t[2])
     if (lands.length === 0) return null
     const live = copyBody(newBody(0, 0, 0), b)
     const pads: Pad[] = [{ f: { b: copyBody(newBody(0, 0, 0), b), t: 0, fired: false, air: 0, rebounds: 0, yaw, leg: 0, top: b.y }, live }]
     let best: HopProgram | null = null
-    // (with the node after: the programs within NEXT_SLACK of each family's quickest, for the next-leg ranking)
+    // Collect near-quickest programs when the next leg affects touchdown choice.
     const cands: HopProgram[] | null = next !== undefined ? [] : null
-    // Seed families (the kick and the pivot are no live families: FAMILIES.all)
-    // on `seedTicks` of their own, in order until one lands, the families'
-    // budget left as it was. From a body come down beside a kick or pivot
-    // plan's line the live families find nothing in all their budget, and the
-    // plan's own family flies it: arena mcc-7-1 a pivot 13t from the landing
-    // (36 ticks to touchdown flown), mcc-8-2 a pivot 17t (28); a kick plan's
-    // landing at mcc-8-2 has a pivot 23t and no kick. `seedFirst`: before the
-    // families, else only where they find nothing.
+    // Seed kick and pivot families can recover starts beside their planned lines that ordinary live families miss.
+    // Give them their own allowance, before ordinary families when seedFirst is set, or after failure otherwise.
     const seeded = (): void => {
       if (seed === undefined || seed.length === 0) return
       const limit = this.tickLimit
@@ -3102,8 +2566,7 @@ export class HopOracle {
     }
     this.collect = cands
     try {
-      // mcc-8-2: try the plan's lane before spending the seed families' work.
-      // The rollout and verification belong to this pass's own allowance.
+      // Try the planned lane within this pass's rollout and verification allowance.
       if (LANE_KICK_TICKS > 0 && hint?.family === 'kick' && hint.kick === true && hint.seq === undefined &&
           hint.run.fixed && hint.air1.fixed && hint.jumpOnLeave !== true && hint.climb !== true && hint.deep !== true &&
           Number.isInteger(hint.jumpAt) && hint.jumpAt >= 0 && hint.jumpAt <= 16 &&
@@ -3128,34 +2591,20 @@ export class HopOracle {
     } finally {
       this.collect = null
     }
-    // (the beam where no family lands - unless the caller asked the families alone: plugin.ts SKIP_AHEAD)
     if (best === null) return beam ? this.beamSearch(pads, lands, t, deadline, [], land) : null
-    // the landing that leaves the quickest next leg (arena opk-1: the
-    // quickest 9t onto the first arm pins the body on its fence post, the
-    // next leg from rest 15t; a 9t landing still moving goes on in 9)
+    // A touchdown that retains forward speed can make the next leg quicker than an equally fast pinned landing.
     return cands !== null && next !== undefined ? this.nextLegPick(best, cands, next, deadline) : best
   }
 
-  /**
-   * The leg onto a stone the plan goes straight on from, picked for the leg
-   * after it: a robust program from body `b` to stone `t` that touches down
-   * over it and goes on (no stop on it: stays() is the wrong test, a stone this
-   * thin stops nothing at the speed the next jump needs), the least total of
-   * its ticks and the next leg's from that touchdown (the same search the
-   * arrival will run, the kernel's flight being the body's to the bit). Null
-   * if no touchdown has a next leg. Arena mcc-5-2, a skull to a 0.125 bar to a
-   * skull: the jump past the bar needs a second ground tick, a quarter of the
-   * tick phases; the gates' touchdown 0.09 further on had none, and 73 ticks
-   * were lost on the bar. `nextGo`: the next leg's landing is a stone too.
-   */
+  /** Choose a robust touchdown on stone `t` by its arrival time plus the next leg's time.
+   * Thin stones need momentum, so stopping is not required. Returns null without a viable next leg.
+   * `nextGo` also treats the next landing as a touch-and-go stone. */
   hopChain (b: SimBody, t: [number, number, number], next: [number, number, number], deadline: number, yaw = NaN, nextGo = false): HopProgram | null {
     const lands = this.stands(t[0], t[1], t[2])
-    // (no stand on the node after: no next leg to weigh a touchdown by)
     if (lands.length === 0 || this.stands(next[0], next[1], next[2]).length === 0) return null
     const live = copyBody(newBody(0, 0, 0), b)
     const pads: Pad[] = [{ f: { b: copyBody(newBody(0, 0, 0), b), t: 0, fired: false, air: 0, rebounds: 0, yaw, leg: 0, top: b.y }, live }]
-    // (one budget, the caller's: the searches and the weighing each a share,
-    // the first round leaving the yaw round enough to search and weigh a few)
+    // Share the caller's budget between searching and ranking, reserving work for the yaw round.
     const limit = this.tickLimit
     const end = limit > 0 ? limit : Infinity
     const share = (ticks: number, until: number): number => {
@@ -3182,9 +2631,9 @@ export class HopOracle {
       this.tickLimit = limit
       let weighed = 0
       for (const p of cands) {
-        // (a next leg is never begun where it cannot end: one cut short is no verdict)
+        // An unfinished next-leg search gives no verdict, so start one only with enough budget to finish.
         if (weighed >= CHAIN_PICK_CANDS || this.ticksFlown + NEXT_LEG_TICKS > stop || performance.now() > deadline) break
-        // (no touchdown a tick later can beat the total in hand on a next leg of a run and a flight)
+        // Stop when no later touchdown can beat the best total even with the minimum next-leg time.
         if (p.ticks + CHAIN_PICK_LEAST >= pickTotal) break
         this.goLanding = true
         const td = this.touchdownOf(p)
@@ -3200,8 +2649,7 @@ export class HopOracle {
     this.collectSlack = CHAIN_PICK_SLACK
     try {
       round(NEXT_FAMILIES, end - reserve)
-      // (the yaw family, five times the work, where no simple touchdown has a
-      // next leg - and there is room left for it to search and weigh some)
+      // Try the expensive yaw family only if simple touchdowns have no viable next leg and budget remains.
       if (pick === null && !this.expired(deadline) && end - this.ticksFlown >= CHAIN_SEARCH_TICKS + NEXT_LEG_TICKS) round(CHAIN_YAW_FAMILY, end)
       return pick
     } finally {
@@ -3213,21 +2661,14 @@ export class HopOracle {
     }
   }
 
-  // ── regions: the places one planner node holds ─────────────────────────
 
   private readonly underCache = new Map<number, Stand[]>()
   private readonly regionsCache = new Map<number, Region[]>()
   private readonly regionOfCache = new Map<string, Stand[]>()
   private readonly linkBody = newBody(0, 0, 0)
 
-  /**
-   * Rests BESIDE a thin block in the cell under the node (a pane rail, a
-   * post): the feet on the floor a block down, filed under this node by
-   * nodeY (the feet cell holds a physical block that is no floor), where the
-   * planner never stands — it reads the node as the top of that block. Only
-   * where no other column carries the body: there the rest is that column's
-   * node, which the planner has.
-   */
+  /** Rests beside a thin block below the node, where the planner assumes the block's top.
+   * Exclude rests carried by another column, since those already have a planner node. */
   underStands (x: number, y: number, z: number): Stand[] {
     const k = ((x & 0x3ff) << 20) | ((y & 0x3ff) << 10) | (z & 0x3ff)
     const hit = this.underCache.get(k)
@@ -3305,11 +2746,8 @@ export class HopOracle {
     return true
   }
 
-  /**
-   * The places on node (x, y, z): its stands and underStands, joined where a
-   * body walks between them (walkLink) — the floor either side of a pane
-   * rail and the rail's top are three. A climbable's catch is one place.
-   */
+  /** Walk-connected regions of a node's stands and underStands; a climbable catch is one region.
+   * A pane rail separates its top and the floors on either side. */
   regions (x: number, y: number, z: number): Region[] {
     const k = ((x & 0x3ff) << 20) | ((y & 0x3ff) << 10) | (z & 0x3ff)
     const hit = this.regionsCache.get(k)
@@ -3326,19 +2764,14 @@ export class HopOracle {
           if (Math.abs(left[j].y - comp[i].y) < 1e-3 && this.walkLink(comp[i], left[j].x, left[j].z)) comp.push(left.splice(j, 1)[0])
         }
       }
-      // (under: made of underStands, beside the block; a rest ON a low block,
-      // a bottom trapdoor or a flower pot's top, is the planner's own place)
+      // Under regions lie beside a block; the top of a low block remains the planner's own region.
       out.push({ stands: comp, y: comp[0].y, under: comp.some(s => s.under === true) })
     }
     this.regionsCache.set(k, out)
     return out
   }
 
-  /**
-   * Is a rest filed under node t (nodeY) BESIDE the block in the cell under
-   * it, not on its top: the node has under places and the feet are below
-   * that block's top (a bottom trapdoor's top is the planner's own place).
-   */
+  /** Whether a rest lies beside the block below node `t`, rather than on its top. */
   besideRest (t: readonly [number, number, number], rest: { x: number, y: number, z: number }): boolean {
     if (rest.y >= t[1] - 0.5 || this.underStands(t[0], t[1], t[2]).length === 0) return false
     return rest.y < t[1] - 1 + this.cellTop(t[0], t[1] - 1, t[2]) - 1e-6
@@ -3378,11 +2811,7 @@ export class HopOracle {
     return f.b
   }
 
-  /**
-   * Take-off pads in the region of a body at rest at `rest` on node `n`: the
-   * rest itself, then the stands it walks to in a straight line (the
-   * executor's line-up walks straight at a program's start).
-   */
+  /** Take-off pads at `rest` and stands reachable from it by a straight walk, matching executor line-up. */
   padsFromRest (n: readonly [number, number, number], rest: { x: number, y: number, z: number }): Pad[] {
     const out: Pad[] = []
     for (const s of this.regionOf(n, rest)) {
@@ -3393,13 +2822,8 @@ export class HopOracle {
     return out
   }
 
-  /**
-   * discover() from a hop's REST (stitchHops): take-offs from the rest and
-   * the stands it walks to (padsFromRest), landings in each region of the
-   * nodes in hop range — the rest's own node too, its other places — each
-   * held to that region (HopProgram.land). `skipTop`: nodes whose planner
-   * place (a region that is not under) is reached already.
-   */
+  /** Discover hops from `rest` or stands it can walk to, targeting each region within hop range.
+   * Includes other regions of the same node. `skipTop` excludes planner regions already reached. */
   discoverFromRest (
     src: { x: number, y: number, z: number },
     rest: { x: number, y: number, z: number },
@@ -3455,12 +2879,7 @@ export class HopOracle {
     return out
   }
 
-  /**
-   * Does (x, y, z) look out on ground the failed search never reached: a
-   * standable cell within hop range of it that discover() would try (not
-   * `reached`, no more than MAX_REGRESS further from the goal)? The test
-   * behind hopPipeline.ts frontierSources.
-   */
+  /** Whether a standable, unreached candidate lies within hop range and MAX_REGRESS of (x, y, z). */
   opens (x: number, y: number, z: number, heuristic: (x: number, y: number, z: number) => number, reached: (x: number, y: number, z: number) => boolean, goalSide: ((x: number, y: number, z: number) => boolean) | null = null): boolean {
     const hR = heuristic(x, y, z)
     const cands: Array<[number, number, number, number]> = []
@@ -3480,24 +2899,8 @@ export class HopOracle {
     return false
   }
 
-  /**
-   * Hops out of the failed search's reach: from each of `sources` (the tail
-   * of the best partial path, nearest the goal last), to nodes within hop
-   * range not already reached (`skip`) and no more than MAX_REGRESS further
-   * from the goal, most promising first. Returns up to `maxEdges` edges
-   * within `budgetMs`. `families`: the simple ones for every candidate, or
-   * ('yaw') the yaw family for the YAW_CANDIDATES most promising per source —
-   * the escalation when no simple program opens the way.
-   */
-  /**
-   * Where a carry chain over ice starts: when `path` ENDS on ice (onIce), the
-   * index of its last node on firm ground before that run (at most CHAIN_BACK
-   * nodes back), else -1. Speed carried across ice is never stopped and taken
-   * up again: a body at rest on an ice pad gets no run-up, and the gap the
-   * run ends at may be crossed only on the carry of every leg before it
-   * (arena mcc-7-2: nothing lands from rest on the last pads, a chain from
-   * the stone before the first does).
-   */
+  /** Index of the last firm-ground node before a path ending on ice, within CHAIN_BACK nodes, or -1.
+   * Ice pads give a stationary body no run-up; later gaps can require momentum carried across earlier legs. */
   chainStart (path: ReadonlyArray<{ x: number, y: number, z: number }>): number {
     const n = path.length
     if (n < 2 || !this.onIce(path[n - 1].x, path[n - 1].y, path[n - 1].z)) return -1
@@ -3507,13 +2910,8 @@ export class HopOracle {
     return -1
   }
 
-  /**
-   * Chains out of the failed search's reach: the beam from `from` along
-   * `corridor` (the partial path after it) to the landings discover()
-   * would try from the corridor's last node (hop range, not `skip`ped, no
-   * more than MAX_REGRESS further from the goal), its depth the corridor's
-   * length at chain speed with CHAIN_SLACK to spare.
-   */
+  /** Beam chains from `from` along `corridor` to unreached, in-range landings within MAX_REGRESS.
+   * Depth covers the corridor at chain speed plus CHAIN_SLACK. */
   chain (
     from: { x: number, y: number, z: number },
     corridor: ReadonlyArray<{ x: number, y: number, z: number }>,
@@ -3559,6 +2957,8 @@ export class HopOracle {
     return out
   }
 
+  /** Discover up to `maxEdges` hops from `sources` within `budgetMs`, excluding `skip` and excessive retreat.
+   * Sources are ordered nearest the goal last. `families` selects simple or escalated searches. */
   discover (
     sources: ReadonlyArray<{ x: number, y: number, z: number }>,
     heuristic: (x: number, y: number, z: number) => number,
@@ -3572,13 +2972,11 @@ export class HopOracle {
     this.ticksFlown = 0
     const out: HopEdge[] = []
     const seenTargets = new Set<number>()
-    // nearest the goal first: the best partial path ends at the closest node
     for (let si = sources.length - 1; si >= 0 && !this.expired(deadline); si--) {
       const r = sources[si]
       if (this.stands(r.x, r.y, r.z).length === 0) continue
       const hR = heuristic(r.x, r.y, r.z)
       const cands: Array<[number, number, number, number]> = []
-      // (a bounce-only discovery flies the slime ring alone)
       for (let dx = -HOP_REACH; families !== 'bounce' && dx <= HOP_REACH; dx++) {
         for (let dz = -HOP_REACH; dz <= HOP_REACH; dz++) {
           if (dx * dx + dz * dz > HOP_REACH_SQ || (dx === 0 && dz === 0)) continue
@@ -3587,7 +2985,7 @@ export class HopOracle {
             const y = r.y + dy
             const z = r.z + dz
             const h = heuristic(x, y, z)
-            // (a cell the planner reaches the goal from is worth any regress, and is tried first, nearest first)
+            // Goal-side landings complete the route, so they bypass the retreat limit and are tried first.
             const side = goalSide !== null && goalSide(x, y, z)
             if (h > hR + MAX_REGRESS && !side) continue
             if (skip !== null && skip(x, y, z)) continue
@@ -3595,7 +2993,6 @@ export class HopOracle {
           }
         }
       }
-      // and round the slime a drop from here could bounce off (the bounce family)
       const seenCand = new Set<number>(cands.map(([x, y, z]) => ((x & 0x3ff) << 20) | ((y & 0x3ff) << 10) | (z & 0x3ff)))
       for (const [sx, sy, sz] of this.slimeTops(r.x, r.y, r.z)) {
         for (let dx = -BOUNCE_REACH; dx <= BOUNCE_REACH; dx++) {
@@ -3615,10 +3012,8 @@ export class HopOracle {
           }
         }
       }
-      // and round the deep slime (deep bounces): landings within the deep
-      // rebound's reach, flown as deep bounces alone (deepCand: no other
-      // family's landing 15-72 down is one). Per pool level, each column's
-      // nearest top once, then the reach per landing height.
+      // Deep slime candidates use deep bounces only, with reach computed for each landing height.
+      // Try each column's nearest top once per pool level.
       const deepCand = new Set<number>()
       const deepTops = families === 'simple' || families === 'bounce' || families === 'all' ? this.deepSlimeTops(r.x, r.y, r.z) : []
       const levels = new Set(deepTops.map(t => t[1]))
@@ -3660,24 +3055,20 @@ export class HopOracle {
       cands.sort((p, q) => p[3] - q[3])
       let tried = 0
       let sideTried = 0
-      // (a goal-side landing above a jump's reach is no hop at all — unless slime throws the body)
+      // Only a slime rebound can reach a goal-side landing above the jump limit.
       const srcStands = this.stands(r.x, r.y, r.z)
       const srcTop = srcStands.length > 0 ? Math.max(...srcStands.map(p => p.y)) : r.y
       const rises = this.slimeTops(r.x, r.y, r.z).length === 0
       for (const [x, y, z] of cands) {
         if (this.expired(deadline)) break
         const key = ((x & 0x3ff) << 20) | ((y & 0x3ff) << 10) | (z & 0x3ff)
-        // (a goal-side landing is worth trying from every take-off: which one flies it is the question)
+        // Try goal-side landings from every take-off; reachability depends on the source.
         const sideT = goalSide !== null && goalSide(x, y, z)
-        // (an escalation family marks a target seen only once it lands it: the
-        // first source to try one may be the one that cannot - mcc-8-2's tail
-        // claimed every pipe target its arm side forbids, and the frontier
-        // cell beside it that flies them was never asked)
+        // Mark escalated targets seen only after landing; another source may reach a target this one cannot.
         const escalation = families === 'yaw' || families === 'yawKick' || families === 'pivot'
         if (!sideT && seenTargets.has(key)) continue
         const lands = this.stands(x, y, z)
         if (lands.length === 0) continue
-        // (the pivot family flies narrow landings alone)
         if (families === 'pivot' && (lands[0].catch || Math.min(spanOf(lands, 0), spanOf(lands, 1)) >= PIVOT_NARROW)) continue
         if (sideT) {
           if (rises && Math.min(...lands.map(p => p.y)) - srcTop > GOAL_SIDE_RISE) continue
@@ -3685,7 +3076,7 @@ export class HopOracle {
         }
         if (!escalation) seenTargets.add(key)
         if ((families === 'pivot' && ++tried > PIVOT_CANDIDATES) || (escalation && families !== 'pivot' && ++tried > YAW_CANDIDATES) || (families === 'beam' && ++tried > BEAM_CANDIDATES)) break
-        // (the beam follows the partial path on from here: a chain carries its momentum along it)
+        // Follow the partial-path corridor to carry momentum through a chain.
         this.sideBridge = sideT
         let p: HopProgram | null
         try {
@@ -3702,11 +3093,7 @@ export class HopOracle {
   }
 }
 
-/**
- * How far (blocks) outside the landing cell an unobstructed flight may come
- * down and still be flown out in full: collisions deflect a flight by a few
- * tenths at most (a graze, a corner slide), not by a block.
- */
+/** Unobstructed landing miss allowed before pruning, in blocks; collisions can deflect a grazing flight. */
 const BALLISTIC_MISS = 1
 
 /** Kernel ticks quickestRobust may still spend verifying found programs once a search is out of budget. */
@@ -3718,25 +3105,17 @@ export type HopFamilies = 'simple' | 'yaw' | 'yawKick' | 'all' | 'beam' | 'bounc
 /** Horizontal hop range (blocks) and its square: a 6.5 disc covers every vanilla gap jump. */
 const HOP_REACH = 6
 const HOP_REACH_SQ = 6.5 * 6.5
-/** The reach of one flight, a hop or a beam program (HOP_REACH_SQ's radius): a live search re-finds nothing farther (plugin.ts futileChain). */
+/** Maximum horizontal reach of one hop or beam flight, in blocks. */
 export const ONE_FLIGHT_REACH = 6.5
 /** Landing heights relative to the take-off node. */
 const HOP_DROP = -6
 const HOP_RISE = 2
-/**
- * How much FURTHER from the goal (heuristic) a landing may be and still be
- * tried: courses wind, and the hop that opens the way (round an L-wall) can
- * lead away from the goal first. The caller judges a hop by what it opens
- * (a follow-up search), not by this.
- */
+/** Allowed heuristic retreat from the goal; a useful hop can lead away before its follow-up finds progress. */
 const MAX_REGRESS = 3
 /** Sort bonus that puts goal-side landings (hopPipeline.ts goalSide) ahead of every other candidate. */
 const GOAL_SIDE_FIRST = 1e6
-/**
- * A goal-side landing more than this above the take-off's stand is out of a
- * jump's reach (apex 1.2522); and at most GOAL_SIDE_PER_SOURCE are flown per
- * take-off, nearest first.
- */
+/** Goal-side rise limit above the take-off stand, just beyond the 1.2522-block jump apex.
+ * Try at most GOAL_SIDE_PER_SOURCE landings per take-off, nearest first. */
 const GOAL_SIDE_RISE = 1.26
 const GOAL_SIDE_PER_SOURCE = 8
 /** Edges one discover() returns at most. */
@@ -3748,35 +3127,21 @@ const REBOUND_JUMPS = [false, true]
 const NO_REBOUND_JUMP = [false]
 /** The climb-on: how far off the column's centre a body caught on the curtain is pressed back (advance()). */
 export const CLIMB_ON_SLACK = 0.12
-/**
- * A touchdown costing this much fall damage or more (fallDamagePoints, the
- * whole-fall rule; sneaking as the program presses it, so onto slime the
- * whole fall) is no landing (tickFlight). The candidate rings reach six
- * below a take-off (HOP_DROP: four points at most with the jump's rise);
- * the deep ring, the drops past BOUNCE_DROP, reaches 72 down, and the
- * oracle has no other fall model.
- */
-const FALL_VETO = 5
 /** A slime touchdown this far inside the pool at least (commitGate, abortsOnSlime). */
 const SLIME_EDGE = 1.5
 /** Next-leg ranking (hopFrom next): programs within NEXT_SLACK ticks of the quickest, NEXT_COLLECT kept a search, NEXT_CANDS distinct touchdowns weighed. */
 const NEXT_SLACK = 1
-/** A touchdown slower than this horizontally is pinned (nextLegPick ranks only then): opk-1's post-pinned 0.08 against 0.26 moving. */
+/** Horizontal speed below which a touchdown is pinned and worth ranking by its next leg. */
 const NEXT_PINNED = 0.12
 const NEXT_ALONG = typeof process === 'undefined' || process.env.PF_NEXT_ALONG !== '0'
 const NEXT_COLLECT = 6
 const NEXT_CANDS = 4
-/** ...each next leg searched within NEXT_LEG_TICKS of kernel work, all of them within NEXT_TOTAL_TICKS, by the simple families. */
+/** Per-leg and total kernel-work budgets for simple next-leg searches. */
 const NEXT_LEG_TICKS = 10_000
 const NEXT_TOTAL_TICKS = 40_000
 const NEXT_FAMILIES: readonly Family[] = ['straight', 'run-turn', 'air-turn']
-/**
- * The two-leg pick (hopChain): programs within CHAIN_PICK_SLACK ticks of a
- * family's quickest, CHAIN_PICK_COLLECT a family, on CHAIN_SEARCH_TICKS of
- * kernel work a round; CHAIN_PICK_CANDS distinct touchdowns weighed on
- * CHAIN_PICK_TICKS a round, all within the caller's budget; CHAIN_PICK_LEAST the
- * least a next leg takes (the pick stops where no later touchdown can win).
- */
+/** Two-leg selection limits: near-quickest candidates, distinct touchdowns and per-round work budgets.
+ * CHAIN_PICK_LEAST bounds the next-leg time so ranking can stop when no later touchdown can win. */
 const CHAIN_YAW_FAMILY: readonly Family[] = ['yaw']
 const CHAIN_PICK_SLACK = 2
 const CHAIN_PICK_COLLECT = 12
@@ -3795,22 +3160,17 @@ const COMMIT_KICKS: ReadonlyArray<[number, number, number, number, number]> = [
   [0, 0, 0, 0, COMMIT_VEL], [0, 0, 0, 0, -COMMIT_VEL]
 ]
 const BEAM_CANDIDATES = 4
-/** ...and the narrow landings per source the pivot step flies (0.5M kernel ticks a strip). */
+/** Narrow landing candidates per source for the expensive pivot search. */
 const PIVOT_CANDIDATES = 2
-/**
- * The exact line-up (HopOracle.lineUp): ticks a press is coasted to rest at
- * most, the heading stride of its sweep (LOOK_STEPs), the second press's
- * spread round its aim (LOOK_STEPs), the move of one sneaking press from rest
- * (blocks, measured on stone), how near the start a rest is worth
- * re-anchoring at, and how many of the nearest are.
- */
+/** Exact line-up limits: coast ticks, yaw stride and spread, approximate press distance in blocks,
+ * rest acceptance distance and verification candidate count. */
 const LINEUP_COAST = 60
 const LINEUP_STRIDE = 4
 const LINEUP_SPREAD = 12
 const LINEUP_PRESS = 0.059
 const LINEUP_ACCEPT = 0.01
 const LINEUP_VERIFY = 6
-/** mcc-7-2's moving line-up checks the chain's controls, with room left for other prefixes. */
+/** Enables moving line-up checks of chain controls while reserving work for other prefixes. */
 const MOVING_LINEUP = typeof process === 'undefined' || process.env.PF_MOVING_LINEUP !== '0'
 const LINEUP_ANCHOR_TICKS = 4000
 /** How many nodes back a carry chain may start (chainStart), and the beam depth it gets per tick of its corridor at chain speed (chain). */

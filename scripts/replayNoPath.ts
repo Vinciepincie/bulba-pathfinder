@@ -1,6 +1,6 @@
 // Offline replay of PF_DUMP_NOPATH captures: re-runs the exact solve the bot
-// failed and renders the geometry the solver saw, so "No path in a room it
-// should cross" is debuggable without touching prod.
+// failed and renders the geometry the solver saw, so a "No path" that should
+// not be one can be inspected without a live server.
 //
 //   npx tsx scripts/replayNoPath.ts <pf-nopath.jsonl> [entryIndex]
 //

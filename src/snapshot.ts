@@ -1,19 +1,11 @@
-// World snapshot: the classification of every block in an AABB around the
-// search, resolved through the LUT into flat SharedArrayBuffer-backed arrays.
-// Building it is one linear pass over chunk columns; after that the solver
-// (in-process or in the worker) probes cells with pure typed-array reads and
-// zero allocation, and block updates patch single cells in place instead of
-// forcing a rebuild.
+// Resolve a search box through the LUT into shared typed arrays for allocation-free probes.
+// Block updates patch cells in place so the snapshot can stay resident.
 import type { Bot } from 'mineflayer'
 import type { BlockLut } from './lut.js'
 import type { Movements } from './movements.js'
 import type { SnapshotMeta } from './types.js'
 
-/**
- * An entity weight that makes a cell impassable to both cores (each refuses a
- * cell weighing over 100): a banned landing, a take-off the executor could
- * not fly (plugin.ts banTakeoff).
- */
+/** Weight above both solvers' impassability threshold, used for banned landings and takeoffs. */
 export const BAN_WEIGHT = 200
 
 export interface Box {
@@ -31,11 +23,9 @@ export class Snapshot {
   readonly heights: Uint8Array
   /** Present only when the goal needs raycasting (GoalLookAtBlock / GoalPlaceBlock). */
   states: Uint16Array | null = null
-  /** LutSpecial byte per cell (bubble columns). Present only when the
-   * profile's LUT carries a special table (useBubbleColumns). */
+  /** Optional special grid for features enabled by the LUT, including bubble columns. */
   special: Uint8Array | null = null
-  /** Thin footprint byte per cell (shapes.ts thinFootprint). Present only when
-   * the profile's LUT carries a thin table (allowParkourExtended). */
+  /** Optional thin-footprint grid for extended parkour. */
   thin: Uint8Array | null = null
   /** Chunk columns inside the box that were not loaded when it was built (their cells read as unsafe), as cx,cz keys. */
   missingColumns: Set<string> = new Set()
@@ -91,21 +81,15 @@ export class Snapshot {
 
 const EMPTY_I32 = new Int32Array(0)
 
-// Process-global so two bots (or tests) can never mint colliding generations
-// — downstream caches key on (generation, patchCount).
+// Process-wide generations keep snapshot cache keys unique across bots.
 let globalGeneration = 0
 
 export function nextSnapshotGeneration (): number {
   return ++globalGeneration
 }
 
-/**
- * Compute the snapshot box for a solve. `targets` are the goal's known
- * coordinates (empty for goals without any); `slack` is the searchRadius
- * cost-slack (-1 = unbounded → generous default, bounded by growth+cap).
- * `floorY`, when given, is a floor the box reaches down to at least (a deep
- * slime pool under it: slimeUnderBox).
- */
+/** Size a solve box around start and known targets; slack is cost allowance (-1 = unbounded).
+ * `floorY` extends the box downward, for example to include a deep slime landing. */
 export function computeBox (
   bot: Bot,
   start: { x: number, y: number, z: number },
@@ -130,22 +114,10 @@ export function computeBox (
     if (d > maxDist) maxDist = d
   }
 
-  // Horizontal margin beyond the start/goal hull. With a cost-slack bound a
-  // detour of d off the straight line costs ≥ ~2d (out and back), so any
-  // on-path node stays within ~slack/2 of the hull; parkour compresses
-  // distance-per-cost, which the boundary-growth retry absorbs. Unbounded
-  // searches start moderate and grow on boundary contact — a small first box
-  // keeps the snapshot build in the low-millisecond range.
-  //
-  // Every cell costs ~60 ns before the search starts (LUT resolution here,
-  // the copy into wasm memory, the arena arrays), and the search itself
-  // touches a few thousand. Measured on the arena's basic2 (93-block route):
-  // the old 0.5·d + 32 margin made a 1.63M-cell box, 100 ms of setup around
-  // a 12 ms search that visited 145 nodes. 0.3·d + 20 halves the box; the
-  // boundary-growth retry still covers the rare route that needs more.
+  // A detour costs roughly twice its distance from the start/goal hull.
+  // Keep the initial margin modest; boundary retries grow it for longer detours and parkour.
   let margin = Math.ceil((slack >= 0 ? slack / 2 + 16 : maxDist * 0.3 + 20) * growFactor)
-  // A close goal doesn't need a slack-sized box — the boundary-growth retry
-  // covers the rare long detour, so first builds stay small and fast.
+  // Close goals start with a small box; boundary retries cover long detours.
   if (targets.length > 0) margin = Math.min(margin, Math.ceil((maxDist + 24) * growFactor))
   const vMargin = Math.ceil(16 * growFactor)
 
@@ -161,11 +133,8 @@ export function computeBox (
     z1: Math.ceil(maxZ + margin)
   }
 
-  // Respect the memory cap: shrink the horizontal margin first, and only when
-  // the start/goal hull alone is over the cap, cut a window of the hull around
-  // the start. Each axis shrinks by its own extent — the old loop shrank z by
-  // 5% of x and turned long narrow boxes inside out, a negative cell count
-  // that SharedArrayBuffer throws on from inside the physics tick.
+  // Meet the memory cap by shrinking margins, then windowing the hull around the start.
+  // Shrink each axis by its own extent to keep long narrow boxes valid.
   const h = box.y1 - box.y0 + 1
   const fits = (m: number): boolean =>
     (Math.ceil(maxX + m) - Math.floor(minX - m) + 1) * h * (Math.ceil(maxZ + m) - Math.floor(minZ - m) + 1) <= maxCells
@@ -214,16 +183,8 @@ interface ColumnLike {
   } | null>
 }
 
-/**
- * The DEEP slime under box `box` (arena opk2-2: the pool a bounce off the
- * arch comes down on is 61 below it, 8 under the box a solve plans in, and
- * the hop pipeline - HopOracle.deepSlimeTops - flies only what the box
- * holds): the slime blocks, within `depth` under the box's floor, that are
- * the first collision box going down their column from `openTo` (a drop
- * from the course's height reaches them). Live reads; a chunk whose
- * sections in that band have no slime in their palette is skipped whole, so
- * where there is none the probe costs next to nothing.
- */
+/** Find slime within `depth` below the box with a clear drop from `openTo`.
+ * Extend snapshots for deep bounce landings; skip sections whose palettes contain no slime. */
 export function slimeUnderBox (bot: Bot, lut: BlockLut, box: Box, depth: number, openTo: number): Array<[number, number, number]> {
   const slime = (bot.registry as unknown as { blocksByName?: Record<string, { minStateId?: number }> }).blocksByName?.slime_block?.minStateId
   if (slime === undefined) return []
@@ -249,7 +210,7 @@ export function slimeUnderBox (bot: Bot, lut: BlockLut, box: Box, depth: number,
           if (d === undefined) continue
           if (typeof d.value === 'number') any = d.value === slime
           else if (Array.isArray(d.palette)) any = d.palette.includes(slime)
-          else any = true // (a direct container: no palette to ask)
+          else any = true // A direct container has no palette to filter.
         }
         if (!any) continue
       }
@@ -266,7 +227,7 @@ export function slimeUnderBox (bot: Bot, lut: BlockLut, box: Box, depth: number,
             break
           }
           if (top === -Infinity) continue
-          // open above it, through the box, up to the course
+          // A landing needs an unobstructed drop through the box.
           let open = true
           for (let y = box.y0; y <= openTo && open; y++) {
             probe.y = y
@@ -284,12 +245,8 @@ interface WorldLike {
   getColumn (cx: number, cz: number): ColumnLike | null | undefined
 }
 
-/**
- * A section's packed cells plus its palette resolved through the LUT: the
- * per-value flags/heights/special/state that a palette index maps to (a
- * direct container's "palette" is the state id itself, resolved on demand
- * over the LUT — its arrays are the LUT's own).
- */
+/** Packed section cells and LUT-resolved palette values.
+ * Direct containers store state IDs and use the LUT itself as the palette. */
 interface NoSpanBits {
   words: Uint32Array
   bitsPerValue: number
@@ -304,12 +261,8 @@ interface NoSpanBits {
 
 const NO_SPECIAL = new Uint8Array(0)
 
-/**
- * Recognise a prismarine-chunk palette container backed by BitArrayNoSpan
- * (1.16+ block storage) and resolve its palette once. Null when the object
- * does not look exactly like that — the caller then falls back to `get`.
- * `cache` is per build: the same section object serves all 16 of its rows.
- */
+/** Resolve a BitArrayNoSpan palette once per section during a snapshot build.
+ * Return null for unsupported layouts so callers can use the generic accessor. */
 function noSpanBits (container: unknown, lut: BlockLut, cache: Map<unknown, NoSpanBits | null>): NoSpanBits | null {
   const hit = cache.get(container)
   if (hit !== undefined) return hit
@@ -347,14 +300,13 @@ function noSpanBits (container: unknown, lut: BlockLut, cache: Map<unknown, NoSp
         }
       }
     } else if (palette === undefined) {
-      // Direct container: the packed value IS the state id.
+      // Direct containers store state IDs rather than palette indices.
       const n = lut.maxStateId + 1
       if (directStates === null || directStates.length !== n) {
         directStates = new Uint16Array(n)
         for (let i = 0; i < n; i++) directStates[i] = i
       }
-      // No special table → the snapshot has no special grid either, so the
-      // empty array is never indexed.
+      // Without a special grid this empty array is never indexed.
       out = {
         words: ba.data, bitsPerValue: ba.bitsPerValue, valuesPerLong: ba.valuesPerLong, valueMask: ba.valueMask,
         flags: lut.flags, heights: lut.heights, special: lut.special ?? NO_SPECIAL, thin: lut.thin ?? NO_SPECIAL, states: directStates
@@ -400,7 +352,6 @@ export function buildSnapshot (bot: Bot, lut: BlockLut, box: Box, needStates: bo
   const cz1 = box.z1 >> 4
   const probe = { x: 0, y: 0, z: 0 }
   const bitsCache = new Map<unknown, NoSpanBits | null>()
-  // PF_SOLVE_TIMING=1: how many rows each path resolved (diagnostic).
   const counting = process.env.PF_SOLVE_TIMING === '1'
   let rowsUniform = 0
   let rowsFast = 0
@@ -420,13 +371,9 @@ export function buildSnapshot (bot: Bot, lut: BlockLut, box: Box, needStates: bo
       } catch {
         column = null
       }
-      if (!column) { colsMissing++; snap.missingColumns.add(`${cx},${cz}`); continue } // unloaded → cells stay 0 (upstream null-block: unsafe, not physical)
+      if (!column) { colsMissing++; snap.missingColumns.add(`${cx},${cz}`); continue } // Unloaded cells remain unsafe and non-physical.
 
-      // Fast path: read section containers directly (prismarine-chunk 1.18+).
-      // A SingleValueContainer section (all air, all stone) resolves without
-      // per-cell reads; paletted sections use container.get (bit-read +
-      // palette index — no hash lookup, no Vec3). Falls back to the generic
-      // per-cell API if the internals don't look as expected.
+      // Read known section layouts directly; unfamiliar layouts use generic cell access.
       const sections = column.sections
       const colMinY = column.minY
       const useSections = Array.isArray(sections) && typeof colMinY === 'number' && (colMinY & 15) === 0
@@ -449,10 +396,7 @@ export function buildSnapshot (bot: Bot, lut: BlockLut, box: Box, needStates: bo
             uniformState = sec.data.value
             sectionOk = true
           } else {
-            // Fastest path: unpack the section's no-span bit array directly
-            // (prismarine-chunk 1.16+ BitArrayNoSpan), the palette resolved
-            // through the LUT once per section. Two method calls per cell
-            // become a few integer ops; measured 27 ns/cell → well under 10.
+            // Resolve the palette once, then unpack no-span values without per-cell method calls.
             bits = noSpanBits(sec.data, lut, bitsCache)
             if (bits !== null) {
               sectionOk = true
@@ -538,7 +482,6 @@ export function buildSnapshot (bot: Bot, lut: BlockLut, box: Box, needStates: bo
               }
               continue
             } catch {
-              // fall through to the generic path for this row
             }
           }
           rowsGeneric++
@@ -598,10 +541,7 @@ export function applySnapshotBlockUpdate (
   return true
 }
 
-/**
- * Bake the movements' entity-intersection index (already computed via
- * updateCollisionIndex, upstream-identical) into sparse per-cell weights.
- */
+/** Bake the movements' entity-intersection index into sparse per-cell weights. */
 export function bakeEntityIndex (snap: Snapshot, movements: Movements): void {
   const entries = Object.entries(movements.entityIntersections)
   if (entries.length === 0) {

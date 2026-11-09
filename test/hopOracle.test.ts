@@ -108,6 +108,17 @@ describe('HopOracle', function () {
   // a three-block gap: take-off z ≤ 1, landing z ≥ 5
   const gap = [...floor([-2, 2], [-4, 1]), ...floor([-2, 2], [5, 8])]
 
+  it('refuses a landing that costs more than fallVeto allows', () => {
+    // From feet at 6 to feet at 1: at least 5 blocks of fall, 2 points of damage or more.
+    const ledge = floor([-2, 2], [-4, 1]).map(([x, , z]): [number, number, number] => [x, 5, z])
+    const solid = [...ledge, ...floor([-2, 2], [5, 8])]
+    const free = oracleOver(solid, true)
+    expect(free.hop([0, 6, 0], [0, 1, 6], performance.now() + 20000)).to.not.equal(null)
+    const capped = oracleOver(solid, true)
+    capped.fallVeto = 1
+    expect(capped.hop([0, 6, 0], [0, 1, 6], performance.now() + 20000)).to.equal(null)
+  })
+
   describe('bonked take-offs', () => {
     type Flight = { b: SimBody, t: number, fired: boolean, air: number, rebounds: number, yaw: number, leg: number, top: number }
     type FlightOracle = { ctl: SimControl, tickFlight: (f: Flight, p: HopProgram, track: number[] | null) => number }

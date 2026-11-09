@@ -1,37 +1,5 @@
-// Gait schedules in the exact kernel (improvement, allowHopIntoJump).
-//
-// On the ground the executor decides one thing a tick: jump now, or keep its
-// feet. A hop is the faster gait — the jump keeps the sprint boost ground
-// friction eats — but it is ballistic: for the length of its arc the body
-// goes where it was thrown. Whether to throw it NOW depends on what the arc
-// comes down in: the far side of a gap, the lip the next jump leaves from,
-// the inside of a corner, the last node of the path. The old answers compared
-// two fixed policies (always hop, never hop) a fixed horizon out, and left
-// every jump to a gate that took it on the first tick it was possible. They
-// took a hop into a one-wide corner because hopping is the faster way down
-// the straight before it (arena tunnel1), refused two hops in a row under a
-// low roof because the first alone gained a single tick, and jumped a gap a
-// tick early into a ditch on its far side.
-//
-// Here the question is asked exactly. Of the SCHEDULES of jumps the body
-// could fly from here — ticks on the ground, a jump, ticks on the ground, a
-// jump — which reaches a node some ten blocks on soonest, and does it begin
-// with a jump? Every schedule is flown in the kernel (playerSim.ts) as the
-// executor will replay it: on the ground steering at the next node not yet
-// passed, the way the executor walks (wallSteer.ts); in the air at that node,
-// tick for tick. A jump over a gap or up a rise is flown like any hop: what
-// tells them apart is that the path asks for it, so it may be taken on any
-// tick, once, and over a gap has to hold from a hair either side.
-//
-// Depth first, jumps first, and cut three ways — none of which changes the
-// answer where the path turns, drops or ends:
-//
-// - the bound: a schedule is dropped once it cannot beat the best so far,
-//   going on at the fastest any gait goes round the corners left (togo);
-// - dominance: a ground state is not flown from twice, nor where a state
-//   explored before it was further down a straight run no later (dominated);
-// - the horizon: as far as the hops a schedule holds reach, and a little
-//   (scout). Past them every schedule is the same run.
+// Jump timing depends on the landing and the next take-off, so schedules use
+// the executor's physics and steering rather than a fixed hopping policy.
 
 import { SIM, SIM_SLIME, SIM_CLIMBABLE, SIM_HAZARD, copyBody, newBody } from './playerSim.js'
 import type { PlayerSim, SimBody, SimControl } from './playerSim.js'
@@ -43,330 +11,206 @@ export interface GaitNode {
   x: number
   y: number
   z: number
-  /** A node the plan jumps to: retired as the executor retires a landing (Search.pass). */
+  /** Jump destination, retired using the executor's landing rules. */
   parkour?: boolean
-  /** ...that the body walks to all the same (kWalkable): no jump is asked for it. */
+  /** The destination is reachable on foot, so it does not require a jump. */
   walked?: boolean
 }
 
 export interface GaitGoal {
-  /**
-   * Index of the goal node in the path: the schedule's end is the body past
-   * it, down and carried. The search ends its schedules sooner where the way
-   * there takes more jumps than a schedule holds (GAIT_HOPS): at the node the
-   * last but one of them lands on.
-   */
+  /** Goal node index; the search may stop earlier at its jump or scouting horizon. */
   index: number
-  /** The goal node ends the path: it is arrived at on the ground, never flown over. */
+  /** The goal ends the path and requires a grounded arrival. */
   last: boolean
-  /** The node retired before the path's first: where the flight to a parkour node that IS the first began. */
+  /** Previous node, used as the take-off origin when the first node is a jump destination. */
   from?: { x: number, z: number } | null
-  /** The server counts the whole fall (fallDamage.ts landingHurts); true when absent. */
+  /** Whether the server counts the whole fall for damage; defaults to true. */
   wholeFall?: boolean
-  /** Fly and run with the 45° strafe (kStrafe). */
+  /** Enable the 45° strafe on the ground and in the air. */
   strafe?: boolean
-  /** The executor retires a parkour node the body came down past (allowLandingRetire); true when absent. */
+  /** Retire parkour nodes when landing past them; defaults to true. */
   landRetire?: boolean
   /**
-   * Index of the node a jump catches a climbable for (a ladder or vine in
-   * its column, at its feet or under them): a flight caught there is a
-   * landing, and the schedule climbs on, as the executor's catch branch
-   * climbs, to the goal's level (Search.climb). The goal is the catch node
-   * or a climb node above it in the same column. Absent or -1: none.
+   * Climbable catch node index; absent or -1 disables catches. A catch counts as
+   * a landing, followed by a climb to the goal in the same column.
    */
   catchAt?: number
-  /**
-   * The schedules' best time, not a choice (physics.ts skipWalk): the phase
-   * that keeps its feet searched for its quickest, not stopped at the first
-   * schedule that does as well as the jump.
-   */
+  /** Find the fastest ground-first schedule instead of stopping at the first qualifying one. */
   best?: boolean
 }
 
-/** A tick on the ground, as the kernel ran it: where the body looks, and the keys beside forward. */
+/** Ground control for one tick, with forward held. */
 export interface GaitStep { yaw: number, sprint: boolean, strafe: boolean }
 
 export interface GaitResult {
-  /** Ticks to the goal of the best schedule that jumps now; Infinity when none gets there. */
+  /** Best arrival time in ticks when jumping now; Infinity if none succeeds. */
   hop: number
-  /** The goal the search ended at (an index into its path: GAIT_LIPS and the scout may end it short of GaitGoal.index), and whether that was the stop GaitGoal.last asked for. */
+  /** Actual goal index, which may precede GaitGoal.index at the search horizon. */
   goal: number
   goalLast: boolean
   /**
-   * ...and of a schedule that keeps its feet this tick: one that does as well
-   * (where a jump lies ahead) or a tick better (over open ground) when `hop`
-   * is finite, any that gets there when it is not; Infinity when there is none.
+   * Arrival time when staying grounded this tick; Infinity if no schedule qualifies.
+   * It must match the hop with jumps ahead, or beat it over open ground.
    */
   run: number
   /**
-   * The search ran out of work looking for a schedule that keeps its feet.
-   * With `hop` finite the jump stands unrefuted: the likeliest refutations
-   * (the same jump a tick or two later) are the first flown, and the jump is
-   * part of a schedule that gets there. With no jump on offer there is no
-   * verdict at all.
+   * The work budget is exhausted. A finite hop is viable but may have a better
+   * ground-first alternative; without a hop, the result is inconclusive.
    */
   spent: boolean
-  /** Kernel ticks flown. */
+  /** Number of simulated physics ticks. */
   work: number
-  /**
-   * The jump now, as flown: the look of every tick from the take-off to the
-   * touchdown. The executor replays it — the schedule was judged on this
-   * flight, and a take-off on any other heading is another flight.
-   */
+  /** Yaw for each tick of the chosen jump; the executor must replay these headings. */
   flight: number[]
-  /** ...its ticks after the take-off's with the strafe key held (GaitGoal.strafe). */
+  /** Hold strafe after take-off while forward is held. */
   strafe: boolean
-  /**
-   * ...and the tick of it from which forward (and the strafe key) is let go:
-   * the flight coasts down onto a node it would fly past (Search.jump).
-   * EASE_NEVER: held to the touchdown.
-   */
+  /** Tick when forward and strafe are released; EASE_NEVER holds them through touchdown. */
   ease: number
-  /** The tick on the ground the feet's schedule begins with (`run` finite), for the executor to take as it was run. */
+  /** First ground control to replay when `run` is finite. */
   step: GaitStep | null
 }
 
-/** A flight that touches a wall must land with the heading this far either side too (the legacy gates' graze rule). */
+/** Wall-grazing flights must also land with headings offset by this angle on either side. */
 export const GRAZE_YAW = 0.02
 /**
- * Cosine of the largest angle between the body's velocity and the commanded
- * heading at which a legacy take-off may go (20°), and a hop of the gait
- * (45°; a jump the path asks for: ASKED_TURN_COS, below). Into a turn a jump
- * flies the OLD heading; the kernel flies it exactly, so the angles are a cut
- * on the search's work, not a model: a flight thrown across the line is one
- * more to refute, and past 45° a hop is never the way to the next node
- * (measured offline: 45° took 73 ticks off 21 routes for a quarter more work;
- * 90° and 180° took less off for more). The 20° stays the executor's own gate
- * on a legacy take-off. PF_HOP_TURN_DEG and PF_GAIT_TURN_DEG for A/B runs.
+ * Take-off alignment limits: 20° for the executor's gate, 45° for gait hops.
+ * A sprint jump boosts along the current heading, so these limits prune turns.
  */
 export const HOP_TURN_COS = Math.cos((Number((typeof process !== 'undefined' ? process.env.PF_HOP_TURN_DEG : undefined) ?? 20) || 20) * Math.PI / 180)
 export const GAIT_TURN_COS = Math.cos((Number((typeof process !== 'undefined' ? process.env.PF_GAIT_TURN_DEG : undefined) ?? 45) || 45) * Math.PI / 180)
-/**
- * The cut on a jump the path asks for alone (Search.mayHop): 45°, as a hop of
- * the gait's. At 20° the gait ran into a turn before every asked jump on a
- * zig-zag of risers and lips; at 45° it takes them off the landing.
- * Same-host A/B twice (2026-10-28, 31 routes): JS -3.92/-1.98 s, wasm
- * -2.72/-1.16 - mcc-2-3 -0.73, opk2-3 -0.60, mcc-5-3 -0.30, opk-6 -0.21,
- * spiral3-c -0.20 both times. Its one live loss before (mcc-8-3, +17 ticks)
- * was the fire escape at the stair foot (playerSim.ts SIM_HAZARD), not the
- * turn. PF_ASKED_TURN_DEG for A/B runs.
- */
+/** Allow path-required jumps within 45° of the body's velocity, including turns between risers. */
 const ASKED_TURN_COS = Math.cos((Number((typeof process !== 'undefined' ? process.env.PF_ASKED_TURN_DEG : undefined) ?? 45) || 45) * Math.PI / 180)
-/** The root's jump, cut by the angles above, flown after all where nothing else is left (Search.run). PF_GAIT_ROOT_UNCUT=0 for A/B. */
+/** Retry the root jump without the angle cut when no schedule succeeds. */
 const GAIT_ROOT_UNCUT = typeof process === 'undefined' || process.env.PF_GAIT_ROOT_UNCUT !== '0'
-/** How far below the path a jump may come down (the lower of the node behind and the node ahead). */
+/** Maximum landing depth below the lower of the adjacent path nodes. */
 export const HOP_MAX_DIP = 0.5
 /**
- * How far ABOVE a parkour node the body may be and still retire it in the
- * air. Roughly one tick of fall: at that height the landing is committed, so
- * holding the node buys nothing and costs the momentum the next move wants.
+ * Maximum height above a parkour node for airborne retirement. The landing is
+ * committed this close to the ground; holding the node sacrifices momentum.
  */
 export const PARKOUR_LAND_DY = 0.5
-/** A parkour node passed from high over it where ground goes on beyond it, as the executor retires it (Search.holeBeyond); PF_GAIT_GROUND_PASS=0: always held. */
+/** Allow airborne retirement of parkour nodes with ground beyond them. */
 const GAIT_GROUND_PASS = typeof process === 'undefined' || process.env.PF_GAIT_GROUND_PASS !== '0'
 
-/**
- * Ticks on the ground a schedule may wait before a hop over ground that runs
- * on, and the hops it may hold.
- */
+/** Ground delay before an optional hop, and the optional hops allowed per schedule. */
 const GAIT_DELAY = 3
 const GAIT_HOPS = 4
 /**
- * The jumps the path may ASK of a schedule — a gap, a rise over a step. One
- * for each, on any tick (the lip is where it is) and not counted against
- * GAIT_HOPS; the schedules end at the node the last of them lands on. Three:
- * a landing is judged by the take-off it leaves for the jump after it, and
- * that one by its own (arena spiral3-a, a row of gaps: with two the body
- * came down where the third could not be thrown).
+ * Path-required jumps do not consume GAIT_HOPS. Looking three jumps ahead
+ * judges each landing by the take-off it leaves for subsequent jumps.
  */
 const GAIT_LIPS = 3
-/** Jumps deep a schedule may go, of both kinds (the scratch bodies' depth). */
+/** Maximum combined jump depth, also used for scratch-body storage. */
 const GAIT_DEPTH = GAIT_HOPS + 2 * GAIT_LIPS
-/**
- * The scout's chain of hops (Search.scout): the ticks it may take, and the
- * blocks past its last touchdown the schedules run on — what that landing
- * shows in: a corner overshot, a wall run into.
- */
+/** The scouting hop chain's tick limit and extra distance for detecting overshot corners or walls. */
 const SCOUT_TICKS = 40
 const SCOUT_TAIL = 3
-/** Ticks a schedule may take. */
+/** Maximum ticks per schedule. */
 const GAIT_BUDGET = 80
-/**
- * Kernel ticks a search may fly: on the schedules that jump now, and then on
- * the ones that do not. A search costs some hundreds; these are for the few
- * with three jumps in a row to time, where one cut short takes the first
- * jump it found for the best. Doubled (offline, climb2: 9 spent searches
- * to 1, -9 ticks): a long tick costs no route time, mineflayer catches up.
- */
+/** Separate simulation budgets for jump-first and ground-first schedules with several jumps to time. */
 const GAIT_WORK_HOP = 18000
 const GAIT_WORK_RUN = 15000
-/**
- * Ticks a landing that hurts stands for the server's packet (plugin.ts
- * HURT_WAIT_TICKS: one, where it comes at once), and the ticks of ground a
- * body that lost its speed there has lost on one that kept it.
- */
+/** Tick costs for waiting on the server's hurt packet and regaining lost speed. */
 const HURT_STAND = 1
 const HURT_REGAIN = 2
-/**
- * ...and what the health it takes is worth, in ticks: a schedule comes down
- * hurt only where that saves it this much. (Timed alone, a hop off a ledge
- * into a fall that hurts beat running off it by a tick or two, whenever the
- * run came down slowly: half a heart for a tenth of a second.)
- */
+/** Health penalty in ticks: a damaging landing must save at least this much time. */
 const HURT_COST = 6
-/** All a hurt landing is charged, in ticks (Search.end): the stand, the health, the speed (physics.ts skipTo compares a program with it). */
+/** Total tick penalty for a damaging landing: packet wait, health and lost speed. */
 export const HURT_TICKS = HURT_STAND + HURT_COST + HURT_REGAIN
-/** As far as any wall probe reaches from the body (SLIDE_PROBE), and a hair. */
+/** Maximum wall-probe reach, with a small margin. */
 const WALL_REACH = 0.36
 /**
- * No gait covers ground faster than this (blocks a tick): the bound's
- * optimism. A body with no hop left in its schedule runs: at the speed its
- * push settles to on the block that carries a runner furthest (RUN_SETTLE
- * times the push: 0.216 / (s^3 (1 - 0.91 s)) at blue ice's s), or the speed
- * it has and a tick's push (RUN_PUSH: sprinting, on plain ground).
+ * Optimistic speed bound in blocks per tick. With no hops left, use the larger
+ * of the blue-ice running equilibrium and current speed plus one tick's push.
  */
 const GAIT_VMAX = 0.5
-/**
- * ...but not where a slippery floor is in reach: hops tapped under a 2-high
- * ceiling on ice hold 0.97 a tick, 1.33 under a 1.81 one (blue ice); open ice
- * hopping 0.46 (bench speedTricks.ts). The bound is the optimism of the
- * search's pruning, so it must not give up a gait faster than it. Measured on
- * a 10-node window (bench gaitIce.ts): the fixed bound lost 0.5 of a tick on
- * ice under a ceiling, and nothing on stone; lifting it for a fast body on
- * stone only doubled the work. PF_GAIT_VMAX_SLIP=0: the fixed bound (A/B).
- */
+/** Ice under low ceilings permits faster hops, so pruning needs a higher speed bound. */
 const GAIT_VMAX_SLIP = 1.4
 const GAIT_VMAX_STATE = process.env.PF_GAIT_VMAX_SLIP !== '0'
-/** A floor this slippery or more (ice 0.98, blue ice 0.989, slime 0.8; stone's default reads 0) lifts the bound. */
+/** Slipperiness threshold for the higher speed bound; stone's default reads as 0. */
 const SLIP_FAST = 0.6
 const RUN_PUSH = 1.3
 const RUN_SETTLE = 2.2326
-/**
- * A parkour node is come down past within LAND_PAST of it, or within
- * LAND_PAST_WALKED on its own platform: ground walked back over to the node
- * (kWalkable). The executor's numbers (plugin.ts).
- */
+/** Landing retirement distance, extended for nodes reachable on foot on the same platform. */
 const LAND_PAST = 1
 const LAND_PAST_WALKED = 2.5
-/** A node is passed from within this of it at the least: the corner of its box, and a parkour node come down past (Search.pass). */
+/** Minimum node reach for its arrival box and landings past parkour nodes. */
 const PASS_REACH = 0.5
 const PASS_REACH_LANDED = LAND_PAST_WALKED
-/** Ticks sooner a schedule that keeps its feet must pass a node over open ground to be preferred to the hop (Search.run). */
+/** Tick advantage required to prefer running over hopping on open ground. */
 const GAIT_RUN_GAIN = 1
-/**
- * The second ground policy (Search.roundMode, gaitSearch's `pick`): how much
- * sooner (ticks) it must reach the goal to be taken, and how far (blocks) the
- * corner it rounds may lie off the leg it is on. Offline over 24 routes
- * (driveSim, the arena's traces) the guarded pair took 56 ticks off and lost
- * none above 5; unguarded — a 0 margin, no stickiness, no corridor — it fell
- * on basic3 and stalled on spiral3-a, the two policies flapping into states
- * neither schedules.
- */
-/**
- * The aim node of a turn test closer than this (blocks, horizontally) is
- * passed for the turn's purposes: the heading to it is float noise. A body
- * riding a block above its floor nodes (basic3's y237 tops beside y236 nodes)
- * never passes them (|dy| < 1), and the hop at the next node was refused on
- * a cos of 0.60 against a node 0.04 away. PF_GAIT_NEARAIM=0 bisects.
- */
+/** Ignore nearby aim nodes in turn tests, where tiny position changes make headings unstable. */
 const NEAR_AIM = 0.35
 const GAIT_NEARAIM = typeof process === 'undefined' || process.env.PF_GAIT_NEARAIM !== '0'
-/**
- * A touchdown further than this (blocks, either axis) from the last parkour
- * node its flight retired flew over that node (Search.hop): the eased flights
- * are tried for it. A node retired in the air (PARKOUR_LAND_DY) was never
- * 'over', so a stair of 2-deep steps was hopped to the far edge of each and
- * the next riser bonked (arena opk-9: -5 ticks offline; it fired on no other
- * route of the book).
- */
+/** Distance past a retired parkour node that triggers easing, leaving room for the next riser. */
 const EASE_PAST = 1
+/** Rounding policy time margin and corridor width prevent switching between incompatible schedules. */
 const ROUND_MARGIN = 2
 const ROUND_CORRIDOR = 0.5
-/** How far ahead (blocks) the rounding policy looks for a box in the way, and the body band it looks in. */
+/** Obstacle look-ahead distance and body-height band for corner rounding. */
 const ROUND_REACH = 2.5
 const ROUND_BAND = 0.61
-/** How far (blocks) from the body the rounding policy's hazard cells are gathered (Search.hazardCells). */
+/** Radius in blocks for gathering hazard cells around the body. */
 const HAZARD_SCAN = 12
-/** PF_GAIT_ROUND=0 bisects the second policy. */
+/** Enable the corner-rounding policy. */
 const GAIT_ROUND = typeof process === 'undefined' || process.env.PF_GAIT_ROUND !== '0'
-// climb2's two policies need not fly the same tree twice: check every ground
-// step, including the scout's, before reusing the plain search.
+// Reuse the plain search only if every ground step, including scouting,
+// makes the same choice under the rounding policy.
 const GAIT_REUSE = typeof process === 'undefined' || process.env.PF_GAIT_REUSE !== '0'
-/** The strafe fallback (gaitSearch): how many ticks sooner the search without the strafe must be; PF_STRAFE_FALLBACK=0 bisects. */
+/** Tick advantage required to choose the search without strafe. */
 const STRAFE_MARGIN = 1
 const STRAFE_FALLBACK = typeof process === 'undefined' || process.env.PF_STRAFE_FALLBACK !== '0'
 /**
- * A jump is taken only if it comes down the same from starts this far either
- * side too (hopOracle.ts LIVE_NUDGE): the replay is exact, the look the
- * executor turns to is not (mineflayer turns in 0.15° steps).
+ * Flights must tolerate this starting-position offset on either side because
+ * mineflayer rounds the replayed look to 0.15° steps.
  */
 const HOP_NUDGE = 0.01
-/** GaitResult.ease of a flight with forward held all the way. */
+/** GaitResult.ease value for holding forward through touchdown. */
 export const EASE_NEVER = 99
 /**
- * A caught flight (Search.climb): the executor's catch branch steers the
- * along-wall drift back to the column's centre (plugin.ts CLIMB_DRIFT,
- * CLIMB_HOLD); the climb ends at the goal's level, CATCH_LEVEL under it. A
- * nudged flight holds where it catches the same column no further down than
- * CATCH_NUDGE_DY and climbs to the goal's level too.
+ * Climb steering keeps the body centred on the column and ends just below
+ * goal height. Nudged catches must reach the same column within CATCH_NUDGE_DY.
  */
 const CATCH_DRIFT = 0.91 / 0.09
 const CATCH_HOLD = 0.15
 const CATCH_LEVEL = 0.01
 const CATCH_NUDGE_DY = 1
-/** The ladder's climb, blocks a tick: (ladderClimbSpeed - gravity) * airdrag. */
+/** Ladder rise in blocks per tick: (ladderClimbSpeed - gravity) * airdrag. */
 const LADDER_RISE = (SIM.ladderClimbSpeed - SIM.gravity) * SIM.airdrag
 const WALL_SIDES: ReadonlyArray<readonly [number, number]> = [[1, 0], [-1, 0], [0, 1], [0, -1]]
-/** PF_GAIT_CATCH=0 bisects the catch landing. */
+/** Enable climbable catches as landings. */
 export const GAIT_CATCH = typeof process === 'undefined' || process.env.PF_GAIT_CATCH !== '0'
-/** mcc-4-1/5-3: hold catches before wall contact, in the executor and its schedules. */
+/** Enable holding climbable catches before wall contact. */
 export const CLIMB_HOLD_ENABLED = typeof process === 'undefined' || process.env.PF_CLIMB_HOLD !== '0'
-/** A body at a schedule's end has stopped below this speed, and is given this many ticks to (Search.stops). */
+/** Speed threshold and braking tick limit for a stopped schedule. */
 const STOP_SPEED = 0.05
 const STOP_TICKS = 8
 /**
- * Dominance (Search.dominated). Bodies on levels further apart than
- * DOM_LEVEL are not compared. A state is THE SAME as another within DOM_SAME
- * (blocks, blocks a tick). Over DOM_CLEAR blocks of straight path a lead of
- * DOM_LEAD blocks per block-a-tick of speed is one the slower body ahead
- * keeps: a surplus of speed decays by the air's friction at the least,
- * 1 / (1 - 0.91) ticks of it.
+ * Compare nearby levels and equivalent states; lead dominance requires a clear straight.
+ * DOM_LEAD bounds extra travel from decaying speed: 1 / (1 - 0.91) ticks of it.
  */
 const DOM_LEVEL = 0.6
 const DOM_SAME = 1e-3
 const DOM_CLEAR = 5
 const DOM_LEAD = 11.2
 /**
- * A jump the path asks for that scrapes a riser on its first RISER_TICKS
- * rising (Search.hop) has the flight it took off from flown eased too, forward
- * let go up to RISER_EASES ticks before its touchdown (Search.jump): a shorter,
- * slower landing that leaves room to clear the riser. Arena opk-2: the hop
- * onto the slab came down 0.17 short of the stair, the jump up bonked it (vz
- * 0.27 to 0) and crawled on from 0.13; eased 6, the same hop leaves the jump
- * room to clear it at 0.26 (offline: opk-2 -6 ticks, climb2 -20, mcc-2-3 -8,
- * mcc-3-2 -7, opk2-3 -5, none slower). The eases are flown for jumps at depth
- * RISER_DEPTH at most (the run phase's first jump is at depth 1; nested deeper
- * they multiplied the work past the budget), on RISER_SHARE of the work left
- * (extras: spent on them, opk2-1's run phase had no answer and hopped into a
- * header), and their landings are not dominated by the un-eased flight's
- * faster bodies ahead (riserEasing): before a rise the faster body is the one
- * that bonks. That rule for every rise (RISE_DOM) gained nothing and blew the
- * work on the ten-ways courses: off. PF_GAIT_RISER=0 for A/B.
+ * Enable easing before a riser scrape: a shorter, slower landing leaves room
+ * for the next jump to clear the riser.
  */
 const RISER_EASE = typeof process === 'undefined' || process.env.PF_GAIT_RISER !== '0'
 const RISER_TICKS = 3
-/** No lead dominance short of a rise (PF_GAIT_RISEDOM=1 to try: A/B). */
+/** Disable lead dominance before rises. */
 const RISE_DOM = typeof process !== 'undefined' && process.env.PF_GAIT_RISEDOM === '1'
 const RISER_EASES = 6
-/** ...on this share of the work left to the search when they start. */
+/** Fraction of remaining work available for eased flights, preserving the main search's budget. */
 const RISER_SHARE = 0.4
 const RISER_DEPTH = Number((typeof process !== 'undefined' ? process.env.PF_GAIT_RISER_DEPTH : undefined) ?? 1)
-/** The ground states a phase has explored (labels): where, how fast, when, with what left to do, and how it came out. */
+/** Ground-state capacity per phase, including position, velocity, time and remaining choices. */
 const LABELS = 4096
 const OPEN = 0
 const ALIVE = 1
 const DEAD = 2
-/** ...and the labels of a subtree under a landing that did not hold (Search.verified): they count for nothing. */
+/** Labels under a landing that fails verification cannot dominate other states. */
 const VOID = 3
 const labelX = new Float64Array(LABELS)
 const labelY = new Float64Array(LABELS)
@@ -374,7 +218,7 @@ const labelZ = new Float64Array(LABELS)
 const labelVx = new Float64Array(LABELS)
 const labelVz = new Float64Array(LABELS)
 const labelT = new Float64Array(LABELS)
-/** (progress down the path and speed, the measures of a lead; and is it on a straight run) */
+/** Path progress, speed and straight-run status used for lead dominance. */
 const labelS = new Float64Array(LABELS)
 const labelV = new Float64Array(LABELS)
 const labelClear = new Uint8Array(LABELS)
@@ -384,12 +228,8 @@ const labelState = new Uint8Array(LABELS)
 const NUDGES: ReadonlyArray<readonly [number, number]> = [[HOP_NUDGE, 0], [-HOP_NUDGE, 0], [0, HOP_NUDGE], [0, -HOP_NUDGE]]
 
 /**
- * The 45° strafe, on a control already aimed down its line: the look turned
- * an eighth of a turn to the right and the left key bringing the push back
- * onto the line. Forward alone is an input 0.98 long; forward and strafe are
- * normalised to 1 — 2% more push, on the ground and in the air (5.58 to 5.69
- * b/s sprinting, 6.97 to 7.04 hopping, measured in the kernel). Never on a
- * jump's own tick: a sprint jump's boost goes where the body LOOKS.
+ * Rotate 45° and hold left to keep the push on the travel line. Combined input
+ * normalises to 1 rather than 0.98; skip take-off because its boost follows yaw.
  */
 export function kStrafe (c: SimControl): void {
   const hx = c.hx
@@ -398,7 +238,7 @@ export function kStrafe (c: SimControl): void {
   c.left = true
 }
 
-/** The yaw that looks down a line of travel yaw `yaw` for the strafe (kStrafe, with the left key). */
+/** Look yaw for travel yaw `yaw` with the left strafe key held. */
 export function strafeYaw (yaw: number): number {
   return yaw - Math.PI / 4
 }
@@ -413,48 +253,35 @@ export function kAim (c: SimControl, b: SimBody, px: number, pz: number): void {
   c.hz = dz / d
 }
 
-/** Which policy the last decision took (per PhysicsSim): the rounding one is kept until the plain one beats it by ROUND_MARGIN. */
+/** Selected steering policy; rounding persists until the plain policy wins by ROUND_MARGIN ticks. */
 export interface GaitPick {
   round: boolean
-  /** False repeats the rounding search for differential checks. */
+  /** Set false to repeat the rounding search even when its steering matches the plain policy. */
   reuse?: boolean
 }
 
 class Search {
-  /**
-   * The second ground policy: a run tick whose straight step to its node has
-   * a box in the way at body height (within ROUND_REACH) steers at that box's
-   * nearest corner instead — round it, sprinting — where the plain policy
-   * walks the wall it meets (sideStandoff, wallSlide, no sprint against it).
-   * On opk-4's diagonal pillar squeezes the plain run was refuted (the
-   * standoff pushed the body off its support) and the gait threw 12-tick
-   * hops pinned against the pillar face.
-   */
+  /** Round obstructing boxes instead of sliding along walls, which can push the body off narrow supports. */
   roundMode = false
   /** Still identical at every rounding opportunity visited by the plain search. */
   roundSame = false
   private best = Infinity
   private work = 0
-  /** The work the phase being searched may reach, and whether it got there. */
+  /** Simulation work limit for this phase and whether it is exhausted. */
   private limit = GAIT_WORK_HOP
   private spent = false
-  /** The run-first search ends at the first schedule it finds. */
+  /** Stop the ground-first search at its first qualifying schedule. */
   private firstWins = false
   private done = false
   private readonly c: SimControl = { forward: true, back: false, left: false, right: false, jump: false, sprint: true, sneak: false, hx: 0, hz: -1 }
   private readonly win: SimBody[] = []
   private readonly fly: SimBody[] = []
-  /** The best jump from the root: its looks (GaitResult.flight) and its ease. */
+  /** Best root jump's headings and forward-release tick. */
   private readonly flight: number[] = []
   private ease = EASE_NEVER
-  /** The looks of the jump being flown that has to hold, by depth (Search.holds). */
+  /** Headings by depth for flights requiring verification. */
   private readonly looks: number[][] = [[]]
-  /**
-   * Per depth, of the jump flown there: must it hold (Search.verified), from
-   * which take-off, with what ease, landing at what level and carried; is
-   * it known to (-1 not yet, 0 no, 1 yes); the labels before its subtree;
-   * and did its subtree find it not to.
-   */
+  /** Per-depth replay state, verification status (-1 unknown, 0 failed, 1 passed), and subtree validity. */
   private readonly heldAt: boolean[] = []
   private readonly holdFrom: SimBody[] = []
   private readonly holdEase: number[] = []
@@ -462,7 +289,7 @@ class Search {
   private readonly holdCarried: boolean[] = []
   private readonly holdCatch: boolean[] = []
   private readonly holdOk: number[] = []
-  /** The catch (GaitGoal.catchAt): its node index, its column, and the bottom of the climbable under it. */
+  /** Catch node index, column and lowest climbable cell. */
   private catchAt = -1
   private catchX = 0
   private catchZ = 0
@@ -472,57 +299,57 @@ class Search {
   private wallZ = 0
   private readonly labelsAt: number[] = []
   private readonly unheld: boolean[] = []
-  /** Per depth, of the flight last flown there: did it fly past a node it was for (and which), and its ticks. */
+  /** Per-depth overshot node and flight duration. */
   private readonly over: boolean[] = []
   private readonly overAt: number[] = []
   private readonly flew: number[] = []
-  /** Per depth: did a jump flown on from the landing of the flight there scrape a riser rising (RISER_EASE)? */
+  /** Whether the next jump from each landing scrapes a riser while rising. */
   private readonly scraped: boolean[] = []
-  /** Flying a riser's eased flights (RISER_EASE): no lead dominance over their landings - the faster body ahead is the one that bonked. */
+  /** Eased landings bypass lead dominance because faster bodies ahead may hit the riser. */
   private riserEasing = false
   private readonly nudged = newBody(0, 0, 0)
-  /** The first tick of the feet's schedule (GaitResult.step): taken down while `stepWanted`. */
+  /** First ground control, recorded while stepWanted is true. */
   private step: GaitStep | null = null
   private stepWanted = false
-  /** Where the body stood before the tick just flown (passedAt). */
+  /** Position before the last tick, for fractional arrival timing. */
   private px = 0
   private pz = 0
   /** When the last stride ended. */
   private at = 0
-  /** The executor's collision probe, on the kernel; and the heading being steered. */
+  /** Collision probe and steering heading shared with the executor. */
   private readonly hit = (x: number, y: number, z: number): boolean => this.k.probeHit(x, y, z, -PROBE_INSET, PROBE_INSET)
   private readonly h: Heading = { dx: 0, dz: 0 }
   private readonly strafe: boolean
-  /** Per node: does getting to it take a jump (a parkour node, a rise over a step)? */
+  /** Whether each node requires a jump: parkour or a rise above step height. */
   private readonly lip: boolean[] = []
   private rootY = 0
-  /** Per node: the path's length to it from the root, through the nodes before it; and from it on to the path's first turn. */
+  /** Per-node path distance from the root and clear distance to the next turn. */
   private readonly cum: number[] = []
   private readonly clear: number[] = []
-  /** Per node: the blocks from passing it to passing the goal at the least, through the nodes between; is there a lip from it on; its PASS_REACH. */
+  /** Per-node minimum distance to the goal, remaining-jump flag and arrival reach. */
   private readonly rest: number[] = []
   private readonly lipAhead: boolean[] = []
   private readonly reach: number[] = []
-  /** The speed a runner settles to at the most, and a tick's push (togo). */
+  /** Maximum running equilibrium speed and one tick's push for the lower bound. */
   private vRun = 0
-  /** The pruning's top speed for this search (GAIT_VMAX_SLIP). */
+  /** Optimistic speed bound for this search. */
   private vMax = GAIT_VMAX
   private aRun = 0
-  /** The labels of this phase (dominated), the ones each call of dfs opened, and whether the hop from each came to anything. */
+  /** Phase labels, labels opened by each dfs call, and whether each hop remains viable. */
   private labels = 0
   private readonly opened: Int32Array[] = []
   private readonly hopped: Uint8Array[] = []
-  /** The measures of the state dominated was last asked about, for label. */
+  /** State measures from the last dominance check, for recording a label. */
   private stateS = 0
   private stateV = 0
   private stateClear = false
-  /** Did the stride that ended its schedule end it alive (at the goal), not lost? */
+  /** Whether the last stride reaches the goal successfully. */
   private live = false
-  /** Scouting (Search.scout): a hop ends at its touchdown, short of the goal — the node index there and the time. */
+  /** Scouting stops each hop at touchdown and records its node index and time. */
   private scouting = false
   private landI = -1
   private landT = 0
-  /** The goal, as far as the schedules are flown (GaitGoal.index, or sooner: GAIT_LIPS). */
+  /** Goal index after applying the jump and scouting horizons. */
   private index = 0
   private last = false
 
@@ -554,7 +381,6 @@ class Search {
       if (this.lip[j] && ++lips >= GAIT_LIPS) { this.index = j; break }
     }
     this.last = this.goal.last && this.index === this.goal.index
-    // the catch, inside the schedules' reach: the column, and how far down it the climbable runs
     this.catchAt = GAIT_CATCH && this.goal.catchAt !== undefined && this.goal.catchAt >= 0 && this.goal.catchAt <= this.index ? this.goal.catchAt : -1
     if (this.catchAt >= 0) {
       const n = this.path[this.catchAt]
@@ -567,12 +393,11 @@ class Search {
     }
     const i0 = this.pass(root, 0, 1, false)
     const none: GaitResult = { hop: Infinity, goal: this.index, goalLast: this.last, run: Infinity, spent: false, work: 0, flight: this.flight, strafe: this.strafe, ease: EASE_NEVER, step: null }
-    // the goal from here, this tick: nothing to schedule
     if (i0 > this.index) return none
     this.scout(root, i0)
     this.vRun = this.k.speedBase * RUN_PUSH * RUN_SETTLE
     this.aRun = this.k.speedBase * RUN_PUSH
-    // (the pruning's top speed: a slippery floor under the body or a node in reach, a body already fast - GAIT_VMAX_SLIP)
+    // Slippery ground within reach needs the higher pruning bound.
     this.vMax = GAIT_VMAX
     if (GAIT_VMAX_STATE) {
       let slip = this.k.slipUnder(root.x, root.y, root.z) > SLIP_FAST
@@ -590,7 +415,7 @@ class Search {
       }
       this.rest[j] = rest
     }
-    // (past the goal is past the search: first there is all it asks, unless the path ends there)
+    // Beyond an intermediate goal the search needs only arrival; a final goal requires stopping.
     this.clear[this.index] = this.last ? 0 : Infinity
     for (let j = this.index - 1; j >= 0; j--) {
       const a = j > 0 ? this.path[j - 1] : root
@@ -603,7 +428,7 @@ class Search {
       const al = Math.hypot(ax, az)
       const bl = Math.hypot(bx, bz)
       const turn = al > 0.35 && bl > 1e-6 && (ax * bx + az * bz) / (al * bl) < HOP_TURN_COS
-      // (nor short of a rise: there the faster body is the one that bonks - RISER_EASE)
+      // A faster body can hit a riser that a slower body clears.
       const rise = RISE_DOM && m.y > n.y + SIM.stepHeight
       this.clear[j] = turn || rise ? 0 : bl + this.clear[j + 1]
     }
@@ -619,45 +444,24 @@ class Search {
     }
     const hopSpent = this.spent
 
-    // Keeping its feet this tick: does any schedule do as well? Where a jump
-    // lies ahead a tie keeps them: the goal is reached the same either way,
-    // and the ground has the options. (A node passed is timed to the
-    // fraction of a tick, passedAt: in whole ticks a hop now ties with the
-    // same hop a tick later, the tick after that ties again, and the body
-    // runs where it should be flying — arena simple1, four ticks on the spot
-    // the hop was due.)
-    //
-    // Over open ground the feet have to EARN the tick (GAIT_RUN_GAIN). The
-    // goal there is a horizon, not a place: hopping at every touchdown is
-    // the fastest gait there is, and which of two schedules is first past a
-    // node eight blocks on turns on where its hops happen to fall about that
-    // node — half a tick either way, for nothing (arena simple3: two ticks
-    // run after every landing, a tick lost on each). A corner, a lip or the
-    // path's end costs whole ticks, and shows.
-    //
-    // With no jump now on offer the feet's first schedule is the answer to
-    // another question: does running on get there at all?
+    // With jumps ahead, ties favour the ground's remaining choices. Over open
+    // ground, require a gain so arbitrary horizon placement does not delay hops.
     const bound = hop === Infinity ? GAIT_BUDGET + 1 : jumps ? hop + 1e-6 : hop - GAIT_RUN_GAIN + 1e-6
     this.best = bound
-    // (the first schedule under the bound answers "can the feet do as well";
-    // with no jump on offer the question is the best way on, not any)
+    // A qualifying schedule settles the hop comparison; without a hop, seek the fastest run.
     this.firstWins = this.goal.best !== true && (hop !== Infinity || !GAIT_NEARAIM)
     this.heldAt[0] = false
     this.limit = this.work + GAIT_WORK_RUN
     this.spent = false
     this.labels = 0
     this.stepWanted = true
-    // (the feet's first tick steps `root` itself)
+    // stride mutates root, so retain the take-off state for the fallback jump.
     const held = rootCut && GAIT_ROOT_UNCUT ? copyBody(newBody(0, 0, 0), root) : null
     const i = this.stride(root, i0, 0, 0)
     if (i >= 0) this.dfs(root, i, this.at, 0, 1, -1)
     const run = this.best < bound ? this.best : Infinity
     const runSpent = this.spent
-    // The turn cut is on the search's work, not a model of the jump: where it
-    // has left the body no schedule at all, the jump it cut is flown after all
-    // (arena mcc-5-2: down on a skull against a wall, the velocity 7° one way
-    // and the next node 40° the other; 47° was 'none' and four ticks of the
-    // gates, where the hop from there is as quick as any).
+    // Angle cuts limit work, not physical feasibility; retry when both searches fail.
     if (held !== null && hop === Infinity && run === Infinity) {
       this.best = GAIT_BUDGET + 1
       this.firstWins = false
@@ -683,16 +487,7 @@ class Search {
     }
   }
 
-  /**
-   * The horizon, in hops. A schedule holds GAIT_HOPS hops and runs the rest
-   * of the way; under a low roof, where a hop is three ticks and a block and
-   * a half, that rest is most of the way, the same run behind every one of
-   * the schedules — and all of the search's work. So the goal is no further
-   * than the chain of hops goes: the body hopped at every touchdown from the
-   * root (run where it may not hop: into a turn), the node its last hop
-   * comes down short of, and SCOUT_TAIL blocks. A jump the path asks for on
-   * the way, a chain that is lost or reaches the goal: the goal stays.
-   */
+  /** Limit the horizon to the hop chain plus a tail; otherwise short hops leave redundant running work. */
   private scout (root: SimBody, i0: number): void {
     const b = copyBody(this.scratch(this.fly, 0), root)
     const best = this.best
@@ -723,14 +518,7 @@ class Search {
     }
   }
 
-  /**
-   * Does the jump from `from`, flown with `looks` to land as `h` did, come
-   * down the same from a hair either side (HOP_NUDGE)? Its looks replayed,
-   * as the executor replays them: on the ground at the level it came down
-   * on, carried as it was. Asked of the jump the executor is handed, and of
-   * every jump the path asks for: a schedule that keeps its feet for a
-   * take-off a tick on is no schedule if that take-off is one in a hundred.
-   */
+  /** Replay required flights from nudged starts; brittle future take-offs cannot justify a schedule. */
   private holds (from: SimBody, looks: number[], ease: number, y: number, carried: boolean, caught: boolean): boolean {
     const c = this.c
     const n = looks.length
@@ -738,7 +526,7 @@ class Search {
       const b = copyBody(this.nudged, from)
       b.x += nx
       b.z += nz
-      // (a start a wall is in the way of is not one the body can be at)
+        // A nudged start inside a wall is not a possible body position.
       if (this.k.collides(b)) continue
       let down = false
       for (let f = 0; f < n + 2 && !down; f++) {
@@ -755,9 +543,7 @@ class Search {
         if (b.inLiquid) return false
         down = f > 0 && (b.onGround || (caught && this.catches(b)))
       }
-      // (a catch holds where the nudged flight catches the same column, about
-      // as high, and climbs to the goal's level from there too: the chosen
-      // climbs ran within a hundredth of the column's edge)
+      // Nudged catches must still reach the goal without falling off the column.
       if (caught) {
         if (!down || b.onGround || b.y < y - CATCH_NUDGE_DY || !this.climbsUp(b)) return false
         continue
@@ -767,11 +553,7 @@ class Search {
     return true
   }
 
-  /**
-   * One tick with the feet down from time `t`, and the fall off what it
-   * walked off, to the ground: the node index there (the time in `at`), -1
-   * when the schedule ended on the way — lost, or past the goal and recorded.
-   */
+  /** Simulate a ground tick and any resulting fall; return the landing node or -1 when the schedule ends. */
   private stride (b: SimBody, i: number, t: number, depth: number): number {
     let fall = 0
     let drop = 0
@@ -799,11 +581,8 @@ class Search {
   }
 
   /**
-   * A schedule's end: the goal passed at `passed`, the body down at `t`.
-   * Past the goal is past the search, so it counts only where the body could
-   * be stopped there: carried, and still carried once it has braked (a post
-   * landed on at a hop's speed is slid off the far side). A landing that hurt
-   * is charged for the speed it lost. False when the schedule is lost there.
+   * A completed schedule must remain supported after braking; fast landings can
+   * slide off narrow supports. Damaging landings also pay for lost speed.
    */
   private end (b: SimBody, passed: number, t: number, stood: number, depth: number): boolean {
     const cost = stood > 0 ? Math.max(passed, t) + stood + HURT_REGAIN : passed
@@ -814,25 +593,13 @@ class Search {
     return true
   }
 
-  /**
-   * Do the jumps above depth `depth` that have to hold (holds) hold? Asked
-   * of a schedule at its end, as it is about to be the best: a nudge test is
-   * four flights, and paid at every landing explored it was most of the work
-   * of a search with three gaps to time — paid at the candidates, it is a
-   * few. A jump found not to hold voids its subtree (unheld): the hop that
-   * threw it is lost, and the states explored under it are no evidence.
-   */
-  /** Is airborne body `b` caught on the climbable in the catch node's column (GaitGoal.catchAt)? */
+  /** Whether airborne body `b` catches a climbable in the catch node's column. */
   private catches (b: SimBody): boolean {
     return !b.onGround && Math.floor(b.x) === this.catchX && Math.floor(b.z) === this.catchZ &&
       (this.k.kindAt(b.x, b.y, b.z) & SIM_CLIMBABLE) !== 0
   }
 
-  /**
-   * The wall the climbable the body is in hangs on (plugin.ts climbWall):
-   * the side of the cell its thin box is on, or a full block beside it (a
-   * vine). Into wallX/wallZ; false when there is none.
-   */
+  /** Set wallX/wallZ from the climbable's thin box or a neighbouring full block for vines. */
   private wallAt (b: SimBody): boolean {
     const k = this.k
     const w = k.world
@@ -860,7 +627,7 @@ class Search {
     return false
   }
 
-  /** The catch branch's heading on a climbable: into its wall, and against the along-wall drift off the column's centre. */
+  /** Climb heading presses into the wall and counters drift away from the column's centre. */
   private climbHeading (b: SimBody, goal: GaitNode): void {
     const c = this.c
     if (!this.wallAt(b)) { kAim(c, b, goal.x, goal.z); return }
@@ -875,7 +642,7 @@ class Search {
     c.hz = hz / l
   }
 
-  /** Does caught body `b` (consumed) climb to the goal's level without leaving the climbable (climb's strict rule, no clock)? */
+  /** Consume caught body `b` to check that it reaches goal height without leaving the climbable. */
   private climbsUp (b: SimBody): boolean {
     const goal = this.path[this.index]
     const c = this.c
@@ -893,14 +660,8 @@ class Search {
   }
 
   /**
-   * A flight caught on the climbable in the catch node's column at time `t`
-   * (body `h`, node index `i`): the climb on, as the executor's catch
-   * branch climbs (plugin.ts, `caughtOnClimbable`) - pressed into the wall
-   * and steered against the drift toward the column's centre, sneaking
-   * (which holds the height and does not stop the climb) - to the goal's
-   * level. That is the schedule's end: the time the goal's level is reached,
-   * to the fraction of a tick. Lost where the body leaves the climbable
-   * short of it (a body sliding off a one-wide column is a fall).
+   * Climb to goal height, timed to a fraction of a tick. Steering counters drift;
+   * sneaking arrests falls. Leaving the climbable below the goal loses the schedule.
    */
   private climb (h: SimBody, i: number, t: number, depth: number): boolean {
     const goal = this.path[this.index]
@@ -915,7 +676,7 @@ class Search {
         this.record(passed)
         return true
       }
-      // (the bound: no faster than the ladder climbs)
+      // Remaining climb time cannot beat the ladder's rise speed.
       if (t + (goal.y - CATCH_LEVEL - h.y) / LADDER_RISE >= this.best) return true
       if (!this.k.onClimbable(h)) return false
       c.forward = true
@@ -923,7 +684,7 @@ class Search {
       c.left = false
       c.jump = CLIMB_HOLD_ENABLED
       c.sprint = false
-      // (only while falling: it stops the first slide, and rising it only weakens the steering; plugin.ts climb hold)
+      // Sneaking arrests the initial fall but weakens steering while rising.
       c.sneak = !CLIMB_HOLD_ENABLED || h.vy < 0
       this.climbHeading(h, goal)
       y0 = h.y
@@ -933,12 +694,13 @@ class Search {
       c.sneak = false
       c.sprint = true
       if (h.inLiquid || t > GAIT_BUDGET) return false
-      // (stood on something short of the goal: a ledge under the climb, not the climb)
+      // A ledge below the goal is not a completed climb.
       if (h.onGround && h.y < goal.y - CATCH_LEVEL) return false
       i = this.pass(h, i, 1.45, false)
     }
   }
 
+  /** Verify candidate schedules lazily to avoid replaying every landing; failed flights invalidate their subtrees. */
   private verified (depth: number): boolean {
     for (let d = 0; d < depth; d++) {
       if (!this.heldAt[d]) continue
@@ -949,26 +711,8 @@ class Search {
   }
 
   /**
-   * Is ground state `b` (aiming at node `i`, at time `t`; `hops` taken,
-   * `wait` ticks since its landing) one not worth exploring, for a state
-   * explored before it — no later, and with as much left to it (no more hops
-   * taken, no longer waited)? Two ways:
-   *
-   * - it is that state: there, at that velocity. What `b` does from here,
-   *   that one did sooner.
-   * - both on a straight run of the path (DOM_CLEAR ahead, and moving down
-   *   it), that one is ahead by more than the speed `b` has on it could
-   *   close (DOM_LEAD). Short of a turn or the path's end the faster body is
-   *   not the better off — it is the one that overshoots — and a stride's
-   *   difference in where the turn is met is ticks: there, states are not
-   *   compared.
-   *
-   * ALIVE when that state's schedules got somewhere (the goal, or the bound:
-   * no better than the best). DEAD when they are still being flown — `b` is
-   * a state the body came round to again, no further for it (run against a
-   * wall, down a hole) — or all came to nothing and `b` is that very state.
-   * A state whose schedules were all lost dominates nothing else: where it
-   * was too far, or too fast, `b` may not be.
+   * Earlier states dominate equivalent states or safe straight-line leads, with enough choices left.
+   * Turns can favour slower bodies; failed states match only exactly, and unresolved matches break cycles.
    */
   private dominated (b: SimBody, i: number, t: number, hops: number, wait: number): number {
     const n = this.path[i]
@@ -996,7 +740,7 @@ class Search {
     return open ? DEAD : OPEN
   }
 
-  /** Take down ground state `b`, as dominated measured it: explored from time `t` on. */
+  /** Record ground state `b` and the measures from its dominance check at time `t`. */
   private label (b: SimBody, t: number, hops: number, wait: number): number {
     const a = this.labels
     if (a >= LABELS) return -1
@@ -1016,7 +760,7 @@ class Search {
     return a
   }
 
-  /** Does body `b`, down, come to a stand where it is — braked as the executor brakes (back held along its motion)? */
+  /** Check that body `b` stays supported while braking against its velocity. */
   private stops (b: SimBody): boolean {
     const k = this.k
     if (!k.carried(b)) return false
@@ -1043,12 +787,7 @@ class Search {
 
   private readonly halt = newBody(0, 0, 0)
 
-  /**
-   * A landing after `fall` (`drop` of it this tick): what it costs when it
-   * hurt, in ticks — the tick it stands (the server takes the speed of a
-   * body it hurts, and the executor decides nothing until it has: plugin.ts
-   * HURT_WAIT_TICKS) and what the health is worth (HURT_COST).
-   */
+  /** Damaging landings reset horizontal speed and cost packet-wait and health-penalty ticks. */
   private landed (b: SimBody, fall: number, drop: number): number {
     if (fall <= SAFE_FALL) return 0
     const kind = this.k.kindAt(b.x, b.y - 0.2, b.z)
@@ -1074,18 +813,13 @@ class Search {
     return this.path[Math.min(i, this.path.length - 1)]
   }
 
-  /** The lowest a body between node `i - 1` and node `i` belongs: under it, it has left the path. */
+  /** Lowest allowed height between adjacent nodes; below it, the body leaves the path. */
   private low (i: number): number {
     const a = i > 0 ? this.path[Math.min(i, this.path.length) - 1].y : this.rootY
     return Math.min(a, this.aim(i).y)
   }
 
-  /**
-   * Ground beyond parkour node `n` along the body's motion (plugin.ts
-   * holeBeyond, its probes and inset): the executor retires such a node from
-   * high over it, so a schedule holding it steers back at a node already
-   * gone (arena mcc-7-1: a flight turned round over a two-block walkway).
-   */
+  /** Ground beyond a parkour node permits airborne retirement without steering back at a passed node. */
   private holeBeyond (n: GaitNode, b: SimBody): boolean {
     let ux = b.vx
     let uz = b.vz
@@ -1107,14 +841,8 @@ class Search {
   }
 
   /**
-   * Nodes passed by body `b` from index `i` on, as the executor retires them
-   * (plugin.ts, the arrival loop): inside the arrival box (`dy` its height)
-   * or down on the leg to the next node, past it (onLegPast);
-   * a parkour node in it only from low over it (PARKOUR_LAND_DY: higher, a
-   * node with a hole beyond is held to the landing) or, `landing` (down this
-   * tick), within a block and past it. A landing short of a parkour node is a
-   * take-off for it still (arena tenways-headhitters: counted as landed, the
-   * next jump left from the lip into a head-hitter, 12 ticks a platform).
+   * Retire nodes using the executor's arrival and landing rules. Hold parkour
+   * nodes over holes until near landing; landing short still requires a take-off.
    */
   private pass (b: SimBody, i: number, dy: number, landing: boolean): number {
     while (i <= this.index) {
@@ -1124,18 +852,14 @@ class Search {
         if (!(boxed && (b.y - n.y <= PARKOUR_LAND_DY || (GAIT_GROUND_PASS && i < this.index && !this.holeBeyond(n, b)))) &&
             !(landing && this.cameDownPast(b, i))) break
       } else if (!boxed && !(b.onGround && i + 1 < this.path.length && Math.abs(n.y - b.y) < dy && onLegPast(b.x, b.z, n, this.path[i + 1]))) break
-      // (the path's end is arrived at: down, and in the node's own cell — a goal is a cell, and a box round a node off its centre is two)
+      // Final arrival requires the goal's cell; an off-centre node's arrival box can span two cells.
       if (this.last && i === this.index && (!b.onGround || Math.floor(b.x) !== Math.floor(n.x) || Math.floor(b.z) !== Math.floor(n.z))) break
       i++
     }
     return i
   }
 
-  /**
-   * The executor's landing retirement (plugin.ts allowLandingRetire): has
-   * body `b`, down this tick, come down within a block of parkour node `i`
-   * and past it along the flight from the node before?
-   */
+  /** Whether a touchdown is within a block of the parkour node and past it along the incoming flight. */
   private cameDownPast (b: SimBody, i: number): boolean {
     if (this.goal.landRetire === false || i >= this.path.length - 1) return false
     const node = this.path[i]
@@ -1149,12 +873,7 @@ class Search {
     return far <= LAND_PAST || kWalkable(this.k, b, node)
   }
 
-  /**
-   * When the goal node was passed, to the fraction of a tick: the tick
-   * before `t`, and how far into the move from there the body crossed into
-   * the node's box. Whole ticks tie too often to choose by — a hop now and
-   * the same hop a tick later pass a node eight blocks on in the same tick.
-   */
+  /** Fractional arrival time avoids whole-tick ties that repeatedly defer a jump. */
   private passedAt (b: SimBody, t: number): number {
     const n = this.path[this.index]
     const ax = Math.abs(n.x - this.px)
@@ -1167,13 +886,13 @@ class Search {
     return t - 1 + Math.min(1, f)
   }
 
-  /** May a jump be taken off here: a hop of the gait, or (`asked`) one the path asks for — not into a turn past its angle (GAIT_TURN_COS, HOP_TURN_COS)? */
+  /** Whether a gait hop or path-required jump meets the take-off alignment limit. */
   private mayHop (b: SimBody, i: number, asked: boolean): boolean {
     let n = this.aim(i)
     let dx = n.x - b.x
     let dz = n.z - b.z
     let head = Math.hypot(dx, dz)
-    // (a node the body is all but on: the turn is the one to the node after it)
+    // Nearby nodes give unstable headings; test the turn toward the next node instead.
     if (GAIT_NEARAIM && head < NEAR_AIM && i + 1 <= this.index) {
       n = this.aim(i + 1)
       dx = n.x - b.x
@@ -1184,11 +903,7 @@ class Search {
     return !(speed > 0.1 && head > 1e-6 && (b.vx * dx + b.vz * dz) / (speed * head) < (asked ? ASKED_TURN_COS : GAIT_TURN_COS))
   }
 
-  /**
-   * Ticks the rest of the way takes at the least, from node `i` on: the
-   * nodes are passed in turn, each from within its reach. `running`: the
-   * body has no hop left to take.
-   */
+  /** Minimum remaining ticks through the nodes' arrival reaches; running means no hops remain. */
   private togo (b: SimBody, i: number, running: boolean): number {
     let far = 0
     for (let m = i; m <= this.index; m++) {
@@ -1199,15 +914,9 @@ class Search {
     return far / (running ? Math.max(this.vRun, Math.hypot(b.vx, b.vz) + this.aRun) : this.vMax)
   }
 
-  /**
-   * One tick with the feet down (or falling off what they walked off): the
-   * node index after it, -1 when the schedule is lost. `air`: the body was
-   * off the ground before the tick (a touchdown in it is a landing).
-   */
+  /** Simulate one ground or falling tick; return the next node index, or -1 for a lost schedule. */
   private runTick (b: SimBody, i: number, air: boolean): number {
-    // steered as the executor walks a step (plugin.ts, wallSteer.ts): off a
-    // wall it runs along, no sprint against one, along one in its way; and
-    // falling, as the executor falls (fallAim)
+    // Match the executor's wall steering, sprint restrictions and falling aim.
     const n = air ? this.path[fallAim(this.path, Math.min(i, this.path.length - 1), b.x, b.z, b.vx, b.vz)] : this.aim(i)
     const c = this.c
     const h = this.h
@@ -1217,8 +926,6 @@ class Search {
     h.dz = nodeDz
     c.sprint = true
     c.forward = true
-    // (the rounding policy: round the first box in the way, if its corner
-    // lies within ROUND_CORRIDOR of the leg the body is on)
     let rounded = false
     if ((this.roundMode || this.roundSame) && !air && this.roundCorner(b, nodeDx, nodeDz, n.y, this.round)) {
       const px = b.x + this.round.dx
@@ -1242,8 +949,7 @@ class Search {
         }
       }
     }
-    // (one gathering of the boxes round the body for all the probes; none
-    // within a probe's reach at body level, and there is no wall to steer by)
+    // Gather boxes once for all probes; distant boxes cannot affect wall steering.
     this.k.probeBegin(b.x, b.y, b.z, WALL_REACH, 0.6)
     if (!rounded && !air && this.k.probeHit(b.x, b.y, b.z, WALL_REACH, PROBE_INSET)) {
       const walk = (n.parkour !== true || n.walked === true) && n.y - b.y <= STEP_UP_MIN
@@ -1254,7 +960,7 @@ class Search {
     const len = Math.hypot(h.dx, h.dz)
     if (len > 1e-9) { c.hx = h.dx / len; c.hz = h.dz / len }
     c.left = false
-    // (the strafe is a sprinting gait: against a wall the body walks, and looks where it goes)
+    // Against a wall, walking uses a forward heading rather than the sprinting strafe.
     if (this.strafe && c.sprint && !air) kStrafe(c)
     c.jump = false
     if (this.stepWanted) {
@@ -1270,16 +976,12 @@ class Search {
   }
 
   private readonly round = { dx: 0, dz: 0 }
-  /** The best box roundCorner found in the way: its grown x0, z0, x1, z1, and how far along the step it starts. */
+  /** Nearest obstructing box, expanded by body width, and its distance along the step. */
   private readonly inWay = new Float64Array(5)
-  /** The hazard cells round the window (SIM_HAZARD: a fire, a cobweb), as x, y, z; gathered once a search (hazardCells). */
+  /** Hazard cell coordinates, gathered once per search. */
   private hazards: number[] | null = null
 
-  /**
-   * The cells round the window a body must not touch (SIM_HAZARD): no box
-   * keeps it out of them, and the kernel stops a body that does. Gathered
-   * once, over the window's nodes and the root, ROUND_REACH and a block wide.
-   */
+  /** Gather hazards across the search window; they lack collision boxes but touching them stops simulation. */
   private hazardCells (b: SimBody): number[] {
     if (this.hazards !== null) return this.hazards
     let x0 = b.x
@@ -1294,7 +996,7 @@ class Search {
       y0 = Math.min(y0, n.y); y1 = Math.max(y1, n.y)
       z0 = Math.min(z0, n.z); z1 = Math.max(z1, n.z)
     }
-    // (no further than a schedule goes from the body: a shortcut's first node may lie far off)
+    // Shortcut nodes can lie far away; scan only as far as a schedule can reach.
     const r = HAZARD_SCAN
     x0 = Math.max(x0, b.x - r); x1 = Math.min(x1, b.x + r)
     z0 = Math.max(z0, b.z - r); z1 = Math.min(z1, b.z + r)
@@ -1312,12 +1014,7 @@ class Search {
     return out
   }
 
-  /**
-   * Is the box [x0, x1] x [z0, z1] (grown already) in the way of the straight
-   * step from body `b` along (ux, uz) within `reach`, and nearer than the best
-   * so far (inWay)? Then it is the best. A box the body is already against is
-   * not in the way: the walk rules have it.
-   */
+  /** Find a nearer obstruction along the step; existing wall contact is handled by walking rules. */
   private takeInWay (b: SimBody, ux: number, uz: number, reach: number, x0: number, z0: number, x1: number, z1: number): void {
     if (b.x > x0 + 1e-6 && b.x < x1 - 1e-6 && b.z > z0 + 1e-6 && b.z < z1 - 1e-6) return
     let t0 = 0
@@ -1345,18 +1042,8 @@ class Search {
   }
 
   /**
-   * The first box at body height (ROUND_BAND up to the head) in the way of
-   * the straight step (ndx, ndz) within ROUND_REACH, by a slab test against
-   * the box grown by the half-width: the heading at its grown corner that
-   * minimises the way to the node (the corner whose midpoint with the body is
-   * outside it), into `h`. False when nothing is in the way, or the corner is
-   * where the body already is. A box no higher than the node's feet (`ny`) is
-   * the step the path climbs, not a box in the way: rounding the riser it was
-   * to jump onto cost spiral3-c 13 ticks and climb2 a hop a step. A hazard's
-   * cell (a fire, a cobweb: SIM_HAZARD) is a box in the way at any height the
-   * body spans, its feet too: no box turns the body off it, and the kernel
-   * stops one that touches it (arena mcc-8-3: the stair foot's fire, which
-   * every plain schedule nicked - the gait had none, and the gates walked in).
+   * Aim around the nearest obstruction expanded by body width, excluding risers the path climbs.
+   * Hazards obstruct even at foot height: they stop simulation without a collision box.
    */
   private roundCorner (b: SimBody, ndx: number, ndz: number, ny: number, h: { dx: number, dz: number }): boolean {
     const k = this.k
@@ -1379,7 +1066,6 @@ class Search {
       if (!(buf[o + 4] > lo - 0.01 && buf[o + 1] < b.y + k.height)) continue
       this.takeInWay(b, ux, uz, reach, buf[o] - hw, buf[o + 2] - hw, buf[o + 3] + hw, buf[o + 5] + hw)
     }
-    // (a hazard's cell, at any height the body spans)
     const hz = this.hazardCells(b)
     for (let j = 0; j < hz.length; j += 3) {
       if (!(hz[j + 1] + 1 > b.y + 1e-3 && hz[j + 1] < b.y + k.height)) continue
@@ -1408,11 +1094,7 @@ class Search {
     return Math.hypot(h.dx, h.dz) >= 0.05
   }
 
-  /**
-   * From a grounded state: every schedule on from here (`hops` of the gait
-   * taken; `used`: the last node a jump the path asked for was taken at).
-   * Consumes nothing of `b`. False when all of them were lost (dominated).
-   */
+  /** Search all schedules from `b` without consuming it; false means none remains viable. */
   private dfs (b: SimBody, i: number, t: number, hops: number, depth: number, used: number): boolean {
     const w = copyBody(this.scratch(this.win, depth), b)
     while (this.opened.length <= depth) {
@@ -1424,7 +1106,6 @@ class Search {
     let n = 0
     let alive = false
     for (let d = 0; ; d++) {
-      // (the ticks waited since the landing: past GAIT_DELAY there is no hop of the gait left in this stretch of ground)
       const wait = Math.min(d, GAIT_DELAY + 1)
       const gait = wait <= GAIT_DELAY && hops < GAIT_HOPS
       if (this.done || t + this.togo(w, i, !gait && !this.lipAhead[i]) >= this.best) { alive = true; break }
@@ -1434,7 +1115,7 @@ class Search {
       opened[n] = this.label(w, t, hops, wait)
       hopped[n] = 0
       n++
-      // (the jump the path asks for here, on any tick and once; or a hop of the gait, counted and timed)
+      // Path-required jumps are allowed once per node; optional hops consume the gait budget.
       const asked = i > used && this.needsJump(w, i)
       if ((asked || gait) && depth < GAIT_DEPTH && t + 1 < this.best && this.mayHop(w, i, asked)) {
         if (this.jump(w, i, t, asked ? hops : hops + 1, depth, asked ? i : used, asked)) hopped[n - 1] = 1
@@ -1444,7 +1125,6 @@ class Search {
       if (i < 0) { alive = this.live; break }
       t = this.at
     }
-    // (a state's schedules: the jump from it, and all of the states after it)
     for (let j = n - 1; j >= 0; j--) {
       alive = alive || hopped[j] === 1
       if (opened[j] >= 0) labelState[opened[j]] = alive ? ALIVE : DEAD
@@ -1452,7 +1132,7 @@ class Search {
     return alive
   }
 
-  /** Does body `b` need a jump to get to node `i`: a parkour node, a rise above its step? */
+  /** Whether node `i` requires a parkour jump or a rise above step height. */
   private needsJump (b: SimBody, i: number): boolean {
     if (!this.lip[i]) return false
     const n = this.path[i]
@@ -1460,16 +1140,8 @@ class Search {
   }
 
   /**
-   * The jump from grounded body `w` (kept), as thrown — forward held to the
-   * touchdown — and, where that flies past the node it is for, eased:
-   * forward let go at the latest tick of the flight that brings it down
-   * short of the node's far side (found on bare flights, by bisection: the
-   * longer forward is held, the further the flight). For a jump the path
-   * asks for, and for the path's last node: thrown at full stretch the body
-   * comes down past the landing and walks back to it (arena mcc-6-2a, three
-   * ticks at the end of every run), or past a platform's far edge. A hop of
-   * the gait is not eased: one that comes down later does the same. False
-   * when all were lost.
+   * Try the full jump, then ease required jumps or final arrivals that overshoot.
+   * Bisection finds the latest release that lands short; optional hops can start later instead.
    */
   private jump (w: SimBody, i: number, t: number, hops: number, depth: number, used: number, asked: boolean): boolean {
     let before = this.best
@@ -1494,9 +1166,9 @@ class Search {
         if (depth === 0 && this.best < before) this.keep(ease)
       }
     }
-    // (the jump on from its landing scraped a riser: the flight eased, landing shorter and slower - RISER_EASE)
+    // Easing the preceding flight leaves room to clear the riser on the next jump.
     if (scraped && RISER_EASE && depth <= RISER_DEPTH) {
-      // (on a share of the work left: extras, never the search's own answer - opk2-1's run phase spent on them)
+      // Limit optional easing work so the main search retains its budget.
       const was = this.riserEasing
       const limit0 = this.limit
       const spent0 = this.spent
@@ -1512,8 +1184,7 @@ class Search {
           if (depth === 0 && this.best < before) this.keep(ease)
         }
       } finally {
-        // (cut short by its share: what it left half flown is no evidence -
-        // its states not dominating any later, and alive only for what it recorded)
+        // Incomplete exploration cannot justify dominance; retain only recorded successes.
         if (this.spent && !spent0) {
           for (let a = labels0; a < this.labels; a++) labelState[a] = VOID
           alive = alive0 || this.best < best0
@@ -1526,7 +1197,7 @@ class Search {
     return alive
   }
 
-  /** The root's jump just flown is the best so far: its looks and its ease are the result's. */
+  /** Store the best root jump's headings and forward-release tick. */
   private keep (ease: number): void {
     const looks = this.looks[0]
     this.flight.length = 0
@@ -1535,12 +1206,8 @@ class Search {
   }
 
   /**
-   * A jump from grounded body `h` (consumed; `from` is it, kept), flown with
-   * forward held up to tick `ease` of it, then every schedule on from its
-   * landing. `hops`: the gait's count with this one; `used`: the last node a
-   * jump the path asked for was taken at; `asked`: this is one. False when
-   * all were lost; `over` and `flew` say how it flew. `bare`: the flight
-   * alone, for those two.
+   * Consume `h` to simulate a jump with forward held until `ease`, then search its landings.
+   * `bare` simulates only the flight, recording its duration and whether it overshoots.
    */
   private hop (h: SimBody, from: SimBody, i: number, t: number, hops: number, depth: number, used: number, asked: boolean, ease: number, bare: boolean): boolean {
     const c = this.c
@@ -1549,7 +1216,7 @@ class Search {
     const looks = this.looks[depth]
     this.over[depth] = false
     this.flew[depth] = 0
-    // (short of a gap's far side is a fall; short of a rise is a tick against it)
+    // Undershooting a gap is a fall; undershooting a rise can leave a viable take-off.
     const held = (root || (asked && this.path[i].parkour === true)) && !this.scouting && !bare
     if (held) looks.length = 0
     this.heldAt[depth] = held
@@ -1579,7 +1246,7 @@ class Search {
       this.work++
       c.forward = true
       this.flew[depth] = f + 1
-      // (a jump the path asks for, scraping a riser as it rises - not a fall into a hole against its far wall: RISER_EASE)
+      // Only rising contact triggers riser easing; a fall against a gap's far wall does not.
       if (RISER_EASE && asked && !bare && depth > 0 && depth - 1 <= RISER_DEPTH && f < RISER_TICKS && h.collidedH && !h.onGround && h.vy > 0) this.scraped[depth - 1] = true
       t++
       const drop = Math.max(0, y0 - h.y)
@@ -1587,7 +1254,7 @@ class Search {
       if (h.inLiquid || t > GAIT_BUDGET) return false
       if (passed < 0 && t >= this.best) return true
       if (!h.onGround) left = true
-      // (the hop's own box is as tall as the hop: plugin.ts HOP_ARRIVE_DY)
+      // The airborne arrival box spans the jump's height.
       const low = this.low(i)
       const i1 = i
       i = this.pass(h, i, 1.45, left && h.onGround)
@@ -1596,9 +1263,8 @@ class Search {
         const o = this.path[lastP]
         if (Math.abs(o.x - h.x) > EASE_PAST || Math.abs(o.z - h.z) > EASE_PAST) { this.over[depth] = true; this.overAt[depth] = lastP }
       }
-      // (a jump that never left the ground: under a roof too low to rise under)
+      // A low roof can prevent take-off entirely.
       if (!left) { if (f > 0) return false; continue }
-      // (past the node it is for: the node not passed, and behind the body's motion)
       if (i <= this.index && !this.over[depth]) {
         const o = this.path[i]
         const ox = o.x - h.x
@@ -1606,7 +1272,7 @@ class Search {
         if (ox * h.vx + oz * h.vz < 0 && (Math.abs(ox) > 0.35 || Math.abs(oz) > 0.35)) { this.over[depth] = true; this.overAt[depth] = i }
       }
       if (i > this.index && passed < 0) passed = this.passedAt(h, t)
-      // (caught on the climbable the path jumps for: a landing, and the climb on to the goal)
+      // A climbable catch counts as a landing followed by a climb to the goal.
       const catching = this.catchAt >= 0 && i >= this.catchAt
       if (catching && this.catches(h)) {
         if (bare) return false
@@ -1622,7 +1288,7 @@ class Search {
       if (h.onGround) {
         this.holdCatch[depth] = false
         if (h.y < low - HOP_MAX_DIP) return false
-        // (slime throws a body back up: its landings are the oracle's, sneak and all)
+        // Slime bounces require the dedicated landing simulation, including sneak control.
         if ((this.k.kindAt(h.x, h.y - 0.2, h.z) & SIM_SLIME) !== 0) return false
         if (bare) return false
         this.holdY[depth] = h.y
@@ -1637,19 +1303,15 @@ class Search {
         for (let a = this.labelsAt[depth]; a < this.labels; a++) labelState[a] = VOID
         return false
       }
-      // (falling to the climbable's foot is falling to the catch)
+      // The climbable's foot remains a valid catch height.
       if (h.y < (catching ? Math.min(low, this.catchLow) : low) - 1) return false
     }
   }
 }
 
 /**
- * The node a body falling off what it walked off steers at (an index into
- * `path`): the next one, `i` — or, once that one is behind its motion, the
- * first after it on the same floor that is not. A node below a ledge is come
- * down past, not circled back to in the air: steering at it all the way, a
- * run off a ledge came down at a standstill on top of it, and a hop off the
- * ledge into a fall that hurts was the faster way down.
+ * Falling aim index: skip nodes behind the body's motion when the next is on
+ * the same floor. Steering back at a node below a ledge destroys forward speed.
  */
 export function fallAim (path: ReadonlyArray<GaitNode>, i: number, x: number, z: number, vx: number, vz: number): number {
   while (i + 1 < path.length) {
@@ -1663,13 +1325,8 @@ export function fallAim (path: ReadonlyArray<GaitNode>, i: number, x: number, z:
 }
 
 /**
- * Is a body at (x, z) on the leg from node `n` to node `m`, level with `n`
- * or past it: within the half-width of a node's box of the line, beyond the
- * node along it? The planner's own line, further along — a node there is
- * passed (plugin.ts, the arrival loop; Search.pass). The line of a jump too:
- * a body that came down past its take-off node, toward the gap, takes the
- * jump from there (arena spiral3-d: it walked back to the node's box and
- * turned round again, nine ticks).
+ * Whether (x, z) is past `n` along the leg to `m`, within the node corridor.
+ * This also permits take-off past a jump's origin without walking back to it.
  */
 export function onLegPast (x: number, z: number, n: { x: number, z: number }, m: { x: number, z: number }): boolean {
   const lx = m.x - n.x
@@ -1685,10 +1342,8 @@ const walker = newBody(0, 0, 0)
 const walkCtl: SimControl = { forward: true, back: false, left: false, right: false, jump: false, sprint: true, sneak: false, hx: 0, hz: -1 }
 
 /**
- * Is node `n` walked to from `from` — sprinting at it, feet down, the
- * arrival box reached on the ground at its level? A parkour node that is, is
- * a jump only in the plan (the planner prices a sprint jump over flat ground
- * below the steps it replaces), and the gait treats it as ground.
+ * Whether sprinting on foot reaches `n` on the ground at its level. The planner
+ * can label flat ground as parkour because sprint jumps cost less than walking steps.
  */
 export function kWalkable (k: PlayerSim, from: { x: number, y: number, z: number }, n: GaitNode): boolean {
   if (Math.abs(n.y - from.y) > 0.6) return false
@@ -1708,16 +1363,10 @@ export function kWalkable (k: PlayerSim, from: { x: number, y: number, z: number
   return false
 }
 
-/**
- * The gait from grounded body `b0` down `path` to `goal`: the ticks of the
- * best schedule that jumps now and of one that keeps its feet this tick
- * (GaitResult). A jump is worth taking when `hop` is finite and `run` is not;
- * a tick on the ground is the kernel's to take (`step`) when `run` is finite;
- * with neither, the kernel has no way there and the tick is someone else's.
- */
+/** Compare jump-first and ground-first schedules; a finite `run` supplies the next ground control. */
 function policySearch (k: PlayerSim, b0: SimBody, path: ReadonlyArray<GaitNode>, goal: GaitGoal, pick?: GaitPick): GaitResult {
   const s1 = new Search(k, path, goal)
-  // (climb2: no rounded corner met in the plain search - the rounding one would fly the same tree; GAIT_REUSE)
+  // Identical steering decisions let the rounding policy reuse the plain search.
   s1.roundSame = GAIT_REUSE && GAIT_ROUND && pick !== undefined && pick.reuse !== false
   const a = s1.run(b0)
   if (pick === undefined || !GAIT_ROUND) return a
@@ -1725,8 +1374,7 @@ function policySearch (k: PlayerSim, b0: SimBody, path: ReadonlyArray<GaitNode>,
     pick.round = pick.round && Math.min(a.hop, a.run) !== Infinity
     return a
   }
-  // (and the rounding policy: taken where it is ROUND_MARGIN sooner, kept
-  // once taken until the plain one is ROUND_MARGIN sooner — no flapping)
+  // Keep the selected policy until the alternative wins by ROUND_MARGIN to avoid oscillation.
   const s2 = new Search(k, path, goal)
   s2.roundMode = true
   const b = s2.run(b0)
@@ -1738,21 +1386,12 @@ function policySearch (k: PlayerSim, b0: SimBody, path: ReadonlyArray<GaitNode>,
   return { ...a, work: a.work + b.work }
 }
 /**
- * The strafe is an option, never a restriction: where the strafed search
- * finds a hop but no run (spent or not), the search without it is asked too
- * and taken when more than STRAFE_MARGIN ticks sooner. From arena
- * spiral3-c's riser leg the strafed search, run to exhaustion, found no run
- * better than r67.8 where the plain one found r48.9, and hopped away from
- * the node and back (+8 ticks on both cores; 2026-10-10 audit, driveSim
- * from the traced state: -11 on the segment). Asked on every tick it took
- * -17 there for half again the gait work.
+ * Compare jump-first and ground-first schedules with optional steering-policy state.
+ * If strafe finds only a hop, prefer a plain schedule when it wins by STRAFE_MARGIN ticks.
  */
 export function gaitSearch (k: PlayerSim, b0: SimBody, path: ReadonlyArray<GaitNode>, goal: GaitGoal, pick?: GaitPick): GaitResult {
   const r = policySearch(k, b0, path, goal, pick)
-  // (only between two kernel schedules: a strafed search with no schedule at
-  // all leaves the tick to the gates, as before - asked there, the plain hop
-  // it found put mcc-5-2 0.09 off its line, and two jumps on the momentum
-  // chain onto a bar arm was not signed and the brake ran off the arm)
+  // Compare viable kernel schedules only; without one, leave control to the executor's gates.
   if (!STRAFE_FALLBACK || goal.strafe !== true || r.run !== Infinity || r.hop === Infinity) return r
   const u = new Search(k, path, { ...goal, strafe: false }).run(b0)
   if (Math.min(u.hop, u.run) + STRAFE_MARGIN + 1e-6 < Math.min(r.hop, r.run)) return { ...u, flight: u.flight.slice(), work: r.work + u.work }

@@ -335,7 +335,7 @@ describe('executor: the 1.21.x hitbox-precision fix', () => {
     ;(createPathfinder({ useWorkerThreads: false, hitboxPrecisionFix: false }) as unknown as (b: unknown) => void)(off)
     expect(off.physics.playerHalfWidth).to.equal(0.3)
 
-    // An application that applies its own nudge (bulbastore does) must not be
+    // An application that applies its own nudge must not be
     // nudged a second time — the guard is on the exact stock values.
     const already = physicsHolder()
     already.physics.playerHalfWidth = 0.30001
@@ -589,8 +589,8 @@ describe('executor: the low-ceiling gait (allowLowCeilingHop)', () => {
 
   it('still refuses to take off from high ground into a low roof', () => {
     // Standing IN the pocket with the 2-high section one node away: the arc
-    // would be at 1.25 exactly as the low part arrives. This is the case the
-    // user called "slamming its head", and it is refused either way.
+    // would be at 1.25 exactly as the low part arrives: it strikes the side
+    // of the lower ceiling, and it is refused either way.
     const { sim, path } = tunnel(pocket, new Vec3(0.5, 1, 2.5))
     expect(sim.sprintHopBetter(path, true)).to.equal(false)
     expect(sim.sprintHopBetter(path, false)).to.equal(false)
