@@ -25,7 +25,9 @@ const tmp = mkdtempSync(join(tmpdir(), 'pf-pack-'))
 let failed = false
 try {
   step('packing')
-  const parsed = JSON.parse(npm(['pack', '--ignore-scripts', '--json', '--pack-destination', tmp], root))
+  // npm 10 runs prepack despite --ignore-scripts, and a script's output can come before the JSON.
+  const out = npm(['pack', '--ignore-scripts', '--json', '--pack-destination', tmp], root)
+  const parsed = JSON.parse(out.slice(out.search(/^\[/m)))
   const info = parsed[0]
   const paths = info.files.map(f => f.path.replace(/\\/g, '/'))
 

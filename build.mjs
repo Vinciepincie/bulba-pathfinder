@@ -51,4 +51,5 @@ cpSync(join(root, 'src/runtime/moduleDir.d.ts'), join(root, 'dist/types/runtime/
 // their own copy under dist/cjs: dist/types sits under the root's "type": "module".
 cpSync(join(root, 'dist/types'), join(root, 'dist/cjs'), { recursive: true })
 
-console.log('[build] dist/esm + dist/cjs + dist/types written')
+// stderr: npm 10 runs prepack even for `npm pack --ignore-scripts --json`, and stdout must stay JSON.
+console.error('[build] dist/esm + dist/cjs + dist/types written')
