@@ -256,6 +256,9 @@ Actions have their own errors, listed under [Actions](#actions).
 Emitted on the bot. `goal_reached`, `goal_updated`, `path_update`, `path_reset` and `path_stop` match
 mineflayer-pathfinder.
 
+Events only report what happened. To check, refuse or change an action, wrap it with
+[`actions.wrap`](#actionswrapname-wrapper).
+
 | Event | Arguments |
 |---|---|
 | `goal_reached` | `goal`. Emitted after the goal is cleared, so a listener can set the next one. A goal set with `setGoal(goal, true)` never emits it. |
