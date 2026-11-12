@@ -1,10 +1,10 @@
 MIT License
 
-Copyright (c) 2026 bulbastore contributors
+Copyright (c) 2026 bulba-pathfinder contributors
 
 Portions of this software are derived from mineflayer-pathfinder
 (https://github.com/PrismarineJS/mineflayer-pathfinder),
-Copyright (c) 2020 Ian Petersen & PrismarineJS contributors, MIT License.
+Copyright (c) 2020 Karang, MIT License.
 The movement cost model, goal classes, path-following tick-loop semantics
 and related data files are intentional ports to guarantee behavioral parity.
 

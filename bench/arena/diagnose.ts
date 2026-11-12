@@ -10,8 +10,8 @@
 // Triggers (see `judge`): our engine did not arrive, our engine stalled, or
 // upstream arrived when we did not / arrived meaningfully sooner.
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
-import { DEBUG_DIR, HISTORY_FILE } from './config.js'
+import { join, relative } from 'node:path'
+import { ARENA_DIR, DEBUG_DIR, HISTORY_FILE } from './config.js'
 import type { RouteReport } from './report.js'
 import type { Impl, RunResult, WorldProbe } from './runner.js'
 import type { Route } from './routes.js'
@@ -461,7 +461,7 @@ export function renderNotes (d: Diagnosis, meta: { resultsFile: string, timeoutM
   out.push('')
   out.push('- `bundle.json` — the full RouteReport for this run: per-tick trace, every `path_update`, reset reasons, stalls, and the terrain probe.')
   out.push(`- \`${meta.resultsFile}\` — the results file the whole race batch wrote.`)
-  out.push('- `../../history.json` — what this route has done on previous runs.')
+  out.push(`- \`${relative(join(DEBUG_DIR, 'bundle'), HISTORY_FILE).replace(/\\/g, '/')}\` — what this route has done on previous runs.`)
   out.push('')
   return out.join('\n')
 }
@@ -535,6 +535,7 @@ export function historyEntry (d: Diagnosis, bundleDir?: string): HistoryEntry {
     })),
     planIdentical: d.planIdentical,
     stuckAt: stall === undefined ? undefined : block(stall.pos),
-    bundle: bundleDir
+    // Tracked in git, so relative to the arena: machine paths do not belong in it.
+    bundle: bundleDir === undefined ? undefined : relative(ARENA_DIR, bundleDir).replace(/\\/g, '/')
   }
 }

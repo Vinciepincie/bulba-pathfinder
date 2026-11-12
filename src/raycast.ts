@@ -1,8 +1,5 @@
-// Voxel raycast over a snapshot, using the real per-state collision shapes
-// from the LUT — the same AABBs prismarine-world's RaycastIterator tests, so
-// GoalLookAtBlock's "clean face ray" guarantee holds identically when the
-// solve runs inside the worker. Face encoding matches prismarine-world:
-// 0:-y 1:+y 2:-z 3:+z 4:-x 5:+x.
+// Use collision shapes so worker goals retain face-level line of sight.
+// Faces match prismarine-world: 0:-y 1:+y 2:-z 3:+z 4:-x 5:+x.
 import { Vec3 } from 'vec3'
 import type { BlockLut } from './lut.js'
 import type { SnapshotMeta } from './types.js'
@@ -103,7 +100,6 @@ export class SnapshotRaycastWorld implements RaycastWorld {
         }
       }
 
-      // Advance to the next cell.
       if (tMaxX < tMaxY) {
         if (tMaxX < tMaxZ) {
           t = tMaxX

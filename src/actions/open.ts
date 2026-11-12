@@ -1,26 +1,5 @@
-// The default open — for ANY block that opens a window.
-//
-// This is deliberately not a container API. `bot.openContainer` asserts the
-// window type against a chest/shulker/barrel allowlist and throws on anything
-// else, which makes it useless for a crafting table, an enchanting table, an
-// anvil, a furnace, a villager trade or a beacon. What a caller almost always
-// wants is "click this and give me whatever window opens", so that is what
-// this returns: mineflayer's `Window`, already extended with
-// `close`/`deposit`/`withdraw`, whatever kind it turned out to be.
-//
-// Two failure modes are handled that `bot.openBlock` does not handle at all:
-//
-//   - **It waits forever.** `openBlock` is `activateBlock` followed by a bare
-//     `once(bot, 'windowOpen')` with no timeout. When the server silently
-//     drops the click — out of its range, sneaking, an interaction cooldown,
-//     an anticheat cancel — the promise never settles and the caller hangs.
-//   - **The dropped listener steals the next window.** That same `once` stays
-//     registered forever, so the window opened by an unrelated action minutes
-//     later resolves the abandoned promise. We remove it on timeout.
-//
-// A silent drop is also diagnosable rather than mysterious: watching for a
-// block update on the target tells us whether the server processed the click
-// and refused it, or never saw it at all.
+// Bound window-open waits and remove abandoned listeners so later windows cannot satisfy them.
+// Accept any window type and use target updates to distinguish processed clicks from silent drops.
 import { Vec3 } from 'vec3'
 import { ActionError, ActionErrors } from './types.js'
 import type { BlockLike, OpenOptions, WindowLike } from './types.js'
@@ -45,8 +24,7 @@ const RUNGS: Rung[] = [
     name: 'jump (position resync)',
     resync: true,
     prepare: async (ctx) => {
-      // A hop makes the client send a fresh position the server must accept,
-      // which clears a stale desync the click would otherwise be judged from.
+      // A hop sends fresh position data before retrying an interaction from stale state.
       ctx.bot.setControlState('jump', true)
       await waitTicks(ctx.bot, 1)
       ctx.bot.setControlState('jump', false)
@@ -63,7 +41,7 @@ const RUNGS: Rung[] = [
 ]
 
 export function createOpen (ctx: ActionContext) {
-  /** The most recent window THIS bot opened, for the reuse check. */
+  /** Most recent window opened by this bot, for target-specific reuse. */
   let lastOpened: { window: WindowLike, pos: Vec3 } | null = null
 
   return async function open (block: BlockLike, options: OpenOptions = {}): Promise<WindowLike> {
@@ -74,9 +52,9 @@ export function createOpen (ctx: ActionContext) {
     const windowTimeout = options.windowTimeout ?? cfg.windowTimeout
     const deadline = deadlineFrom(options.timeout ?? cfg.timeout)
     const maxRungs = Math.min(RUNGS.length, Math.max(1, options.retries ?? RUNGS.length))
+    throwIfAborted(options.signal, pos)
 
-    // An already-open window for this very block: hand it back rather than
-    // closing and reopening, which costs two round trips and can race.
+    // Reopening the same window costs round trips and can race.
     if (options.reuse !== false && bot.currentWindow && lastOpened?.window === bot.currentWindow &&
         lastOpened.pos.equals(pos) && inReach(bot, pos, reach)) {
       return bot.currentWindow as WindowLike
@@ -98,6 +76,8 @@ export function createOpen (ctx: ActionContext) {
       const rung = RUNGS[i]
       throwIfAborted(options.signal, pos)
       if (Date.now() > deadline) break
+      // approach: false means the bot stays where it is.
+      if (rung.name === 'walk closer' && options.approach === false) break
 
       if (rung.prepare) await rung.prepare(ctx, pos, reach, options.signal)
 
@@ -129,6 +109,7 @@ export function createOpen (ctx: ActionContext) {
         bot.emit('pathfinder:open_finish', pos, window)
         return window
       } catch (err) {
+        if (err instanceof ActionError && err.name === ActionErrors.ABORTED) throw err
         lastError = err as Error
         bot.emit('pathfinder:open_retry', pos, rung.name, lastError.message)
       }
@@ -165,15 +146,12 @@ async function attemptOpen (
   }
 
   bot.emit('pathfinder:open_start', pos)
+  throwIfAborted(signal, pos)
   return await clickAndWait(ctx, block, pos, aim ? aim.face : new Vec3(0, 1, 0), windowTimeout, signal)
 }
 
-/**
- * Click and wait for the window, bounded. Prefers `bot.openBlock` so the
- * window arrives with mineflayer's own `close`/`deposit`/`withdraw` helpers
- * attached; on timeout the listener `openBlock` registered is removed, so the
- * abandoned promise cannot claim a window opened later by something else.
- */
+/** Open any window with mineflayer's helpers; remove its listener on timeout.
+ * Otherwise a later unrelated window could resolve the abandoned request. */
 async function clickAndWait (
   ctx: ActionContext,
   block: BlockLike,
@@ -201,8 +179,7 @@ async function clickAndWait (
     const opening: Promise<WindowLike> = typeof bot.openBlock === 'function'
       ? (bot.openBlock(block, face, cursor) as Promise<WindowLike>)
       : activateAndWait(ctx, block, face, cursor)
-    // A rejection after we have already timed out must not become an
-    // unhandled rejection.
+    // The timed-out operation may still reject later; consume that rejection.
     opening.catch(() => {})
 
     return await raceWindow(opening, timeoutMs, signal, () => {
@@ -217,14 +194,14 @@ async function clickAndWait (
     })
   } finally {
     bot.removeListener('blockUpdate', onBlockUpdate)
-    // Drop whatever `openBlock`'s internal `once` left behind.
+    // Remove the listener left by openBlock's pending window wait.
     for (const l of listenersOf(bot, 'windowOpen')) {
       if (!listenersBefore.has(l)) bot.removeListener('windowOpen', l)
     }
   }
 }
 
-/** Fallback for a bot without `openBlock` (a fake one in tests). */
+/** Fallback when the bot has no openBlock helper. */
 async function activateAndWait (
   ctx: ActionContext,
   block: BlockLike,

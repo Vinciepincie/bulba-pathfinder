@@ -1,7 +1,6 @@
 // A driveable fake mineflayer bot for executor-level tests: EventEmitter,
 // control states, crude-but-honest voxel physics (walk toward yaw, gravity,
-// 1-block step-up while jumping), and a physicsTick pump. Generalizes the
-// repo's FarmPillar fake-physics harness (plan §5.3).
+// 1-block step-up while jumping), and a physicsTick pump.
 import { EventEmitter } from 'node:events'
 import { Vec3 } from 'vec3'
 import type { PhysicsLike, XYZ } from '../../src/types.js'

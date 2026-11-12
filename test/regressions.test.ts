@@ -285,11 +285,10 @@ describe('onNoPath capture hook', function () {
   })
 })
 
-// Thin-floor (carpet) landings and the flight-curve corridor — the prod
-// storage-room "No path" (2026-08-20): a fully carpeted pedestal grid made
-// every diagonal/drop/extended-parkour landing float one cell up in the air,
-// and drop-jumps demanded full landing-depth clearance over same-level
-// corners near takeoff.
+// Thin-floor (carpet) landings and the flight-curve corridor: on a fully
+// carpeted pedestal grid every diagonal, drop and extended-parkour landing
+// used to float one cell up in the air, and drop-jumps demanded full
+// landing-depth clearance over same-level corners near take-off.
 describe('thin floors + flight-curve corridor', function () {
   this.timeout(20000)
   const CARPET = mcData.blocksByName.gray_carpet.minStateId as number
@@ -308,7 +307,7 @@ describe('thin floors + flight-curve corridor', function () {
   }
 
   /** Carpeted pedestal grid: 3x3 pedestals (walk 1) with 1-wide channels
-   * (walk 0), carpet on EVERY walk cell — the prod storage-room floor. */
+   * (walk 0), carpet on EVERY walk cell. */
   function carpetedPedestalRoom (): VoxelWorld {
     const world = new VoxelWorld({ x0: -8, y0: -6, z0: -8, x1: 24, y1: 12, z1: 24 })
     world.fill(-8, -1, -8, 24, -1, 24, STONE)
@@ -362,17 +361,17 @@ describe('thin floors + flight-curve corridor', function () {
     expect(last.y, 'landing node must be the carpet cell').to.equal(-4)
   })
 
-  it('storage-room pillar course: standing diagonal 1x1 hops climb to the player (prod dump 2026-08-20)', () => {
-    // Exact geometry from the PF_DUMP_NOPATH capture, rebased to origin:
+  it('standing diagonal hops climb successive one-block pillars', () => {
+    // Geometry from a captured failed solve, rebased to origin:
     // floor top at walk 0; 1-tall pillar A, 2-tall pillar D, 3-tall goal
     // pillar; goal = GoalNear(player on the tall pillar, r=2). The climb is
     // A → D (offset (-1,-3), +1) → top (offset (-1,-3), +1): standing
     // corner-takeoff diagonal hops (per-axis credit model).
     const world = new VoxelWorld({ x0: -10, y0: -6, z0: -10, x1: 12, y1: 12, z1: 12 })
     world.fill(-10, -1, -10, 12, -1, 12, STONE) // floor, walk 0
-    world.fill(2, 0, 6, 2, 0, 6, STONE) // A: 1-tall, walk 1  (161701,87667)
-    world.fill(1, 0, 3, 1, 1, 3, STONE) // D: 2-tall, walk 2  (161700,87664)
-    world.fill(0, 0, 0, 0, 2, 0, STONE) // goal pillar: 3-tall, walk 3 (161699,87661)
+    world.fill(2, 0, 6, 2, 0, 6, STONE) // A: 1-tall, walk 1
+    world.fill(1, 0, 3, 1, 1, 3, STONE) // D: 2-tall, walk 2
+    world.fill(0, 0, 0, 0, 2, 0, STONE) // goal pillar: 3-tall, walk 3
     const res = rawSolve(world, { x: 4, y: 0, z: 3 }, new GoalNear(0, 3, 0, 2))
     expect(res.status).to.equal('success')
     const tail = res.path.slice(-2)
@@ -380,8 +379,8 @@ describe('thin floors + flight-curve corridor', function () {
     expect(res.path.some(n => n.parkour === true)).to.equal(true)
   })
 
-  it('extended course: head-hitter drop from the pillar top to a ledge under the overhang (prod dump 2026-08-20 #2)', () => {
-    // Vince extended the pillar course: from the 3-tall pillar top the next
+  it('head-hitter drop reaches a ledge under an overhang', () => {
+    // An extended pillar course: from the 3-tall pillar top the next
     // leg is a (2,2) drop-1 onto a ledge that sits UNDER the raised
     // platform's overhang — solid blocks 2 above the takeoff. A player
     // jumps, bonks at +0.2, and lands; the planner must classify the lid as
@@ -398,8 +397,8 @@ describe('thin floors + flight-curve corridor', function () {
     expect(last.parkour, 'must arrive by the bonked drop-jump').to.equal(true)
   })
 
-  it('corner jump past a pillar beside the landing (prod dump 2026-08-20 #3)', () => {
-    // Rebased from the capture: takeoff on a 1-tall block, landing on a
+  it('corner jump clears a pillar beside the landing', () => {
+    // Rebased from a captured failed solve: takeoff on a 1-tall block, landing on a
     // block +1 up at offset (1,3), with a 3-tall pillar filling the cell
     // directly beside the landing. The flight only NICKS that pillar's
     // corner (<7cm) — vanilla slides past — but the old full-hitbox sweep

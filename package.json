@@ -1,65 +1,106 @@
 {
   "name": "@bulba/pathfinder",
   "version": "0.1.0",
-  "description": "Drop-in replacement for mineflayer-pathfinder: same API, same walking outcome, snapshot-based zero-allocation A* that runs off the event loop in a worker thread. Opt-in digging, an overridable dig/place/open interaction layer with vanilla-range guards and retries, and cooperative interrupts so other plugins stop acting mid-jump.",
+  "description": "Pathfinder for mineflayer bots: A* on a worker thread, physics-verified parkour, and interruptible movement. API-compatible with mineflayer-pathfinder.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Vinciepincie/bulba-pathfinder.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Vinciepincie/bulba-pathfinder/issues"
+  },
+  "homepage": "https://github.com/Vinciepincie/bulba-pathfinder#readme",
   "type": "module",
   "main": "./dist/cjs/index.js",
   "module": "./dist/esm/index.js",
   "types": "./dist/types/index.d.ts",
   "exports": {
     ".": {
-      "types": "./dist/types/index.d.ts",
-      "import": "./dist/esm/index.js",
-      "require": "./dist/cjs/index.js"
+      "import": {
+        "types": "./dist/types/index.d.ts",
+        "default": "./dist/esm/index.js"
+      },
+      "require": {
+        "types": "./dist/cjs/index.d.ts",
+        "default": "./dist/cjs/index.js"
+      }
+    },
+    "./internals": {
+      "import": {
+        "types": "./dist/types/internals.d.ts",
+        "default": "./dist/esm/internals.js"
+      },
+      "require": {
+        "types": "./dist/cjs/internals.d.ts",
+        "default": "./dist/cjs/internals.js"
+      }
     },
     "./package.json": "./package.json"
+  },
+  "typesVersions": {
+    "*": {
+      "internals": [
+        "dist/types/internals.d.ts"
+      ]
+    }
+  },
+  "bin": {
+    "bulba-pathfinder-patch-physics": "./scripts/patchPhysics.mjs"
   },
   "files": [
     "dist",
     "src",
-    "bench",
-    "build.mjs",
-    "build-wasm.mjs",
-    "rust/Cargo.toml",
-    "rust/src",
+    "scripts/patchPhysics.mjs",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "CHANGELOG.md"
   ],
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=22.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "scripts": {
     "build": "node build.mjs",
     "prepare": "node build.mjs",
     "prepack": "node build.mjs",
+    "prepublishOnly": "node build.mjs && npm test && npm run test:pack",
+    "pretest": "node scripts/patchPhysics.mjs",
     "test": "mocha",
+    "pretest:fuzz": "node scripts/patchPhysics.mjs",
     "test:fuzz": "cross-env PF_FUZZ_CASES=500 mocha test/fuzz.test.ts",
+    "test:pack": "node scripts/packSmoke.mjs",
     "bench": "tsx bench/bench.ts",
+    "build:wasm": "node build-wasm.mjs",
     "arena:world": "tsx bench/arena/trimWorld.ts",
     "arena:server": "tsx bench/arena/setupServer.ts",
+    "prearena:race": "node scripts/patchPhysics.mjs",
     "arena:race": "tsx bench/arena/race.ts",
     "arena:probe": "tsx bench/arena/probe.ts",
     "arena:edit": "tsx bench/arena/race.ts --edit",
-    "build:wasm": "node build-wasm.mjs",
     "arena:controls": "tsx bench/arena/controlProbe.ts"
   },
   "keywords": [
     "mineflayer",
+    "mineflayer-plugin",
     "pathfinder",
+    "pathfinding",
     "minecraft",
+    "bot",
     "astar",
-    "navigation",
-    "bot"
+    "parkour",
+    "navigation"
   ],
   "dependencies": {
     "prismarine-block": "^1.17.0",
     "prismarine-nbt": "^2.5.0",
-    "prismarine-physics": "^1.8.0",
+    "prismarine-physics": "^1.11.0",
     "vec3": "^0.1.10"
   },
   "peerDependencies": {
-    "mineflayer": "^4.0.0"
+    "mineflayer": "^4.37.0"
   },
   "devDependencies": {
     "@types/mocha": "^10.0.10",

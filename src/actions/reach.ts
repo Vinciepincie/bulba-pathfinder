@@ -1,13 +1,4 @@
-// Reach, aim and face selection — the geometry every world interaction needs
-// before it is allowed to send a packet.
-//
-// The rule this file enforces is "vanilla range": the server measures block
-// interaction from the EYE to the closest point of the target block's cell,
-// not centre-to-centre. A bot that measures centre-to-centre thinks it can
-// reach a block ~0.87 further away than the server does on a diagonal, sends
-// the click, and gets silence — no window, no break, no error, just a dropped
-// packet. Measuring the same way the server does turns that whole failure
-// class into an explicit `OutOfReach` the caller can act on.
+// Match server reach using eye-to-cell distance; inconsistent reach checks cause silent interaction drops.
 import { Vec3 } from 'vec3'
 import { ActionError, ActionErrors } from './types.js'
 import type { BlockLike, BlockTarget } from './types.js'
@@ -15,12 +6,7 @@ import type { BlockLike, BlockTarget } from './types.js'
 /** Eye height of a standing player. */
 export const EYE_HEIGHT = 1.62
 
-/**
- * How far the cursor may be from the block centre on the face plane. Vanilla
- * block models rarely fill the cell — a chest lid stops at 0.9375 — so aiming
- * at the exact geometric face centre can raycast past a slim block entirely.
- * 7/16 keeps the aim point inside every common model.
- */
+/** Distance from block centre toward a face; 7/16 stays inside common partial block models. */
 export const FACE_INSET = 7 / 16
 
 /** Beyond this the geometric face fallback is not credible; see `pickFace`. */
@@ -36,6 +22,8 @@ export interface BotLike {
   waitForTicks?: (ticks: number) => Promise<void>
   setControlState: (name: string, value: boolean) => void
   emit: (event: string, ...args: unknown[]) => boolean
+  once?: (event: string, listener: (...args: unknown[]) => void) => unknown
+  removeListener?: (event: string, listener: (...args: unknown[]) => void) => unknown
 }
 
 /** The six block faces, in protocol order (`block_place` direction ids). */
@@ -63,10 +51,7 @@ export function eyePos (bot: BotLike): Vec3 {
   return bot.entity.position.offset(0, typeof h === 'number' && h > 0 ? h * 0.9 : EYE_HEIGHT, 0)
 }
 
-/**
- * Distance from `eye` to the CLOSEST point of the block cell at `pos` — the
- * same measurement the server makes. Not centre-to-centre.
- */
+/** Distance from `eye` to the closest point of the block cell at `pos`, as used for server reach. */
 export function reachToCell (eye: Vec3, pos: Vec3): number {
   const cx = Math.min(Math.max(eye.x, pos.x), pos.x + 1)
   const cy = Math.min(Math.max(eye.y, pos.y), pos.y + 1)
@@ -94,8 +79,10 @@ export function resolveBlock (bot: BotLike, target: BlockTarget): BlockLike {
 
 /** Normalise whatever the caller passed into a floored block position. */
 export function toVec3 (target: BlockTarget): Vec3 {
-  const anyTarget = target as { position?: Vec3, x?: number, y?: number, z?: number }
-  if (anyTarget.position instanceof Vec3) return anyTarget.position.floored()
+  const anyTarget = target as { position?: { x: number, y: number, z: number }, x?: number, y?: number, z?: number }
+  // By shape, not instanceof: a block from a second copy of vec3 is still a block.
+  const p = anyTarget.position
+  if (p != null && typeof p.x === 'number') return new Vec3(Math.floor(p.x), Math.floor(p.y), Math.floor(p.z))
   return new Vec3(
     Math.floor(anyTarget.x as number),
     Math.floor(anyTarget.y as number),
@@ -112,10 +99,7 @@ export function cellCentre (pos: Vec3): Vec3 {
   return new Vec3(pos.x + 0.5, pos.y + 0.5, pos.z + 0.5)
 }
 
-/**
- * A point on `face` of the cell at `pos`, inset from the edges so the ray
- * lands on the block model rather than sliding past a slim one.
- */
+/** Aim point toward a cell face, kept inside partial block models. */
 export function facePoint (pos: Vec3, face: Vec3): Vec3 {
   return new Vec3(
     pos.x + 0.5 + face.x * FACE_INSET,
@@ -140,14 +124,8 @@ export interface Aim {
   id: number
 }
 
-/**
- * Choose the face to click. Prefers whatever the bot's own raycast reports —
- * that is the face the SERVER will compute too, and a mismatch between the
- * face in the packet and the face the server derives from the rotation is one
- * of the things anticheats look at. Falls back to the nearest geometric face
- * only when explicitly allowed and the bot is nearly touching the block, where
- * every face is plausibly clickable.
- */
+/** Prefer the raycast face so the packet agrees with the server's rotation-based face check.
+ * Geometric fallback requires explicit opt-in and nearly touching the block. */
 export function pickFace (
   bot: BotLike,
   pos: Vec3,
@@ -168,8 +146,7 @@ export function pickFace (
     if (requireCursor && !options.allowGeometric) return null
   }
 
-  // No cursor information (a fake bot in tests, or a version without the
-  // helper), or the caller opted into the escape hatch.
+  // Use geometry only without cursor data or when fallback is explicitly allowed.
   const centre = cellCentre(pos)
   const pointBlank = eye.distanceTo(centre) <= POINT_BLANK
   if (typeof bot.blockAtCursor === 'function' && !pointBlank) return null
@@ -192,12 +169,8 @@ export function pickFace (
   return best
 }
 
-/**
- * Look at `point` and wait until the bot's own raycast agrees it is aimed at
- * `pos` (and, when given, at `wantFace`). Rotation reaches the server as a
- * position packet, so clicking on the same tick as the look is how a click
- * arrives with the previous rotation attached.
- */
+/** Aim and wait for the cursor to match `pos` and optional `wantFace`.
+ * Rotation needs time to reach the server before the click. */
 export async function settleAim (
   bot: BotLike,
   pos: Vec3,
@@ -208,7 +181,7 @@ export async function settleAim (
   const maxTicks = options.maxTicks ?? 8
   const reach = options.reach ?? 4.5
 
-  await bot.lookAt(point, true)
+  await untilStopped(bot, () => bot.lookAt(point, true))
   for (let tick = 0; tick < maxTicks; tick++) {
     await waitTicks(bot, 1)
     if (tick + 1 < minTicks) continue
@@ -221,20 +194,48 @@ export async function settleAim (
   return typeof bot.blockAtCursor !== 'function'
 }
 
-/** Wait N server ticks, falling back to wall-clock when the bot has no helper. */
-export async function waitTicks (bot: BotLike, ticks: number): Promise<void> {
-  if (typeof bot.waitForTicks === 'function') {
-    await bot.waitForTicks(ticks)
-    return
-  }
-  await new Promise<void>(resolve => setTimeout(resolve, ticks * 50))
+const lifecycles = new WeakMap<object, AbortSignal>()
+
+/** Fires when the connection or the plugin is gone, and waits on this bot should give up. */
+export function bindLifecycle (bot: object, signal: AbortSignal): void {
+  lifecycles.set(bot, signal)
 }
 
 /**
- * Wait until the body has actually stopped. A swing sent while the bot is
- * still sliding or falling is sent from a position the server has not agreed
- * to yet.
+ * Start `work` unless the bot or `signal` has stopped, and reject with ActionAborted if either stops first.
+ * Mineflayer's waits on ticks and rotations need physics ticks, which end with the connection and pause
+ * with physics or an unloaded chunk.
  */
+export async function untilStopped<T> (bot: BotLike, work: () => PromiseLike<T> | T, signal?: AbortSignal): Promise<T> {
+  const life = lifecycles.get(bot)
+  const stop = life !== undefined && signal !== undefined ? AbortSignal.any([life, signal]) : life ?? signal
+  if (stop === undefined) return await work()
+  const stopped = (): ActionError => new ActionError(ActionErrors.ABORTED, (stop.reason as Error | undefined)?.message ?? 'The action was aborted.')
+  if (stop.aborted) throw stopped()
+  const running = Promise.resolve(work())
+  // It may fail after this has given up on it.
+  running.catch(() => {})
+  let onStop = (): void => {}
+  const aborted = new Promise<never>((_resolve, reject) => {
+    onStop = () => reject(stopped())
+    stop.addEventListener('abort', onStop, { once: true })
+  })
+  try {
+    return await Promise.race([running, aborted])
+  } finally {
+    stop.removeEventListener('abort', onStop)
+  }
+}
+
+/** Wait N server ticks, falling back to wall-clock when the bot has no helper. */
+export async function waitTicks (bot: BotLike, ticks: number): Promise<void> {
+  await untilStopped(bot, async () => {
+    if (typeof bot.waitForTicks === 'function') await bot.waitForTicks(ticks)
+    else await new Promise<void>(resolve => setTimeout(resolve, ticks * 50))
+  })
+}
+
+/** Wait until sliding and falling stop so the server can accept the interaction position. */
 export async function settleGrounded (bot: BotLike, maxTicks = 20): Promise<boolean> {
   for (let i = 0; i < maxTicks; i++) {
     const e = bot.entity
@@ -260,11 +261,7 @@ export function bodyOverlaps (bot: BotLike, pos: Vec3): boolean {
   )
 }
 
-/**
- * Is there a clear line from the eye to `point`, ending on `pos`? Uses the
- * bot's own world raycast when available — the same one mineflayer's
- * `blockAtCursor` uses — so the answer matches what the server will compute.
- */
+/** Check eye-to-point visibility ending on `pos` using the world's raycast, when available. */
 export function hasLineOfSight (bot: BotLike, pos: Vec3, point: Vec3, reach: number): boolean {
   const raycast = bot.world?.raycast
   if (typeof raycast !== 'function') return true // cannot tell; let the server judge

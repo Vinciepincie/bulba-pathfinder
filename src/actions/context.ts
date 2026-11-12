@@ -1,7 +1,4 @@
-// What the built-in actions need from the host plugin. Keeping it in one
-// explicit interface is what lets the action layer be unit-tested against a
-// fake bot, and what lets a consumer replace one action without inheriting
-// the whole plugin.
+// A small host interface keeps actions replaceable without depending on the whole plugin.
 import type { Vec3 } from 'vec3'
 import { Pacer } from './pacing.js'
 import type { ActionConfig, BlockLike } from './types.js'
@@ -29,12 +26,7 @@ export interface ActionContext {
   bot: DiggingBot
   config: ActionConfig
   pacer: Pacer
-  /**
-   * The `bot.dig` captured when the pathfinder was injected — BEFORE any
-   * application-level wrapper monkey-patched it. Calling this instead of
-   * `bot.dig` is what stops an application whose own dig wrapper delegates
-   * back into the pathfinder from recursing into itself.
-   */
+  /** Original bot.dig captured at injection; bypasses application overrides that could recurse. */
   rawDig: (block: unknown, forceLook?: unknown, digFace?: unknown) => Promise<void>
   /** ms since the server last corrected the bot's position, or Infinity. */
   msSinceForcedMove: () => number
@@ -42,9 +34,8 @@ export interface ActionContext {
   serverTps: () => number | null
   /** Fastest tool in the inventory for this block, or null. */
   bestHarvestTool: (block: BlockLike) => unknown
-  /**
-   * Walk to a position the block can be interacted with from. Provided by the
-   * plugin (it owns the goal); returns false when no path exists.
-   */
+  /** Approach an interactable position using the plugin's goal; false when no path exists. */
   approach: (pos: Vec3, reach: number, signal?: AbortSignal) => Promise<boolean>
+  /** Equip through the action table, so an override of `actions.equip` covers every action. */
+  equip: (item: unknown, destination?: string) => Promise<void>
 }

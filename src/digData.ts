@@ -1,8 +1,4 @@
-// Per-state dig tables for canDig solves. Upstream re-runs bestHarvestTool +
-// block.digTime for EVERY unsafe block probe (nbt parsing per neighbor!);
-// the numbers only depend on (block type × inventory × effects), so we
-// compute them once per solve and cache by an inventory fingerprint —
-// identical costs, computed thousands of times less often.
+// Dig costs depend on block type, inventory and effects, so cache them per solve.
 import prismarineBlockLoader from 'prismarine-block'
 import nbt from 'prismarine-nbt'
 import type { Bot } from 'mineflayer'
@@ -20,7 +16,7 @@ interface DigBlockLike {
   digTime (toolType: number | null, creative: boolean, inWater: boolean, notOnGround: boolean, enchants: unknown[], effects: unknown): number
 }
 
-/** Fingerprint of everything digTime can depend on. */
+/** Cache key for inventory, effects, LUT and dig restrictions. */
 export function digFingerprint (bot: Bot, movements: Movements, lut: BlockLut): string {
   const items = bot.inventory.items() as ToolLike[]
   const toolKey = items
@@ -43,7 +39,7 @@ export function computeDigData (bot: Bot, movements: Movements, lut: BlockLut): 
   const labor = new Float32Array(lut.maxStateId + 1)
   const flags = new Uint8Array(lut.maxStateId + 1)
 
-  // Pre-simplify tool enchantments once (upstream does this per probe).
+  // Enchantment parsing is shared by all block probes.
   const items = bot.inventory.items() as ToolLike[]
   const tools = items.map(tool => ({
     type: tool.type,
@@ -61,8 +57,7 @@ export function computeDigData (bot: Bot, movements: Movements, lut: BlockLut): 
     let typeLabor = 0
     if ((typeFlags & DigFlags.CANT_BREAK) === 0) {
       const block = Block.fromStateId(blockType.minStateId, 0) as unknown as DigBlockLike
-      // bestHarvestTool, upstream-identical: fastest digTime over inventory
-      // (bare hand only when the inventory is empty — upstream quirk kept).
+      // Use the fastest inventory tool, or bare hands when the inventory is empty.
       let fastest = Number.MAX_VALUE
       try {
         for (const tool of tools) {
@@ -73,9 +68,7 @@ export function computeDigData (bot: Bot, movements: Movements, lut: BlockLut): 
       } catch {
         fastest = Number.MAX_VALUE
       }
-      // Upstream: laborCost = (1 + 3 * digTime / 1000) * digCost. digCost is
-      // applied at move-generation time; unbreakable-in-practice blocks
-      // (digTime Infinity) get a huge labor so the 100 gate rejects them.
+      // Move generation applies digCost; infinite dig times must exceed the labor gate.
       typeLabor = Number.isFinite(fastest) ? 1 + (3 * fastest) / 1000 : 1e9
     }
 

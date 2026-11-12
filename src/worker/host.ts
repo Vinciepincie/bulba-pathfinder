@@ -1,13 +1,5 @@
-// Host side of the worker solver: one worker per PROCESS (shared by every
-// bot instance — reconnect loops must never leak threads), lazy spawn
-// serialized through a single in-flight promise, crash-tolerant (pending
-// solves reject → callers fall back to main-thread solving), and the worker
-// is unref()ed so it never keeps the process alive.
-//
-// Failure accounting distinguishes SPAWN failures (the worker dies before
-// its 'online' event — bad entry path, bundler mangling) from runtime
-// crashes: repeated spawn failures latch `unavailable` so callers stop
-// paying thread-churn and stay on the main-thread path permanently.
+// Share one lazy worker across bots; failed solves fall back to the main thread.
+// Repeated startup failures disable spawning, and unref lets idle processes exit.
 import { Worker } from 'node:worker_threads'
 import { join } from 'node:path'
 import { MAX_DIG_TABLES } from './digProtocol.js'
@@ -27,6 +19,16 @@ export interface WorkerSolveRequest {
   sliceMs: number
   /** Per-state dig tables (required when cfg.canDig). */
   dig?: DigData | null
+  /** The bot's body for the physics kernel (cfg.allowParkourPhysics): hitbox and walking speed. */
+  body?: { halfWidth: number, height: number, speed: number }
+  /** Allow hops in the first boundary-limited box; grown boxes make follow-up floods expensive. */
+  hopsOnBoundary?: boolean
+  /** The core to solve on (PathfinderOptions.core); the wasm core when absent. */
+  core?: 'wasm' | 'js'
+  /** The body's exact feet position, when on the ground (hopPipeline.ts startRest). */
+  startPos?: { x: number, y: number, z: number }
+  /** Whether the worker kernel keeps vanilla's faster jump rise, matching the bot's physics. */
+  vanillaJump?: boolean
   onPartial: (result: RawSolveResult) => void
 }
 
@@ -41,14 +43,12 @@ interface Pending {
   onPartial: (r: RawSolveResult) => void
 }
 
-/** A spawned worker with ITS OWN pending map and LUT state — a dead
- * worker's late 'exit' event can only ever touch its own solves. */
+/** Worker-local pending solves and LUT state keep late exit events isolated from replacement workers. */
 interface ActiveWorker {
   worker: Worker
   pending: Map<number, Pending>
   sentLutFingerprint: string
-  /** Dig fingerprints resident in the worker — insertion-ordered, evicted
-   * at MAX_DIG_TABLES exactly like the worker's own cache. */
+  /** Resident dig fingerprints, evicted in insertion order at the worker's MAX_DIG_TABLES bound. */
   sentDigFingerprints: Set<string>
   online: boolean
   gone: boolean
@@ -56,14 +56,12 @@ interface ActiveWorker {
 
 const MAX_SPAWN_FAILURES = 3
 
-/**
- * Cells the wasm arena is pre-sized for at prewarm. A 60-100 block route on
- * the arena builds a 350k-870k-cell box after the 0.3·d + 20 margin; this
- * covers those with room, at ~26 bytes a cell (~30 MB in the worker).
- */
+/** Prewarm reserve size avoids allocating search arrays on the first solve. */
 const DEFAULT_RESERVE_CELLS = 1_200_000
 
 export class SolverWorkerHost {
+  /** Where the host's warnings go. */
+  warn: (message: string) => void = message => console.warn(message)
   private active: ActiveWorker | null = null
   private spawning: Promise<ActiveWorker | null> | null = null
   private nextId = 1
@@ -72,7 +70,7 @@ export class SolverWorkerHost {
   /** Arena size every spawned worker is asked to reserve (0 = none). */
   private reserveCells = 0
 
-  /** Permanently unavailable (spawn kept failing) — callers use main-thread. */
+  /** True after repeated spawn failures; callers solve on the main thread. */
   get unavailable (): boolean {
     return this.spawnFailures >= MAX_SPAWN_FAILURES
   }
@@ -83,9 +81,7 @@ export class SolverWorkerHost {
 
   private async resolveEntryPath (): Promise<string> {
     if (this.entryPath) return this.entryPath
-    // The compiled tree carries a format-specific runtime shim next to this
-    // file; in dev (running TS directly) it doesn't exist and the import
-    // throws → callers fall back to main-thread solving.
+    // The format-specific shim is absent during direct TS execution; failure uses the main thread.
     const { moduleDir } = await import('../runtime/moduleDir.js')
     return join(moduleDir(), 'worker', 'entry.js')
   }
@@ -95,7 +91,7 @@ export class SolverWorkerHost {
     aw.gone = true
     if (!aw.online) this.spawnFailures++ // died before 'online' = spawn failure
     if (this.unavailable) {
-      console.warn('[bulba-pathfinder] worker thread unavailable, staying on main-thread solving')
+      this.warn('[bulba-pathfinder] worker thread unavailable, staying on main-thread solving')
     }
     if (this.active === aw) this.active = null
     const err = new Error(`pathfinder worker ${reason}${info !== undefined ? `: ${String(info)}` : ''}`)
@@ -107,7 +103,6 @@ export class SolverWorkerHost {
     try {
       const entry = await this.resolveEntryPath()
       const worker = new Worker(entry)
-      worker.unref()
       const aw: ActiveWorker = {
         worker,
         pending: new Map(),
@@ -137,13 +132,15 @@ export class SolverWorkerHost {
       })
       worker.on('error', (err) => this.retire(aw, 'errored', err?.message ?? err))
       worker.on('exit', (code) => this.retire(aw, 'exited', code !== 0 ? code : undefined))
+      // After the listeners: adding a message listener refs the worker again, and it would hold the process open.
+      worker.unref()
       if (this.reserveCells > 0) worker.postMessage({ t: 'reserve', cells: this.reserveCells })
       this.active = aw
       return aw
     } catch (error) {
       this.spawnFailures++
       if (this.unavailable) {
-        console.warn('[bulba-pathfinder] worker thread unavailable, staying on main-thread solving:', (error as Error).message)
+        this.warn(`[bulba-pathfinder] worker thread unavailable, staying on main-thread solving: ${(error as Error).message}`)
       }
       return null
     }
@@ -161,23 +158,11 @@ export class SolverWorkerHost {
     return this.spawning
   }
 
-  /**
-   * Spawn the worker now rather than on the first solve.
-   *
-   * Thread start, module load and wasm instantiation are a one-time ~150 ms
-   * that otherwise lands entirely inside the first goal — the arena measures
-   * it directly as `1st move`, where the worker engine was 100-250 ms behind
-   * the main-thread one on every route while being faster at everything
-   * afterwards. A bot is idle when it connects and busy when it is asked to
-   * walk somewhere, so the cost belongs at load time. Fire and forget: a
-   * spawn failure is already handled (callers fall back to the main thread),
-   * and the worker is unref()ed so an idle process still exits.
-   */
+  /** Prewarm thread startup and wasm loading so the first goal avoids their cost.
+   * Spawn failures still use main-thread fallback; unref lets idle processes exit. */
   prewarm (cells = DEFAULT_RESERVE_CELLS): void {
     if (this.unavailable) return
-    // The arena allocation is the other one-time cost of a first solve
-    // (lib.rs arena_reserve): size it for a typical box now, and again for
-    // every worker spawned after this one.
+    // Reserve search arrays now and for every replacement worker.
     if (cells > this.reserveCells) {
       this.reserveCells = cells
       if (this.active && !this.active.gone) this.active.worker.postMessage({ t: 'reserve', cells })
@@ -185,7 +170,7 @@ export class SolverWorkerHost {
     void this.ensureWorker().catch(() => {})
   }
 
-  /** Null when the worker can't be used — caller solves on the main thread. */
+  /** Null when the worker is unavailable; the caller solves on the main thread. */
   async solve (req: WorkerSolveRequest): Promise<WorkerSolveHandle | null> {
     const aw = await this.ensureWorker()
     if (!aw || aw.gone) return null
@@ -197,13 +182,14 @@ export class SolverWorkerHost {
         maxStateId: req.lut.maxStateId,
         shapeStarts: req.lut.shapeStarts,
         shapeCounts: req.lut.shapeCounts,
-        shapeData: req.lut.shapeData
+        shapeData: req.lut.shapeData,
+        simSlip: req.lut.simSlip,
+        simKind: req.lut.simKind
       })
       aw.sentLutFingerprint = req.lut.fingerprint
     }
 
-    // Dig tables travel once per fingerprint, not per solve (~120KB saved
-    // per repeat solve). An empty fingerprint is uncacheable — resend it.
+    // Send dig tables once per fingerprint; an empty fingerprint is uncacheable.
     const digFp = req.dig ? req.dig.fingerprint : null
     if (req.dig && digFp !== null && (digFp === '' || !aw.sentDigFingerprints.has(digFp))) {
       aw.worker.postMessage({
@@ -229,6 +215,8 @@ export class SolverWorkerHost {
     const promise = new Promise<RawSolveResult>((resolve, reject) => {
       aw.pending.set(id, { resolve, reject, onPartial: req.onPartial })
     })
+    // A cancelled solve has nobody waiting on it, and a worker dying then must not crash the process.
+    promise.catch(() => {})
 
     const snap = req.snapshot
     aw.worker.postMessage({
@@ -239,6 +227,7 @@ export class SolverWorkerHost {
       heightsBuf: snap.heights.buffer,
       statesBuf: snap.states ? snap.states.buffer : null,
       specialBuf: snap.special ? snap.special.buffer : null,
+      thinBuf: snap.thin ? snap.thin.buffer : null,
       entityIdx: snap.entityIdx,
       entityWeight: snap.entityWeight,
       cfg: req.cfg,
@@ -248,7 +237,12 @@ export class SolverWorkerHost {
       searchRadius: req.searchRadius,
       sliceMs: req.sliceMs,
       cancelBuf,
-      digFingerprint: req.dig ? req.dig.fingerprint : null
+      digFingerprint: req.dig ? req.dig.fingerprint : null,
+      body: req.body,
+      hopsOnBoundary: req.hopsOnBoundary,
+      core: req.core,
+      startPos: req.startPos,
+      vanillaJump: req.vanillaJump
     })
 
     return {

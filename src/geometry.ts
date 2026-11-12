@@ -1,27 +1,15 @@
-// Shape-aware body geometry + walk-only recovery, absorbed from the
-// bulbastore wrapper (its generic navigation half — crop/dig semantics stay
-// with the app). Everything here reads block.shapes — the REAL collision
-// AABBs — so carpets, slabs, stairs and chests classify correctly, and uses
-// an epsilon so "touching" never counts as "overlapping" (never trust exact
-// boundary equality — the 1.21 hitbox-freeze class).
+// Collision shapes distinguish partial blocks; epsilon keeps touching faces from overlapping.
 import { Vec3 } from 'vec3'
 import type { Bot } from 'mineflayer'
+import { waitTicks } from './actions/reach.js'
+import type { BotLike } from './actions/reach.js'
 
 const EPS = 0.02
-/** Fallback body half-width / height — see bodyHalf/bodyTall. */
+/** Fallback body half-width in blocks. */
 const HALF = 0.3
 const TALL = 1.8
 
-/**
- * The body dimensions the PHYSICS is actually using, not the nominal ones.
- *
- * The 1.21.x hitbox-precision fix (plugin.ts hitboxPrecisionFix) nudges
- * prismarine-physics to 0.30001 / 1.80001 so collision resolutions stop
- * landing exactly on block boundaries. Every probe in this file exists to
- * predict what that engine will do, so they have to measure the same body it
- * does — otherwise the checks are 1e-5 optimistic about exactly the contacts
- * the nudge was added to disambiguate.
- */
+/** Match the physics engine's body dimensions so boundary probes predict its collisions. */
 function bodyHalf (bot: Bot): number {
   const ph = (bot as unknown as { physics?: { playerHalfWidth?: number } }).physics
   return ph?.playerHalfWidth ?? HALF
@@ -36,17 +24,11 @@ interface ShapedBlock {
   shapes?: number[][]
 }
 
-/**
- * Per-tick block cache, executor only. The corner cut sweeps the body box
- * down chords of up to ~32 blocks several times a tick, and every sample asks
- * for the same few hundred blocks; between beginTick and endTick the shape
- * probes answer from here. The world is fixed within a tick, and outside one
- * (actions, callers between ticks) the cache is simply off.
- */
+/** Cache repeated shape probes within a tick; reads outside a tick stay live. */
 let shapeCache: Map<number, number[][]> | null = null
 export function beginTick (): void { shapeCache = new Map() }
 export function endTick (): void { shapeCache = null }
-/** Unique within a tick's reach: two cells would have to be 2^20 apart to collide. */
+/** Coordinates wrap every 2^20 cells in X/Z and 512 in Y, beyond a tick's reach. */
 function cellKey (x: number, y: number, z: number): number {
   return ((x & 0xFFFFF) * 0x100000 + (z & 0xFFFFF)) * 512 + (y & 0x1FF)
 }
@@ -60,7 +42,7 @@ function shapesRaw (bot: Bot, x: number, y: number, z: number): number[][] {
   ])
 }
 
-/** A block's collision boxes in WORLD coordinates, by integer cell. */
+/** A block's collision boxes in world coordinates, by integer cell. */
 export function shapesAt (bot: Bot, x: number, y: number, z: number): number[][] {
   if (shapeCache === null || !Number.isInteger(x) || !Number.isInteger(y) || !Number.isInteger(z)) {
     return shapesRaw(bot, x, y, z)
@@ -74,7 +56,7 @@ export function shapesAt (bot: Bot, x: number, y: number, z: number): number[][]
   return hit
 }
 
-/** A block's collision boxes in WORLD coordinates. */
+/** A block's collision boxes in world coordinates. */
 export function blockShapes (bot: Bot, pos: Vec3): number[][] {
   return shapesAt(bot, pos.x, pos.y, pos.z)
 }
@@ -87,17 +69,67 @@ export function playerCollides (bot: Bot, x: number, feetY: number, z: number): 
     x + half - EPS, feetY + bodyTall(bot) - EPS, z + half - EPS)
 }
 
-/**
- * Is there floor under a thin column at (x, z) — something a body centred
- * there would rest on? A body has floor as long as ANY corner of its box
- * overlaps a block top, which is what the swept-line support probe tests and
- * is the right answer about standing; this asks the stricter question the
- * corner cut's side margin needs: is the ground still there half a block to
- * the side of the line, so that a body knocked off it by a hop's momentum
- * lands rather than falls.
- */
+/** Probe a thin floor column for side margins, so sideways drift still has ground to land on. */
 export function floorUnder (bot: Bot, x: number, feetY: number, z: number): boolean {
   return boxCollides(bot, x - 0.05, feetY - 0.55, z - 0.05, x + 0.05, feetY - EPS, z + 0.05)
+}
+
+/** A face of a support a body can rest on, as a world-space XZ rectangle. */
+export interface FaceRect { x0: number, x1: number, z0: number, z1: number, top: number }
+
+/** Support faces in world XZ coordinates, within 0.6 blocks of the highest top.
+ * Uses actual faces because narrow supports need not be centred in their cells. */
+export function supportFaces (bot: Bot, x: number, y: number, z: number): FaceRect[] {
+  const shapes = shapesAt(bot, x, y, z)
+  if (shapes.length === 0) return []
+  let top = -Infinity
+  for (const s of shapes) if (s[4] > top) top = s[4]
+  const out: FaceRect[] = []
+  for (const s of shapes) {
+    if (s[4] > top - 0.6) out.push({ x0: s[0], x1: s[3], z0: s[2], z1: s[5], top: s[4] })
+  }
+  return out
+}
+
+/** Is a body centred at (x, z), its hitbox shrunk by `margin` on every side, resting on one of these faces? */
+export function supportedAt (bot: Bot, faces: readonly FaceRect[], x: number, z: number, margin = 0): boolean {
+  const h = bodyHalf(bot) - margin
+  for (const f of faces) {
+    if (x + h > f.x0 && x - h < f.x1 && z + h > f.z0 && z - h < f.z1) return true
+  }
+  return false
+}
+
+/** Distance along unit direction (ux, uz) before leaving all currently supporting faces.
+ * Returns -1 when unsupported; excludes faces reached only later. */
+export function supportReach (bot: Bot, faces: readonly FaceRect[], ox: number, oz: number, ux: number, uz: number): number {
+  const h = bodyHalf(bot)
+  let best = -1
+  for (const f of faces) {
+    const ax0 = f.x0 - h
+    const ax1 = f.x1 + h
+    const az0 = f.z0 - h
+    const az1 = f.z1 + h
+    if (ox <= ax0 || ox >= ax1 || oz <= az0 || oz >= az1) continue
+    let t = Infinity
+    if (ux > 1e-9) t = Math.min(t, (ax1 - ox) / ux)
+    else if (ux < -1e-9) t = Math.min(t, (ax0 - ox) / ux)
+    if (uz > 1e-9) t = Math.min(t, (az1 - oz) / uz)
+    else if (uz < -1e-9) t = Math.min(t, (az0 - oz) / uz)
+    if (t > best) best = t
+  }
+  return best
+}
+
+/** Maximum over faces of the smaller X/Z overlap with the body at (x, z). */
+export function supportDepth (bot: Bot, faces: readonly FaceRect[], x: number, z: number): number {
+  const h = bodyHalf(bot)
+  let best = 0
+  for (const f of faces) {
+    const d = Math.min(Math.min(x + h, f.x1) - Math.max(x - h, f.x0), Math.min(z + h, f.z1) - Math.max(z - h, f.z0))
+    if (d > best) best = d
+  }
+  return best
 }
 
 /** Does this world-space box overlap any block collision box? */
@@ -122,13 +154,8 @@ export function boxCollides (
   return false
 }
 
-/**
- * Is the body within `margin` of a solid block sideways — touching a wall,
- * standing in a doorway, wedged in a corner? Unlike playerCollides this counts
- * EXACT contact, which is the state prismarine-physics leaves the bot in after
- * every horizontal collision (it clamps to the block face), and the state the
- * server refuses to accept a sprinting client in.
- */
+/** Whether a wall is within `margin`, including exact contact left by collision resolution.
+ * Some servers reject sprinting while the body touches a wall. */
 export function nearWall (bot: Bot, margin = 0.03): boolean {
   const p = bot.entity.position
   const half = bodyHalf(bot)
@@ -137,7 +164,6 @@ export function nearWall (bot: Bot, margin = 0.03): boolean {
   const maxX = p.x + half + margin
   const minZ = p.z - half - margin
   const maxZ = p.z + half + margin
-  // Feet and head cells only: the body is what a wall can touch.
   const y0 = Math.floor(p.y + EPS)
   const y1 = Math.floor(p.y + tall - EPS)
   for (let bx = Math.floor(minX); bx <= Math.floor(maxX); bx++) {
@@ -156,15 +182,8 @@ export function nearWall (bot: Bot, margin = 0.03): boolean {
   return false
 }
 
-/**
- * How far the body can travel along (dirX, dirZ) before it touches a block
- * face, capped at `max`.
- *
- * Only faces the body would actually hit count: playerCollides tests the
- * 1.8-tall box from the FEET up, so the step the bot is standing on top of is
- * invisible to it and the step in front of it is not. That is exactly the
- * distinction the riser standoff needs.
- */
+/** Travel distance along (dirX, dirZ) before body collision, capped at `max`.
+ * Floor beneath the feet does not count as an obstruction ahead. */
 export function clearanceAhead (bot: Bot, dirX: number, dirZ: number, max = 0.3, step = 0.05): number {
   const p = bot.entity.position
   for (let d = step; d <= max + 1e-9; d += step) {
@@ -193,24 +212,8 @@ export function canStandAt (bot: Bot, pos: Vec3): boolean {
   return isStandable(bot, pos.floored())
 }
 
-/**
- * Could a walking body go from (x0,z0) to (x1,z1) in a STRAIGHT line at floor
- * level `y`, with something under its feet the whole way?
- *
- * This is the corner cut's safety check. The planner routes cell centre to
- * cell centre, so a run that drifts a few degrees off a cardinal comes back as
- * a zig-zag of alternating steps, and a follower that visits every centre
- * walks every zig. Skipping them is only sound if the line the body would
- * actually sweep is checked, which is what this does: the full body box at
- * samples along the segment, plus a support probe half a block down.
- *
- * The support probe is the same box dropped by 0.55. Anything it newly hits is
- * below the feet by construction — a head-height obstruction would already
- * have failed the first test — so "no new contact" means "no floor", which is
- * how a gap, a lava pool or an open ledge is refused: none of them have
- * anything to stand on. `avoid` catches what geometry cannot see, the blocks
- * the profile says not to walk on (magma, cactus, fire).
- */
+/** Check straight-line walking clearance and continuous support at floor level `y`.
+ * The lowered body probe detects floor; `avoid` and `cellCost` preserve non-geometric hazards. */
 export function walkableLine (
   bot: Bot,
   x0: number, z0: number,
@@ -228,7 +231,6 @@ export function walkableLine (
   if (len < 1e-6) return true
   const n = Math.ceil(len / step)
   const cy = Math.floor(y)
-  // Unit normal to the line, for the side-margin floor probes.
   const nx = -dz / len * sideMargin
   const nz = dx / len * sideMargin
   let lastCx = NaN
@@ -239,22 +241,15 @@ export function walkableLine (
     const z = z0 + dz * t
     if (playerCollides(bot, x, y, z)) return false
     if (!playerCollides(bot, x, y - 0.55, z)) return false
-    // Ground to either side as well, over the first `sideMarginLen` blocks
-    // (the cut's side margin): a line that skims a ledge where the body is
-    // still turning onto it is refused, so a body knocked a little off the
-    // line by a hop's momentum still lands on something.
+    // Side margins leave landing room for momentum while turning onto a shortcut.
     if (sideMargin > 0 && t * len <= sideMarginLen &&
         (!floorUnder(bot, x + nx, y, z + nz) || !floorUnder(bot, x - nx, y, z - nz))) return false
-    // The per-cell checks, once per cell the centreline enters.
     const cx = Math.floor(x)
     const cz = Math.floor(z)
     if (cx === lastCx && cz === lastCz) continue
     lastCx = cx
     lastCz = cz
-    // Cost the geometry cannot see — an entity the profile is avoiding, which
-    // the planner paid to detour around. Checked PER CELL: a world simply
-    // containing entities is every world, so a global "are there any" test
-    // switches the cut off permanently.
+    // Preserve entity detours per cell; entities elsewhere must not disable all shortcuts.
     if (cellCost !== null) {
       if (cellCost(cx, cy, cz) > 0 || cellCost(cx, cy + 1, cz) > 0) return false
     }
@@ -309,8 +304,7 @@ export function findNearestOpenStandable (bot: Bot, radius = 6): Vec3 | null {
 
 function waitForTicks (bot: Bot, n: number): Promise<void> {
   const asWaiter = bot as unknown as { waitForTicks?: (n: number) => Promise<void> }
-  if (typeof asWaiter.waitForTicks === 'function') return asWaiter.waitForTicks(n)
-  // Fallback (bare/fake bots): count physicsTick events.
+  if (typeof asWaiter.waitForTicks === 'function') return waitTicks(bot as unknown as BotLike, n)
   return new Promise((resolve) => {
     let count = 0
     const handler = (): void => {
@@ -323,11 +317,7 @@ function waitForTicks (bot: Bot, n: number): Promise<void> {
   })
 }
 
-/**
- * Walk-only recovery from being embedded in a block: face the nearest
- * standable cell and walk at it holding jump. Never digs. Always releases
- * the controls it set.
- */
+/** Walk and jump toward the nearest standable cell to escape a block, then release controls. */
 export async function unstick (bot: Bot, attempts = 3): Promise<boolean> {
   if (!isStuck(bot)) return true
 
@@ -359,11 +349,8 @@ export async function unstick (bot: Bot, attempts = 3): Promise<boolean> {
   return false
 }
 
-/**
- * Come to a verified standstill: stop driving, then wait until position
- * drift actually ends (momentum outlives control release).
- * @returns true once still, false if still drifting after ~40 ticks.
- */
+/** Wait for position drift to end; momentum outlives control release.
+ * @returns true once still, false after 40 ticks of continued drift. */
 export async function settle (bot: Bot): Promise<boolean> {
   let last = bot.entity.position.clone()
   for (let attempt = 0; attempt < 20; attempt++) {
@@ -375,11 +362,7 @@ export async function settle (bot: Bot): Promise<boolean> {
   return false
 }
 
-/**
- * Drive the body to the CENTRE of a cell it already arrived in (a block
- * goal is satisfied by the node, not the body — a 0.6-wide hitbox on a cell
- * corner can straddle a neighbouring column and wedge).
- */
+/** Centre the body in an already reached cell so its hitbox does not straddle a neighbour. */
 export async function centreInCell (bot: Bot, cell: Vec3, tolerance = 0.15): Promise<boolean> {
   const centre = cell.floored().offset(0.5, 0, 0.5)
   const offset = (): number => {
@@ -396,7 +379,6 @@ export async function centreInCell (bot: Bot, cell: Vec3, tolerance = 0.15): Pro
       if (offset() <= tolerance) break
     }
   } catch {
-    // fall through to the release below
   } finally {
     bot.setControlState('forward', false)
   }

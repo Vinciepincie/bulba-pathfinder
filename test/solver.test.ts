@@ -21,6 +21,7 @@ import {
   Block
 } from './helpers/voxelWorld.js'
 import { Solver } from '../src/solver.js'
+import { MoveGen, META_PARKOUR } from '../src/moveGen.js'
 import { Move } from '../src/move.js'
 import type { RawSolveResult } from '../src/solver.js'
 import { GoalAdapter } from '../src/goalAdapter.js'
@@ -35,6 +36,110 @@ interface SolveOpts {
 }
 
 /** Build movements/lut/snapshot for the world and run the solver to a terminal status. */
+
+/** A dry ladder facing north: its panel at z 0.8125..1, against a wall on +z. */
+const LADDER_NORTH = ((): number => {
+  const b = mcData.blocksByName.ladder
+  for (let s = b.minStateId as number; s <= (b.maxStateId as number); s++) {
+    const p = Block.fromStateId(s, 0).getProperties() as Record<string, unknown>
+    if (String(p.facing) === 'north' && String(p.waterlogged) === 'false') return s
+  }
+  return -1
+})()
+const LAVA = mcData.blocksByName.lava.minStateId as number
+
+/** A row of 1-high ladders on a wall too tall to walk on, over a void: only ladder-top take-offs cross it. */
+function ladderRowWorld (): VoxelWorld {
+  const w = new VoxelWorld({ x0: -2, y0: -8, z0: -2, x1: 10, y1: 8, z1: 2 })
+  w.fill(-1, -6, 1, 9, 6, 1, STONE)
+  w.set(0, 1, 0, LADDER_NORTH)
+  w.set(3, 1, 0, LADDER_NORTH)
+  w.set(6, 1, 0, LADDER_NORTH)
+  return w
+}
+
+/** A 1-wide ledge between two lava cells on the straight line, and a dry way round further off. */
+function lavaLedgeWorld (): VoxelWorld {
+  const w = new VoxelWorld({ x0: -2, y0: -4, z0: -3, x1: 10, y1: 5, z1: 5 })
+  w.fill(0, 0, -1, 1, 0, 1, STONE)
+  w.set(3, 0, 0, STONE)
+  w.set(3, 0, -1, STONE)
+  w.set(3, 0, 1, STONE)
+  w.set(3, 1, -1, LAVA)
+  w.set(3, 1, 1, LAVA)
+  w.fill(5, 0, -1, 7, 0, 1, STONE)
+  w.set(2, 0, 3, STONE)
+  w.set(4, 0, 3, STONE)
+  return w
+}
+
+/** An open, dry, unpowered bottom birch trapdoor facing `facing`: a 3/16 panel against the opposite face. */
+function birchTrapdoor (facing: string): number {
+  const b = mcData.blocksByName.birch_trapdoor
+  for (let s = b.minStateId as number; s <= (b.maxStateId as number); s++) {
+    const p = Block.fromStateId(s, 0).getProperties() as Record<string, unknown>
+    if (String(p.facing) === facing && String(p.open) === 'true' && String(p.half) === 'bottom' && String(p.waterlogged) === 'false' && String(p.powered) === 'false') return s
+  }
+  throw new Error('no birch trapdoor facing ' + facing)
+}
+
+/**
+ * A trapdoor-ladder shaft (arena mcc-8-3): plates against three walls in a
+ * period-3 spiral, each under the same plate three up (a lid 0.2 over the
+ * head of a body standing on it). Start (4,3,0) on the first S plate; the
+ * top platform's stand is (-1,21,0).
+ */
+function trapShaftWorld (): VoxelWorld {
+  const S = birchTrapdoor('south')
+  const N = birchTrapdoor('north')
+  const E = birchTrapdoor('east')
+  const w = new VoxelWorld({ x0: -3, y0: -2, z0: -3, x1: 8, y1: 26, z1: 4 })
+  w.fill(-1, 0, -2, 7, 0, 3, STONE)
+  w.fill(0, 1, -1, 4, 19, -1, STONE)
+  w.fill(0, 1, 2, 4, 19, 2, STONE)
+  w.fill(0, 1, 0, 0, 19, 1, STONE)
+  for (let k = 0; k < 6; k++) {
+    const y = 2 + 3 * k
+    w.set(3, y, 0, S); w.set(4, y, 0, S)
+    w.set(3, y + 1, 1, N); w.set(4, y + 1, 1, N)
+    w.set(1, y + 2, 0, E); w.set(1, y + 2, 1, E)
+  }
+  w.fill(-2, 20, 0, 0, 20, 1, STONE)
+  return w
+}
+
+/** The moves MoveGen emits from `a`: [dx, dy, dz, parkour]. */
+function moves (world: VoxelWorld, a: XYZ, overrides: Record<string, unknown>): Array<[number, number, number, boolean]> {
+  const bot = makeFakeBot(world, new Vec3(a.x + 0.5, a.y, a.z + 0.5))
+  const movements = makeOurMovements(bot, overrides)
+  const gen = new MoveGen(snapshotFromWorld(world, lutFor(bot, movements)), movements.toConfig())
+  gen.generate(a.x, a.y, a.z)
+  const out: Array<[number, number, number, boolean]> = []
+  for (let i = 0; i < gen.outCount; i++) out.push([gen.outX[i] - a.x, gen.outY[i] - a.y, gen.outZ[i] - a.z, (gen.outMeta[i] & META_PARKOUR) !== 0])
+  return out
+}
+
+/**
+ * A one-cell ladder one above the take-off's feet (arena opk2-1's moss
+ * pillar to the ladder over the next): post (0,0,0), stand (0,1,0); the
+ * ladder at (0,2,-2) on its wall (0,2,-3), open air under it, and (with
+ * `net`) a floor two under flight level that a missed catch falls onto.
+ */
+function upCatchWorld (net: boolean): VoxelWorld {
+  const b = mcData.blocksByName.ladder
+  let south = -1
+  for (let s = b.minStateId as number; s <= (b.maxStateId as number); s++) {
+    const p = Block.fromStateId(s, 0).getProperties() as Record<string, unknown>
+    if (String(p.facing) === 'south' && String(p.waterlogged) === 'false') south = s
+  }
+  const w = new VoxelWorld({ x0: -3, y0: -6, z0: -6, x1: 3, y1: 6, z1: 3 })
+  w.set(0, 0, 0, STONE)
+  w.set(0, 2, -3, STONE)
+  w.set(0, 2, -2, south)
+  if (net) w.set(0, -2, -2, STONE)
+  return w
+}
+
 function solve (world: VoxelWorld, start: XYZ, goal: Goal, opts: SolveOpts = {}): RawSolveResult {
   const bot = makeFakeBot(world, new Vec3(start.x + 0.5, start.y, start.z + 0.5))
   const movements = makeOurMovements(bot, opts.overrides ?? {})
@@ -149,6 +254,114 @@ describe('Solver over hand-built scenes', function () {
     world6.fill(2, 0, -2, 6, 0, 2, STONE) // lower floor, stand y=1 (drop 7 > 4)
     const res6 = solve(world6, { x: 0, y: 7, z: 0 }, new GoalBlock(4, 1, 0))
     expect(res6.status).to.equal('noPath')
+  })
+
+  it('scene 3b: a partial never ends past a deep drop into water (META_DEEP)', () => {
+    // A platform (stand y=7) over a pool (water at y=0 on a floor at y=-1), and
+    // the goal on an island 8 blocks on: out of reach, so the search fails.
+    // The cells nearest the goal are in the pool under the island — reached
+    // by a 7-block drop into water, which infiniteLiquidDropdownDistance
+    // allows and the body can never climb back from. The failure's path is
+    // cut back to the platform, not into the pool (arena mcc-5-3: the bot
+    // walked off the course into the water below and swam at the goal).
+    const world = new VoxelWorld({ x0: -3, y0: -2, z0: -3, x1: 16, y1: 12, z1: 3 })
+    world.fill(-3, -1, -3, 16, -1, 3, STONE) // pool floor
+    world.fill(-3, 0, -3, 16, 0, 3, WATER) // the pool
+    world.fill(-2, 6, -1, 1, 6, 1, STONE) // platform, stand y=7
+    world.fill(10, 6, -1, 13, 6, 1, STONE) // island, stand y=7
+    const start = { x: 0, y: 7, z: 0 }
+    const res = solve(world, start, new GoalBlock(12, 7, 0))
+    expect(res.status).to.equal('noPath')
+    for (const n of res.path) expect(n.y, 'a node of the failed search').to.equal(7)
+    // The same drop is a move like any other where the whole way is found.
+    const swim = solve(world, start, new GoalBlock(8, 0, 0))
+    expect(swim.status).to.equal('success')
+    expect(lastNode(swim)).to.deep.equal({ x: 8, y: 0, z: 0 })
+  })
+
+  it('scene 3c: ladder to ladder over a void, taking off from each ladder top (allowParkourExtended)', () => {
+    const ext = { overrides: { allowParkourExtended: true, allowParkourMomentum: true } }
+    const res = solve(ladderRowWorld(), { x: 0, y: 2, z: 0 }, new GoalBlock(6, 2, 0), ext)
+    expect(res.status).to.equal('success')
+    // catch L2, stand on its top, catch L3, stand on its top
+    expect(res.path.map(n => [n.x, n.y, n.z, n.parkour === true])).to.deep.equal([
+      [3, 1, 0, true], [3, 2, 0, false], [6, 1, 0, true], [6, 2, 0, false]
+    ])
+  })
+
+  it('scene 3d: a ledge between two lava cells is never a landing; the dry way round is taken', () => {
+    const ext = { overrides: { allowParkourExtended: true, allowParkourMomentum: true } }
+    const res = solve(lavaLedgeWorld(), { x: 0, y: 1, z: 0 }, new GoalBlock(7, 1, 0), ext)
+    expect(res.status).to.equal('success')
+    for (const n of res.path) expect([n.x, n.y, n.z], 'a node beside the lava').to.not.deep.equal([3, 1, 0])
+  })
+
+  it('scene 3e: a trapdoor-ladder shaft, each plate under the same plate three up, is climbed by jumps on the latched tick', () => {
+    const ext = { overrides: { allowParkourExtended: true, allowParkourMomentum: true } }
+    const res = solve(trapShaftWorld(), { x: 4, y: 3, z: 0 }, new GoalBlock(-1, 21, 0), ext)
+    expect(res.status).to.equal('success')
+    expect(lastNode(res)).to.deep.equal({ x: -1, y: 21, z: 0 })
+    // (the S to N plate jump-ups are planned jumps, the take-off searched live)
+    expect(res.path.some(n => n.parkour === true && n.y > 3)).to.equal(true)
+  })
+
+  it('scene 3f: the lid stays a ceiling where the body is still on the strip; its end and its open side leave it', () => {
+    const ext = { allowParkourExtended: true, allowParkourMomentum: true }
+    const S = birchTrapdoor('south')
+    // B: a strip of three plates under a lid strip three up, a +1 block two past its end
+    const b = new VoxelWorld({ x0: -3, y0: -6, z0: -3, x1: 8, y1: 8, z1: 3 })
+    b.fill(-2, 0, -1, 8, 4, -1, STONE)
+    for (let x = 0; x <= 2; x++) { b.set(x, 1, 0, S); b.set(x, 4, 0, S) }
+    b.set(-1, 1, 0, STONE); b.set(-1, 1, 1, STONE)
+    b.set(4, 2, 0, STONE)
+    const toLanding = (m: Array<[number, number, number, boolean]>, from: number): boolean => m.some(([dx, dy, dz]) => from + dx === 4 && dy === 1 && dz === 0)
+    expect(toLanding(moves(b, { x: 1, y: 2, z: 0 }, ext), 1), 'from mid-strip: still under the lid at the lip').to.equal(false)
+    expect(toLanding(moves(b, { x: 2, y: 2, z: 0 }, ext), 2), 'off the strip end').to.equal(true)
+    // D: off the strip end into a block at feet level - no; across the open side - yes
+    const d = new VoxelWorld({ x0: -3, y0: -6, z0: -3, x1: 8, y1: 8, z1: 3 })
+    d.fill(-2, 0, -1, 8, 4, -1, STONE)
+    for (let x = 0; x <= 1; x++) { d.set(x, 1, 0, S); d.set(x, 4, 0, S) }
+    d.set(2, 2, 0, STONE)
+    d.set(0, 2, 1, STONE)
+    expect(moves(d, { x: 1, y: 2, z: 0 }, ext).some(([dx, dy, dz]) => dx === 1 && dy === 1 && dz === 0), 'jump-up off the strip end').to.equal(false)
+    expect(moves(d, { x: 0, y: 2, z: 0 }, ext).some(([dx, dy, dz, pk]) => dx === 0 && dy === 1 && dz === 1 && pk), 'jump-up across the open side').to.equal(true)
+  })
+
+  it('scene 3g: a ladder one above the take-off is caught by a +1 jump, only over a floor a miss lands on', () => {
+    const ext = { overrides: { allowParkourExtended: true, allowParkourMomentum: true } }
+    const res = solve(upCatchWorld(true), { x: 0, y: 1, z: 0 }, new GoalBlock(0, 2, -2), ext)
+    expect(res.status).to.equal('success')
+    expect(res.path.map(n => [n.x, n.y, n.z, n.parkour === true])).to.deep.equal([[0, 2, -2, true]])
+    // no floor under the column: a missed catch would fall out of the course
+    expect(solve(upCatchWorld(false), { x: 0, y: 1, z: 0 }, new GoalBlock(0, 2, -2), ext).status).to.equal('noPath')
+  })
+
+  it('scene 3h: a big dripleaf is no floor, powder snow no air (allowParkourExtended)', () => {
+    const ext = { overrides: { allowParkourExtended: true, allowParkourMomentum: true } }
+    const leaf = (Block.fromStateId(mcData.blocksByName.big_dripleaf.minStateId as number, 0) as { getProperties: () => Record<string, unknown> }) && (() => {
+      const b = mcData.blocksByName.big_dripleaf
+      for (let st = b.minStateId as number; st <= (b.maxStateId as number); st++) {
+        const p = Block.fromStateId(st, 0).getProperties() as Record<string, unknown>
+        if (p.tilt === 'none' && String(p.waterlogged) === 'false') return st
+      }
+      return -1
+    })()
+    // a stone run with a leaf in it over a pit, then stone again past a 1-block gap
+    const w = new VoxelWorld({ x0: -2, y0: -8, z0: -2, x1: 10, y1: 4, z1: 2 })
+    w.fill(0, 0, 0, 2, 0, 0, STONE)
+    w.set(3, 0, 0, leaf)
+    w.fill(5, 0, 0, 7, 0, 0, STONE)
+    const res = solve(w, { x: 0, y: 1, z: 0 }, new GoalBlock(7, 1, 0), ext)
+    expect(res.status).to.equal('success')
+    for (const n of res.path) expect([n.x, n.z], 'a node over the leaf').to.not.deep.equal([3, 0])
+    // a corridor of powder snow: the way round is taken
+    const snow = mcData.blocksByName.powder_snow.minStateId as number
+    const c = new VoxelWorld({ x0: -2, y0: -2, z0: -3, x1: 8, y1: 4, z1: 3 })
+    c.fill(0, 0, -2, 6, 0, 2, STONE)
+    c.fill(3, 1, -1, 3, 2, 1, snow)
+    const round = solve(c, { x: 0, y: 1, z: 0 }, new GoalBlock(6, 1, 0), ext)
+    expect(round.status).to.equal('success')
+    for (const n of round.path) expect(n.x === 3 && Math.abs(n.z) <= 1, 'a node in the powder snow').to.equal(false)
   })
 
   it('scene 4: 1-block gap needs parkour; noPath with allowParkour=false', () => {

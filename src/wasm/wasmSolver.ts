@@ -1,13 +1,5 @@
-// Loader + runner for the Rust wasm solver core (rust/src/lib.rs). The JS
-// solver stays the REFERENCE implementation; the wasm core is an accelerator
-// for coordinate goals (the fastEvaluator set, plus GoalCompositeAny over
-// them) with no exclusion callbacks. Any load/instantiation failure degrades
-// silently to the JS path.
-//
-// The core keeps persistent state between solves: the snapshot grids and dig
-// tables stay RESIDENT in wasm memory keyed by (generation, patchCount) /
-// dig fingerprint, and the A* arena is epoch-stamped so repeat solves skip
-// both the input copies and the arena clear entirely.
+// Accelerate supported goals with the Rust wasm core; load failures fall back to JavaScript.
+// Snapshot and dig inputs stay resident by content key; epoch stamps avoid clearing search arrays.
 import type { GoalDescriptor, MovementsConfig, RawPathNode, DigData, SnapshotMeta } from '../types.js'
 import type { RawSolveResult } from '../solver.js'
 import { getParkourExtTable, serializeParkourTable } from '../parkourTable.js'
@@ -22,6 +14,11 @@ interface WasmExports {
   snap_heights_ptr (): number
   snap_states_ptr (): number
   snap_special_ptr (): number
+  snap_thin_begin (len: number): void
+  snap_thin_ptr (): number
+  ext_begin? (len: number): void
+  ext_ptr? (): number
+  ext_commit? (): number
   snap_set_meta (x0: number, y0: number, z0: number, w: number, h: number, l: number, worldMinY: number): void
   dig_begin (len: number): void
   dig_labor_ptr (): number
@@ -31,6 +28,7 @@ interface WasmExports {
   finalize (status: number): number
   result_ptr (): number
   arena_reserve (n: number, momentum: number): void
+  node_reached? (x: number, y: number, z: number): number
 }
 
 const GOAL_KINDS: Record<string, number> = {
@@ -53,15 +51,11 @@ interface GoalSpec {
 
 const MAX_GOAL_SPECS = 4096 // matches the solve_init cap in lib.rs
 
-/** The serialised extended-parkour table, built on first use (a process constant). */
+/** Extended-parkour table serialized on first use and shared across solves. */
 let cachedExtBlob: ArrayBuffer | null = null
 
-/**
- * Flatten a descriptor into wasm goal specs. Coordinate goals map 1:1;
- * compositeAny of (recursively) coordinate goals flattens exactly — min is
- * associative, so nested min-folds equal the flat one bit-for-bit. Null when
- * any leaf needs the JS path.
- */
+/** Flatten coordinate goals into wasm specs; compositeAny works because minimum is associative.
+ * Return null if any leaf needs JavaScript goal evaluation. */
 export function flattenGoalSpecs (d: GoalDescriptor): GoalSpec[] | null {
   const kind = GOAL_KINDS[d.type]
   if (kind !== undefined) {
@@ -98,8 +92,11 @@ export interface WasmSnapshotInput {
   heights: Uint8Array
   states: Uint16Array | null
   special?: Uint8Array | null
+  thin?: Uint8Array | null
   entityIdx: Int32Array
   entityWeight: Int32Array
+  /** Banned (from cell, to cell) move pairs (SnapshotView.bannedEdges). */
+  bannedEdges?: Int32Array | null
 }
 
 export interface WasmSolveOptions {
@@ -116,6 +113,8 @@ export class WasmSolver {
   private lastSnapKey: string | null = null
   /** Fingerprint of the dig tables currently resident in wasm memory. */
   private lastDigKey: string | null = null
+  /** Whether the extended-parkour table is resident in the core (ext_begin / ext_commit). */
+  private extResident = false
 
   private constructor (exports: WasmExports) {
     this.exports = exports
@@ -135,21 +134,18 @@ export class WasmSolver {
     }
   }
 
-  /**
-   * Pre-size the core's arena for a box of `cells` cells (see lib.rs
-   * arena_reserve). Grow-only, so calling it with a smaller number later is
-   * a no-op. Tolerates a core built without the export.
-   */
+  /** Grow the wasm search arrays to at least `cells`; no-op when the reserve export is absent. */
   reserve (cells: number): void {
     if (typeof this.exports.arena_reserve !== 'function') return
     this.exports.arena_reserve(Math.max(0, Math.floor(cells)), 1)
   }
 
-  /**
-   * Full solve loop with host-side slicing: between expansion batches the
-   * host checks its cancel flag + think budget and emits interim partials
-   * (same cadence contract as the JS solver path).
-   */
+  /** Whether the last solve reached a cell, for physics-hop discovery; false without the wasm export. */
+  reached (x: number, y: number, z: number): boolean {
+    return this.exports.node_reached !== undefined && this.exports.node_reached(x, y, z) === 1
+  }
+
+  /** Solve in batches, checking cancellation and budget and emitting interim partials between them. */
   solve (
     snap: WasmSnapshotInput,
     cfg: MovementsConfig,
@@ -161,10 +157,10 @@ export class WasmSolver {
     try {
       return this.solveInner(snap, cfg, goal, start, dig, opts)
     } catch (error) {
-      // Residency state may be inconsistent after a mid-upload/trap failure
-      // — force full re-upload on the next attempt.
+      // A partial upload or trap can invalidate residency; force a full upload next time.
       this.lastSnapKey = null
       this.lastDigKey = null
+      this.extResident = false
       throw error
     }
   }
@@ -188,25 +184,27 @@ export class WasmSolver {
     const specs = flattenGoalSpecs(goal)
     if (!specs) throw new Error(`wasm solver does not support goal type ${goal.type}`)
 
-    // ── snapshot residency: upload only when content changed ─────────────
     const statesLen = cfg.canDig && snap.states ? snap.states.length : 0
-    // Uploaded whenever present (bubble columns and/or climbable vines mark it).
     const specialLen = snap.special ? snap.special.length : 0
-    const snapKey = `${m.generation}:${m.patchCount}:${m.x0},${m.y0},${m.z0}:${m.w}x${m.h}x${m.l}:${statesLen}:${specialLen}`
+    const thinLen = snap.thin ? snap.thin.length : 0
+    const snapKey = `${m.generation}:${m.patchCount}:${m.x0},${m.y0},${m.z0}:${m.w}x${m.h}x${m.l}:${statesLen}:${specialLen}:${thinLen}`
     if (this.lastSnapKey !== snapKey) {
       this.lastSnapKey = null // a failure below must not leave a stale claim
       ex.snap_begin(n, statesLen, specialLen)
+      ex.snap_thin_begin(thinLen)
       const flagsPtr = ex.snap_flags_ptr()
       const heightsPtr = ex.snap_heights_ptr()
       const statesPtr = statesLen > 0 ? ex.snap_states_ptr() : 0
       const specialPtr = specialLen > 0 ? ex.snap_special_ptr() : 0
-      // snap_begin may have grown wasm memory — build the view after it.
+      const thinPtr = thinLen > 0 ? ex.snap_thin_ptr() : 0
+      // snap_begin can grow memory and detach existing views.
       const mem = new Uint8Array(ex.memory.buffer)
       mem.set(snap.flags, flagsPtr)
       mem.set(snap.heights, heightsPtr)
       if (statesLen > 0) {
         mem.set(new Uint8Array(snap.states!.buffer, snap.states!.byteOffset, statesLen * 2), statesPtr)
       }
+      if (thinLen > 0) mem.set(snap.thin!, thinPtr)
       if (specialLen > 0) {
         mem.set(snap.special!, specialPtr)
       }
@@ -215,7 +213,6 @@ export class WasmSolver {
       if (timing) uploadMs = performance.now() - startTime
     }
 
-    // ── dig residency: upload once per fingerprint ────────────────────────
     if (cfg.canDig && dig) {
       const digKey = dig.fingerprint ? `${dig.fingerprint}:${dig.labor.length}` : null
       if (digKey === null || this.lastDigKey !== digKey) {
@@ -230,20 +227,31 @@ export class WasmSolver {
       }
     }
 
-    // ── per-solve blobs: params + entity weights + parkour table ─────────
     const entityCount = snap.entityIdx.length
     const entitySize = entityCount * 8
-    const paramsSize = 4 * 4 + specs.length * 36 + 4 * 2 + 8 * 6 + 4 * 2 + 4 * 2
-    // The extended-parkour table travels with the solve so the core consumes
-    // the exact table the JS reference builds — one geometry source. It is a
-    // process constant (~25 KB), serialised once and re-uploaded per solve.
-    const extBlob = cfg.allowParkourExtended && cfg.allowParkour && cfg.allowSprinting
-      ? (cachedExtBlob ??= serializeParkourTable(getParkourExtTable(), J_RUN, J_LOW_RUN, J_CHAIN))
-      : null
-    // Allocs before any view — each may grow (and detach views of) wasm
-    // memory; resident snapshot/dig data stays valid (growth extends).
+    const bannedPairs = snap.bannedEdges != null ? snap.bannedEdges.length >> 1 : 0
+    const paramsSize = 4 * 4 + specs.length * 36 + 4 * 2 + 8 * 7 + 4 * 2 + 4 * 2 + 4 * 2
+    // Upload the process-constant parkour table once when residency exports exist.
+    const extWanted = cfg.allowParkourExtended && cfg.allowParkour && cfg.allowSprinting
+    let extBlob: ArrayBuffer | null = null
+    if (extWanted) {
+      cachedExtBlob ??= serializeParkourTable(getParkourExtTable(), J_RUN, J_LOW_RUN, J_CHAIN)
+      if (ex.ext_begin !== undefined && ex.ext_ptr !== undefined && ex.ext_commit !== undefined) {
+        if (!this.extResident) {
+          ex.ext_begin(cachedExtBlob.byteLength)
+          new Uint8Array(ex.memory.buffer).set(new Uint8Array(cachedExtBlob), ex.ext_ptr())
+          const rc = ex.ext_commit()
+          if (rc !== 0) throw new Error(`wasm ext_commit rejected the parkour table (code ${rc})`)
+          this.extResident = true
+        }
+      } else {
+        extBlob = cachedExtBlob
+      }
+    }
+    // Allocate before creating views: wasm memory growth detaches existing views.
     const entityPtr = entityCount > 0 ? ex.wasm_alloc(entitySize) : 0
     const extPtr = extBlob !== null ? ex.wasm_alloc(extBlob.byteLength) : 0
+    const bannedPtr = bannedPairs > 0 ? ex.wasm_alloc(bannedPairs * 8) : 0
     const paramsPtr = ex.wasm_alloc(paramsSize)
     if (extBlob !== null) {
       new Uint8Array(ex.memory.buffer).set(new Uint8Array(extBlob), extPtr)
@@ -256,6 +264,10 @@ export class WasmSolver {
         interleaved[i * 2 + 1] = snap.entityWeight[i]
       }
       new Uint8Array(ex.memory.buffer).set(new Uint8Array(interleaved.buffer), entityPtr)
+    }
+    if (bannedPairs > 0) {
+      const pairs = (snap.bannedEdges as Int32Array).slice(0, bannedPairs * 2)
+      new Uint8Array(ex.memory.buffer).set(new Uint8Array(pairs.buffer), bannedPtr)
     }
 
     const view = new DataView(ex.memory.buffer)
@@ -285,10 +297,13 @@ export class WasmSolver {
     i32(cfg.maxDropDown)
     f64(cfg.liquidCost); f64(cfg.entityCost); f64(cfg.digCost)
     f64(cfg.bubbleCost)
-    f64(ENVELOPE_SAFETY_MARGIN - (cfg.parkourSafetyMargin ?? ENVELOPE_SAFETY_MARGIN)) // margin credit
+    const marginCredit = ENVELOPE_SAFETY_MARGIN - (cfg.parkourSafetyMargin ?? ENVELOPE_SAFETY_MARGIN)
+    f64(marginCredit)
+    f64(cfg.allowParkourTight === false ? marginCredit : ENVELOPE_SAFETY_MARGIN) // tight-pass credit
     f64(opts.searchRadius)
     u32(entityPtr); u32(entityCount)
     u32(extPtr); u32(extBlob !== null ? extBlob.byteLength : 0)
+    u32(bannedPtr); u32(bannedPairs)
 
     try {
       const initT0 = timing ? performance.now() : 0
@@ -306,12 +321,7 @@ export class WasmSolver {
         return r
       }
 
-      // ── slice loop: cancel + budget between expansion batches ──────────
-      // 2048, not 16384: a batch is the cancel/partial granularity, and at
-      // ~20 µs an expansion the old batch let a replan's cancel queue behind
-      // up to ~330 ms of dead work while the "40 ms partial cadence" was
-      // never met on a route-book-sized solve. A performance.now() every
-      // 2048 expansions is noise.
+      // Small expansion batches bound cancellation delay and partial-path latency.
       const BATCH = 2048
       let lastPartial = performance.now()
       for (;;) {
@@ -337,6 +347,7 @@ export class WasmSolver {
       ex.wasm_free(paramsPtr, paramsSize)
       if (entityPtr) ex.wasm_free(entityPtr, entitySize)
       if (extPtr) ex.wasm_free(extPtr, (extBlob as ArrayBuffer).byteLength)
+      if (bannedPtr) ex.wasm_free(bannedPtr, bannedPairs * 8)
     }
   }
 
@@ -377,6 +388,10 @@ export class WasmSolver {
         useOne: (meta & 2) !== 0 ? { x, y, z } : null
       }
       if ((meta & 16) !== 0) node.run = true // META_RUN
+      if ((meta & 32) !== 0) {
+        // META_AIM: the AIM byte follows the meta byte (lib.rs serialize_result)
+        node.aim = view.getUint8(off); off += 1
+      }
       if ((meta & (4 | 8)) !== 0) {
         // META_BOUNCE / META_CHAIN: the via cell follows the meta byte
         // (lib.rs serialize_result), before the toBreak list.

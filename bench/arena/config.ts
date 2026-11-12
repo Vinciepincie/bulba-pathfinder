@@ -1,8 +1,8 @@
 // Shared paths / defaults for the real-world benchmark arena.
 //
 // Everything generated (Paper jar, trimmed world, server configs, results)
-// lives under `.run/` and is gitignored: the arena is reproducible from the
-// scripts plus a world download, never committed.
+// lives under `.run/` and is gitignored. The 2b2t routes are reproducible from
+// the scripts plus the world download; the imported courses are not.
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -25,10 +25,9 @@ export const ROUTES_FILE = join(ARENA_DIR, 'routes.json')
 export const HISTORY_FILE = join(ARENA_DIR, 'history.json')
 
 /**
- * Server version. 1.21.11 is the newest protocol mineflayer speaks
- * (minecraft-data 3.111.0) and is what the production bot runs, so the bots
- * connect natively — no translation layer between the thing under test and
- * the server. Human spectators on a newer client join through ViaVersion.
+ * Server version. The bots connect natively, with no translation layer
+ * between the thing under test and the server. Human spectators on a newer
+ * client join through ViaVersion.
  */
 export const MC_VERSION = process.env.ARENA_MC_VERSION ?? '1.21.11'
 

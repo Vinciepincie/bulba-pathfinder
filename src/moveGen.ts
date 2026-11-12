@@ -1,36 +1,25 @@
-// Neighbor generation: an exact port of mineflayer-pathfinder's
-// Movements.getNeighbors() with the walk moveset plus (opt-in) the full dig
-// cost model — canDig branches mirror upstream's safeToBreak/safeOrBreak
-// including dontCreateFlow and dontMineUnderFallingBlock. Block PLACEMENT
-// branches remain statically dead (no scaffolding) and are omitted. Costs,
-// probe order, thresholds and quirks are mirrored verbatim; the documented
-// improvement: real (non-iron) doors/open gates are traversable when
-// canOpenDoors && canOpenRealDoors.
-//
-// All probes are typed-array reads against the snapshot; neighbors are
-// written into preallocated arrays (including their world coordinates, so
-// the solver never pays an index-decode per neighbor) — zero allocation per
-// expansion on the walk-only path; dig moves allocate only their toBreak
-// lists, like upstream.
+// Snapshot probes and preallocated neighbor arrays avoid allocations on walk-only expansions.
+// Dig moves allocate only their block lists.
 import { LutFlags, LutSpecial, DigFlags } from './types.js';
 import type { MovementsConfig, SnapshotMeta, DigData } from './types.js';
-import { getParkourExtTable } from './parkourTable.js';
+import { getParkourExtTable, AIM_P0_MASK } from './parkourTable.js';
 import type { ParkourExtEntry, ParkourExtTable } from './parkourTable.js';
-import { J_RUN, J_LOW_RUN, runRow, J_CHAIN, CHAIN_MIN_COS, CHAIN_TAKEOFF_FRACTION, CHAIN_TURN_LOSS, LIP_PHASE, reachBucket, ENVELOPE_SAFETY_MARGIN, TAKEOFF_STAND, LAND_HALF, TAKEOFF_NARROW_MARGIN, LAND_NARROW_MARGIN, BOUNCE_APEX, BOUNCE_MAX_DROP, BOUNCE_MARGIN, BOUNCE_MARGIN_FAR } from './parkourEnvelope.js';
-import { CATCH_HALF } from './shapes.js';
+import { J_RUN, J_LOW_RUN, runRow, J_CHAIN, CHAIN_MIN_COS, CHAIN_TAKEOFF_FRACTION, CHAIN_TURN_LOSS, LIP_PHASE, TAKEOFF_RUN, reachBucket, ENVELOPE_SAFETY_MARGIN, TAKEOFF_STAND, LAND_HALF, TAKEOFF_NARROW_MARGIN, LAND_NARROW_MARGIN, BOUNCE_APEX, BOUNCE_MAX_DROP, BOUNCE_MARGIN, BOUNCE_MARGIN_FAR, J_LID8_RUN, J_LID13_RUN, J_LID3_RUN, FLIGHT_ROW, FREE_APEX } from './parkourEnvelope.js';
+import { CATCH_HALF, CARRY_SHIFT, carrySide, carryTouch, CARRY_W_NONE, CARRY_S_NONE, isLidByte } from './shapes.js';
+/** Maximum number of lids checked for one candidate jump. */
+const LID_MAX = 64;
+/** Flight rows selected by the feet height at which the head hits a lid. */
+function lidRows (cap: number): ReadonlyArray<readonly number[]> {
+    return cap >= FREE_APEX ? J_RUN : cap >= 1.2 - 1e-9 ? J_LID3_RUN : cap >= 1.0125 - 1e-9 ? J_LID13_RUN : cap >= 0.7 - 1e-9 ? J_LID8_RUN : J_LOW_RUN;
+}
 /** cos(angle) gate as an exact integer test: dot > 0 and dot² ≥ c²·|u|²·|v|². */
 const CHAIN_MIN_COS2 = CHAIN_MIN_COS * CHAIN_MIN_COS;
-/**
- * Momentum state (allowParkourMomentum, docs/VelocityInSearch.md): MOM_NONE,
- * or 1 + the packed PRIMITIVE flight direction (dx/g, dz/g) of the parkour
- * landing that reached the node — each component in [-6, 6]
- * (MAX_OFFSET_MAJOR), so a state is an exact direction, never a bin, and
- * the re-jump cone is the same integer test the compound chains use. The
- * wasm core packs it identically (lib.rs momentum_of).
- */
+/** Momentum is MOM_NONE or 1 + a packed primitive flight direction (dx/g, dz/g).
+ * Components lie in [-6, 6]; exact directions keep the re-jump cone consistent
+ * with compound chains. The WASM core uses the same packing. */
 export const MOM_NONE = 0;
-/** Deepest landing (rise, blocks) that still carries momentum: a jump's
- * 1.25 apex plus this is the 3-block fall vanilla starts hurting at. */
+/** Maximum drop retaining momentum: with the 1.25-block apex, this reaches
+ * vanilla's 3-block fall-damage threshold. */
 export const MOMENTUM_MAX_DROP = 1.75;
 const MOM_RANGE = 6;
 const MOM_SPAN = 2 * MOM_RANGE + 1;
@@ -50,19 +39,14 @@ export function momentumDx (m: number): number {
 export function momentumDz (m: number): number {
     return ((m - 1) % MOM_SPAN) - MOM_RANGE;
 }
-/**
- * Flight needed for offset (a, b) ≥ 0 from a takeoff point `s` along the
- * flight line with per-axis landing credit `lCred` — parkourEnvelope's
- * flightNeeded/takeoff pair for arbitrary credits (the narrow-support case;
- * the wasm core mirrors this arithmetic op for op).
- */
-function flightFrom (a: number, b: number, dist: number, s: number, lCred: number): number {
-    const dx = a - a / dist * s - lCred;
-    const dz = b - b / dist * s - lCred;
+/** Required flight from distance `s` along the flight line, with per-axis
+ * landing credits for narrow supports. */
+function flightFrom2 (a: number, b: number, dist: number, s: number, lCredX: number, lCredZ: number): number {
+    const dx = a - a / dist * s - lCredX;
+    const dz = b - b / dist * s - lCredZ;
     const px = dx > 0 ? dx : 0;
     const pz = dz > 0 ? dz : 0;
-    // sqrt of a sum, not hypot: correctly rounded everywhere, so JS and the
-    // wasm core cannot disagree on the last bit.
+    // Use sqrt rather than hypot so JavaScript and WASM agree on the last bit.
     return Math.sqrt(px * px + pz * pz);
 }
 export type StepExclusionFn = ((x: number, y: number, z: number) => number) | null
@@ -74,10 +58,15 @@ export interface SnapshotView {
   heights: Uint8Array
   entityIdx: Int32Array
   entityWeight: Int32Array
-  /** Raw state ids — required for canDig (dig tables key on state). */
+  /** Raw state IDs, required by the state-keyed dig tables when canDig is enabled. */
   states?: Uint16Array | null
-  /** LutSpecial byte per cell — required for useBubbleColumns. */
+  /** LutSpecial byte per cell, required for useBubbleColumns. */
   special?: Uint8Array | null
+  /** Thin footprint byte per cell for allowParkourExtended. */
+  thin?: Uint8Array | null
+  /** Forbidden moves as (from cell index, to cell index) pairs.
+   * The cells remain available to all other moves. */
+  bannedEdges?: Int32Array | null
 }
 
 export interface DigContext {
@@ -94,11 +83,76 @@ export const META_BOUNCE = 4;
 /** Momentum-chain move: jump to `via` (a stepping stone) and re-jump on the
  * landing tick to reach the node. Always paired with META_PARKOUR. */
 export const META_CHAIN = 8;
-/** The jump needs a RUN-UP: the standing (creep-to-the-lip) row cannot fly
- * it, only the running rows, a lip take-off or a chain can. Tells the
- * executor to line up a run instead of creeping to the corner and jumping
- * from rest. Always paired with META_PARKOUR. Never affects the search. */
+/** Extra flight required when a diagonal leaves an edge panel's empty side. */
+const OFF_PANEL_MARGIN = 0.3;
+/** Climbability uses the body centre, so a ladder catch needs the centre
+ * inside the cell: 0.5 blocks from its middle, rather than LAND_HALF's 0.8. */
+const LADDER_CATCH_OVERCREDIT = 0.3;
+/** A ladder-top takeoff requires climbing out and resting on the 3/16 strip;
+ * this adds the setup cost omitted by the climb moves. */
+const LADDER_TOP_COST = 2;
+/** A catch one block up tests climbability at the feet centre, so its
+ * landing credit is the cell's half-width less a margin. */
+const UP_CATCH_CREDIT = 0.45;
+/** Thin footprint interval classes in sixteenths. */
+const THIN_LO = [0, 0, 13, 7, 6, 5, 4, 0, 0, 0, 0, 7, 6, 5, 4, 0];
+const THIN_HI = [16, 3, 16, 9, 10, 11, 12, 9, 10, 11, 12, 16, 16, 16, 16, 16];
+/** Hitbox half-width a thin footprint is tested against (a centimetre of grace). */
+const THIN_BODY_HALF = 0.29;
+/** Whether segment P -> P+D enters the open rectangle [x0,x1] x [z0,z1]. */
+function segHits (px: number, pz: number, dx: number, dz: number, x0: number, x1: number, z0: number, z1: number): boolean {
+    let t0 = 0;
+    let t1 = 1;
+    if (dx === 0) {
+        if (px <= x0 || px >= x1)
+            return false;
+    }
+    else {
+        let e = (x0 - px) / dx;
+        let x = (x1 - px) / dx;
+        if (e > x) {
+            const sw = e;
+            e = x;
+            x = sw;
+        }
+        if (e > t0)
+            t0 = e;
+        if (x < t1)
+            t1 = x;
+    }
+    if (dz === 0) {
+        if (pz <= z0 || pz >= z1)
+            return false;
+    }
+    else {
+        let e = (z0 - pz) / dz;
+        let x = (z1 - pz) / dz;
+        if (e > x) {
+            const sw = e;
+            e = x;
+            x = sw;
+        }
+        if (e > t0)
+            t0 = e;
+        if (x < t1)
+            t1 = x;
+    }
+    return t1 - t0 > 1e-9;
+}
+/** Extra cost for a jump that requires the zero-margin envelope. */
+const TIGHT_COST = 6;
+/** Marks a jump requiring a run-up, lip takeoff or chain instead of a jump
+ * from rest. Executor information only; always paired with META_PARKOUR. */
 export const META_RUN = 16;
+/** Marks an aimed flight line with offset takeoff or landing points.
+ * outAim bits 0-6 hold the 1-based variant index; bit 7 marks a mirrored side.
+ * One mirrored axis flips the perpendicular; two do not.
+ * Executor information only; always paired with META_PARKOUR. */
+export const META_AIM = 32;
+/** Marks a drop into liquid deeper than maxDropDown with no return path.
+ * Descendants inherit this flag and cannot be endpoints of partial or noPath
+ * results, even when they are closer to the goal. */
+export const META_DEEP = 64;
 const SAFE = LutFlags.SAFE;
 const PHYSICAL = LutFlags.PHYSICAL;
 const LIQUID = LutFlags.LIQUID;
@@ -108,6 +162,9 @@ const DOOR_CLOSED = LutFlags.DOOR_CLOSED;
 const DOOR_OPEN = LutFlags.DOOR_OPEN;
 const GATE_OPEN = LutFlags.GATE_OPEN;
 const PASSABLE_WHEN_OPEN = DOOR_OPEN | GATE_OPEN;
+/** Small penalty beside fire, lava or cobwebs to prefer equally short paths
+ * with clearance, since momentum through a turn can carry the body into them. */
+const HAZARD_NEAR_COST = 0.01;
 const CAN_FALL = DigFlags.CAN_FALL;
 const CANT_BREAK = DigFlags.CANT_BREAK;
 const BUBBLE_UP = LutSpecial.BUBBLE_UP;
@@ -118,59 +175,39 @@ const SPECIAL_STAIR = LutSpecial.STAIR;
 /** Bubble-only semantics (float support, fall catching, no-jump) must not
  * fire on VINE/SLIME-marked cells. */
 const BUBBLE_MASK = BUBBLE_UP | BUBBLE_DOWN;
-// Cardinal + diagonal probe tables, upstream order (W, E, N, S / NW, SW, NE, SE).
+// Probe order: W, E, N, S, then NW, SW, NE, SE.
 const CARDINAL_X = [-1, 1, 0, 0];
 const CARDINAL_Z = [0, 0, -1, 1];
 const DIAGONAL_X = [-1, -1, 1, 1];
 const DIAGONAL_Z = [-1, 1, -1, 1];
-// Climb-transfer directions: cardinals then diagonals (same order as above).
 const TRANSFER_X = [-1, 1, 0, 0, -1, -1, 1, 1];
 const TRANSFER_Z = [0, 0, -1, 1, -1, 1, -1, 1];
 /** Transfer cost per direction: octile + 0.5 pad (|dy| is added per move). */
 const TRANSFER_COST = [1.5, 1.5, 1.5, 1.5, Math.SQRT2 + 0.5, Math.SQRT2 + 0.5, Math.SQRT2 + 0.5, Math.SQRT2 + 0.5];
-// Slime-bounce landing columns around the slime cell: the 8 neighbours,
-// then the 4 cells two out along a cardinal (a rebound drifts ~1 block by
-// the apex and a little more on the way down — parkourEnvelope.ts).
+// A rebound drifts about one block by its apex and farther while descending.
 const BOUNCE_X = [-1, 1, 0, 0, -1, -1, 1, 1, -2, 2, 0, 0];
 const BOUNCE_Z = [0, 0, -1, 1, -1, 1, -1, 1, 0, 0, -2, 2];
 const BOUNCE_OFFSETS = 12;
 const BOUNCE_RING1 = 8;
-/**
- * Upper bound on neighbours from one expansion, derived rather than guessed.
- *
- * Base moveset: 4 cardinals x {forward, jumpUp, dropDown} + 4 diagonals +
- * moveDown + moveUp + the two bubble rides = 20. Extended parkour adds the
- * whole table: every diagonal entry in 4 quadrants, every pure-x entry in 2
- * directions, every pure-z entry in 2.
- *
- * The old fixed 160 was 8 short of today's table (32*4 + 5*2 + 5*2 + 20 =
- * 168). Overflowing a typed array does not throw — the writes are silently
- * dropped while `outCount` keeps counting — so the solver read undefined
- * coordinates for the last neighbours of a fully-loaded node and relaxed
- * them as NaN. Deriving the size means enlarging the table can never
- * reintroduce that.
- */
+/** Derive neighbor capacity from the moveset: typed-array overflow silently
+ * drops writes while outCount continues, leaving invalid coordinates. */
 function outCapacity (extended: boolean): number {
-    // Without the table, upstream's cardinal parkour runs instead, and its
-    // "down" branch can push a landing at each of d = 2, 3 and 4 in the same
-    // direction — 12 more than the 20 above.
+    // Cardinal parkour can emit three drop landings per direction,
+    // adding 12 edges to the 20 base moves.
     const base = extended ? 20 : 32;
     if (!extended)
         return base;
     const t = getParkourExtTable();
-    // Extended also adds climb transfers (8 directions × 3 dy), slime bounces
-    // (BOUNCE_OFFSETS per drop landing, 5 drop generators) and momentum
-    // chains: per parkour landing, every table entry within the angle gate —
-    // bounded by the full table again per landing, and the landings by the
-    // table; the chain set is far sparser in practice (stepping stones only),
-    // so a generous fixed allowance is kept rather than the product.
+    // Reserve 8 directions x 3 heights for climb transfers and five sets of
+    // bounce targets. Sparse stepping-stone chains use a fixed allowance
+    // rather than the product of all possible first and second jumps.
     const table = t.diag.length * 4 + t.cardX.length * 2 + t.cardZ.length * 2;
     return table + base + 24 + BOUNCE_OFFSETS * 5 + CHAIN_CAP;
 }
-/** Upper bound on momentum-chain edges per expansion (see outCapacity). */
+/** Upper bound on momentum-chain edges per expansion. */
 const CHAIN_CAP = 256;
 export class MoveGen {
-    /** Output arrays for one expansion — see outCapacity(). */
+    /** Output arrays for one expansion, sized by outCapacity(). */
   readonly outIdx!: Int32Array
   readonly outX!: Int32Array
   readonly outY!: Int32Array
@@ -181,22 +218,39 @@ export class MoveGen {
   readonly outBreaks!: Array<number[] | null>
     /** Slime stand cell (index) a META_BOUNCE neighbour drops onto; -1 otherwise. */
   readonly outVia!: Int32Array
-    /** Momentum the neighbour arrives with (MOM_NONE unless a support landing
-     * with allowParkourMomentum on). */
+    /** AIM byte of an aimed parkour move (META_AIM), 0 otherwise. */
+  readonly outAim!: Uint8Array
+    /** Arrival momentum; MOM_NONE unless momentum is enabled for a support landing. */
   readonly outMom!: Uint8Array
   outCount = 0
-    /** Set by slimeBounce for the push it is about to make. */
+    /** Slime stand cell for the next push. */
   private pendingVia = -1
-    /** Set by parkourExtTarget for the landing it is about to push. */
+    /** Aimed variant for the next push. */
+  private pendingAim = 0
+  /** Whether the head+1 lid lies inside the takeoff support panel's strip. */
+  private lidHere = false
+  /** Forbidden cell-index pairs, or null when none exist. */
+  private readonly bannedEdges: Int32Array | null = null
+  /** Current source cell of a banned edge, or -1 when no banned edge leaves it. */
+  private bannedFrom = -1
+    /** Arrival momentum for the next push. */
   private pendingMom = MOM_NONE
-    /** allowParkourMomentum && parkourExtended: landings carry momentum. */
+    /** The centre line's landing (node y, support y), reused by its aimed variants. */
+    private extLandY = 0
+    private extLandSupY = NaN
+    private extLandLid1 = false
+    /** Aimed variants to try after a corridor refusal: bit v selects variant v; 0 means none. */
+  private extTryMask = 0
+    /** Whether the candidate is a climbable catch one block above flight level. */
+  private extUpCatch = false
+    /** Whether extended parkour landings carry momentum. */
   readonly parkourMomentum!: boolean
-    /** Momentum of the node being expanded (set per generate()). */
+    /** Momentum of the node being expanded. */
   private momIn = MOM_NONE
   private momDx = 0
   private momDz = 0
   private momD2 = 0
-    /** Set when any probe left the snapshot — a noPath may be growth-fixable. */
+    /** A probe leaves the snapshot; expanding it may resolve a noPath result. */
   boundaryTouched = false
   private readonly flags!: Uint8Array
   private readonly heights!: Uint8Array
@@ -211,7 +265,7 @@ export class MoveGen {
   private readonly stepExclusion!: StepExclusionFn
   private readonly allowParkour!: boolean
   private readonly allowSprinting!: boolean
-    /** allowParkourExtended && allowParkour && allowSprinting (all jumps need sprint). */
+    /** Extended parkour requires parkour and sprinting to be enabled. */
   private readonly parkourExtended!: boolean
     /** Generated offset/corridor table (null when the feature is off). */
   private readonly extTable!: ParkourExtTable | null
@@ -221,13 +275,15 @@ export class MoveGen {
   private readonly infiniteLiquidDropdownDistance!: boolean
   private readonly liquidCost!: number
   private readonly entityCost!: number
-    // ── bubble columns (null when useBubbleColumns is off — zero overhead) ──
   private readonly special!: Uint8Array | null
+    /** Thin footprint grid (null without the extended repertoire). */
+  private readonly thin!: Uint8Array | null
   private readonly bubbleCost!: number
     /** Added to every usable-flight row: ENVELOPE_SAFETY_MARGIN − the profile's
      * parkourSafetyMargin (0 at the default; positive plans tighter jumps). */
   private readonly marginCredit!: number
-    // ── digging (null when canDig is off — the hot path never touches it) ──
+    /** Tight-pass margin credit; equal to marginCredit when allowParkourTight is disabled. */
+  private readonly tightCredit!: number
   private readonly dig!: DigContext | null
   private readonly digCost!: number
   private readonly dontCreateFlow!: boolean
@@ -255,6 +311,8 @@ export class MoveGen {
         else {
             this.entityMap = null;
         }
+        if (snap.bannedEdges != null && snap.bannedEdges.length >= 2)
+            this.bannedEdges = snap.bannedEdges;
         this.stepExclusion = stepExclusion;
         this.allowParkour = cfg.allowParkour;
         this.allowSprinting = cfg.allowSprinting;
@@ -269,6 +327,7 @@ export class MoveGen {
         this.outMeta = new Uint8Array(cap);
         this.outBreaks = new Array(cap).fill(null);
         this.outVia = new Int32Array(cap).fill(-1);
+        this.outAim = new Uint8Array(cap);
         this.outMom = new Uint8Array(cap);
         this.parkourMomentum = this.parkourExtended && cfg.allowParkourMomentum === true;
         this.canOpenDoors = cfg.canOpenDoors;
@@ -277,17 +336,18 @@ export class MoveGen {
         this.infiniteLiquidDropdownDistance = cfg.infiniteLiquidDropdownDistance;
         this.liquidCost = cfg.liquidCost;
         this.entityCost = cfg.entityCost;
-        // Presence of the grid is the signal — it exists only when a feature
-        // (bubble columns, climbable vines) marked cells into it.
+        // The grid exists only when a feature marks special cells.
         this.special = snap.special ?? null;
+        this.thin = snap.thin ?? null;
         this.bubbleCost = cfg.bubbleCost;
         this.marginCredit = ENVELOPE_SAFETY_MARGIN - (cfg.parkourSafetyMargin ?? ENVELOPE_SAFETY_MARGIN);
+        this.tightCredit = cfg.allowParkourTight === false ? this.marginCredit : ENVELOPE_SAFETY_MARGIN;
         this.dig = cfg.canDig ? dig : null;
         this.digCost = cfg.digCost;
         this.dontCreateFlow = cfg.dontCreateFlow;
         this.dontMineUnderFallingBlock = cfg.dontMineUnderFallingBlock;
     }
-    /** Cell index or -1 when out of the snapshot (upstream null-block). */
+    /** Cell index, or -1 outside the snapshot. */
   cellIndex (x: number, y: number, z: number): number {
         const lx = x - this.x0;
         const ly = y - this.y0;
@@ -302,27 +362,79 @@ export class MoveGen {
         const idx = this.cellIndex(x, y, z);
         return idx < 0 ? 0 : this.flags[idx];
     }
-    /** Absolute collision-top height of the cell (upstream b.height). The
-     * height byte is packed — bits 6–7 carry the top-catch class (types.ts). */
+    /** Neighbor probe that leaves the boundary flag untouched because no move enters it. */
+  private cellIndexQuiet (x: number, y: number, z: number): number {
+        const lx = x - this.x0;
+        const ly = y - this.y0;
+        const lz = z - this.z0;
+        if (lx < 0 || lx >= this.w || ly < 0 || ly >= this.h || lz < 0 || lz >= this.l) return -1;
+        return (ly * this.l + lz) * this.w + lx;
+    }
+    /** Fire, lava and cobwebs have no collision box to deflect the body.
+     * A diagonal can cut their corners by up to 0.21 blocks. */
+  private hazardAt (x: number, y: number, z: number): boolean {
+        const idx = this.cellIndexQuiet(x, y, z);
+        if (idx < 0) return false;
+        return (this.flags[idx] & (SAFE | PHYSICAL | PASSABLE_WHEN_OPEN)) === 0 && (this.heights[idx] & 63) === 0;
+    }
+    /** Whether any of the eight neighbors at feet or head height is a hazard. */
+  private hazardNear (x: number, y: number, z: number, idx: number): boolean {
+        let m = this.nearHazard;
+        if (m === null) m = this.nearHazard = new Uint8Array(this.flags.length);
+        const v = m[idx];
+        if (v !== 0) return v === 2;
+        let near = false;
+        for (let dy = 0; dy <= 1 && !near; dy++) {
+            for (let dz = -1; dz <= 1 && !near; dz++) {
+                for (let dx = -1; dx <= 1; dx++) {
+                    if ((dx !== 0 || dz !== 0) && this.hazardAt(x + dx, y + dy, z + dz)) { near = true; break; }
+                }
+            }
+        }
+        m[idx] = near ? 2 : 1;
+        return near;
+    }
+    /** Absolute collision-top height; bits 6-7 of the height byte store the top-catch class. */
   heightAt (x: number, y: number, z: number): number {
         const idx = this.cellIndex(x, y, z);
         return idx < 0 ? y : y + (this.heights[idx] & 63) / 32;
     }
-    /** topCatchClass of the cell's block (0 = full/wide … 3 = unstandable). */
+    /** Top-catch class: 0 for full/wide supports through 3 for unstandable blocks. */
   private catchAt (x: number, y: number, z: number): number {
         const idx = this.cellIndex(x, y, z);
         return idx < 0 ? 0 : this.heights[idx] >> 6;
     }
-    /** Upstream block.safe, plus the open-door/open-gate improvement when enabled. */
+    /** Narrow-support position within its cell; 0 means centred. */
+  private carryAt (x: number, y: number, z: number): number {
+        return this.specialAt(x, y, z) >> CARRY_SHIFT;
+    }
+  /** Reject lava beside airborne landings: LAND_HALF allows the body to
+     * land 0.3 blocks past the cell edge. Cells outside the snapshot do not
+     * count as hazards here; this check applies only to jumps. */
+  private lavaFlanked (tx: number, ny: number, tz: number): boolean {
+        for (let dx = -1; dx <= 1; dx++) {
+            for (let dz = -1; dz <= 1; dz++) {
+                if (dx === 0 && dz === 0)
+                    continue;
+                for (let ly = ny; ly <= ny + 1; ly++) {
+                    const idx = this.cellIndex(tx + dx, ly, tz + dz);
+                    if (idx < 0)
+                        continue;
+                    const f = this.flags[idx];
+                    if ((f & LIQUID) !== 0 && (f & SAFE) === 0)
+                        return true;
+                }
+            }
+        }
+        return false;
+    }
+  /** Whether a cell is safe, including open doors and gates when enabled. */
   private isSafe (f: number): boolean {
         return (f & SAFE) !== 0 || (this.doorMode && (f & PASSABLE_WHEN_OPEN) !== 0);
     }
-    /**
-     * Tall stand (extended parkour): the fence/wall/closed-gate class —
-     * excluded from PHYSICAL by upstream because a 1.5 top can't be stepped or
-     * jumped onto from its own level, yet a real support: feet rest ON its
-     * top, 0.5 into the cell above. `hByte` is the packed height byte.
-     */
+    /** Fence, wall and closed-gate tops support the feet 0.5 blocks into the
+     * cell above, although their 1.5-block height excludes them from PHYSICAL.
+     * hByte is the packed height byte. */
   private isTallStand (f: number, hByte: number): boolean {
         return (f & (SAFE | PHYSICAL | LIQUID)) === 0 && (hByte & 63) > 32;
     }
@@ -330,16 +442,12 @@ export class MoveGen {
         const idx = this.cellIndex(x, y, z);
         return idx >= 0 && this.isTallStand(this.flags[idx], this.heights[idx]);
     }
-    /**
-     * Thin walk-in floor (carpet class): SAFE + PHYSICAL, not a climbable.
-     * Feet stand IN this cell on its sub-block shape — never ON TOP of it as
-     * a full block. Every "PHYSICAL ⇒ land at cell+1" site must branch here,
-     * or carpeted floors produce landings one block up in the air.
-     */
+    /** Thin floors support the feet inside their cell. Treating them as full
+     * blocks places the landing one block above the floor. */
   private isThinFloor (f: number): boolean {
         return (f & (SAFE | PHYSICAL | CLIMBABLE)) === (SAFE | PHYSICAL);
     }
-    /** LutSpecial byte of the cell (0 when the feature is off / out of box). */
+    /** LutSpecial byte, or 0 outside the snapshot or when disabled. */
   private specialAt (x: number, y: number, z: number): number {
         if (this.special === null)
             return 0;
@@ -357,18 +465,16 @@ export class MoveGen {
   private exclusionAt (x: number, y: number, z: number): number {
         return this.stepExclusion === null ? 0 : this.stepExclusion(x, y, z);
     }
-    /** Reset the per-move toBreak scratch — every generator calls this first. */
+    /** Reset the break list before generating each move. */
   private beginMove (): void {
         if (this.moveBreaks.length > 0)
             this.moveBreaks = [];
     }
-    /**
-     * Upstream safeToBreak() against the snapshot (only reached when canDig).
-     */
+    /** Whether a block can be broken safely when canDig is enabled. */
   private safeToBreak (x: number, y: number, z: number, idx: number): boolean {
         const dig = this.dig!;
         if (this.dontCreateFlow) {
-            // false if next to liquid (above + 4 lateral), upstream order.
+            // Liquids above or beside the block can flow into the opening.
             if ((this.flagsAt(x, y + 1, z) & LIQUID) !== 0)
                 return false;
             if ((this.flagsAt(x - 1, y, z) & LIQUID) !== 0)
@@ -394,11 +500,8 @@ export class MoveGen {
             return false;
         return true;
     }
-    /**
-     * Upstream safeOrBreak(): exclusion + entity weight when the block is
-     * safe; with canDig, unsafe-but-breakable blocks cost their dig labor and
-     * are recorded in the per-move toBreak scratch; otherwise a flat 100.
-     */
+    /** Safe cells cost exclusion plus entity weight. Breakable unsafe cells
+     * cost dig labor and enter the break list; other unsafe cells cost 100. */
   private safeOrBreak (x: number, y: number, z: number): number {
         let cost = this.exclusionAt(x, y, z);
         cost += this.entitiesAt(x, y, z) * this.entityCost;
@@ -418,12 +521,24 @@ export class MoveGen {
         cost += dig.data.labor[dig.states[idx]] * this.digCost;
         return cost;
     }
+  /** Cached hazard proximity: 0 unknown, 1 clear, 2 beside a hazard. */
+  private nearHazard: Uint8Array | null = null;
   private push (x: number, y: number, z: number, cost: number, meta: number): void {
         const mom = this.pendingMom;
         this.pendingMom = MOM_NONE;
         const idx = this.cellIndex(x, y, z);
         if (idx < 0)
-            return; // target outside snapshot — boundaryTouched already set
+            return; // Out-of-snapshot target; boundaryTouched is already set.
+        if (this.bannedFrom >= 0 && this.edgeBanned(idx)) {
+            // Discard pending metadata together with the banned edge.
+            this.pendingVia = -1;
+            this.pendingAim = 0;
+            if (this.moveBreaks.length > 0)
+                this.moveBreaks = [];
+            return;
+        }
+        if (this.parkourExtended && this.hazardNear(x, y, z, idx))
+            cost += HAZARD_NEAR_COST;
         const i = this.outCount++;
         this.outIdx[i] = idx;
         this.outX[i] = x;
@@ -433,6 +548,8 @@ export class MoveGen {
         this.outMeta[i] = meta;
         this.outVia[i] = this.pendingVia;
         this.pendingVia = -1;
+        this.outAim[i] = this.pendingAim;
+        this.pendingAim = 0;
         this.outMom[i] = mom;
         if (this.moveBreaks.length > 0) {
             this.outBreaks[i] = this.moveBreaks;
@@ -442,37 +559,58 @@ export class MoveGen {
             this.outBreaks[i] = null;
         }
     }
-    /** Fills the out* arrays for the node at (x, y, z), upstream order. `mom`
-     * is the node's momentum state (MOM_NONE unless allowParkourMomentum). */
+  /** Whether the edge from bannedFrom to `to` is forbidden. */
+  private edgeBanned (to: number): boolean {
+        const e = this.bannedEdges as Int32Array;
+        for (let k = 0; k + 1 < e.length; k += 2) {
+            if (e[k] === this.bannedFrom && e[k + 1] === to)
+                return true;
+        }
+        return false;
+    }
+  /** Fill the output arrays for (x, y, z). `mom` is the node's momentum
+   * state, or MOM_NONE when momentum is disabled. */
   generate (x: number, y: number, z: number, mom: number = MOM_NONE): void {
         this.outCount = 0;
+        this.bannedFrom = -1;
+        if (this.bannedEdges !== null) {
+            // Reading the source cell must not set the boundary flag.
+            const lx = x - this.x0;
+            const ly = y - this.y0;
+            const lz = z - this.z0;
+            if (lx >= 0 && lx < this.w && ly >= 0 && ly < this.h && lz >= 0 && lz < this.l) {
+                const from = (ly * this.l + lz) * this.w + lx;
+                for (let k = 0; k + 1 < this.bannedEdges.length; k += 2) {
+                    if (this.bannedEdges[k] === from) {
+                        this.bannedFrom = from;
+                        break;
+                    }
+                }
+            }
+        }
         this.momIn = this.parkourMomentum ? mom : MOM_NONE;
         if (this.momIn !== MOM_NONE) {
             this.momDx = momentumDx(this.momIn);
             this.momDz = momentumDz(this.momIn);
             this.momD2 = this.momDx * this.momDx + this.momDz * this.momDz;
         }
-        // Extended-parkour takeoff gates are node-invariant — hoisted so a
-        // non-jumpable node (in water, no headroom) pays 3 probes, not 40.
+        // Takeoff eligibility is node-invariant, so check it once per expansion.
         let ext = false;
         let jumps = false;
         let h0 = 0;
         let lowTakeoff = false;
+        this.lidHere = false;
         if (this.parkourExtended) {
-            // No y+2 requirement: a blocked head+1 at the takeoff just puts the
-            // jump into the head-hitter class (bonked arc), like a real player
-            // jumping inside a 2-high tunnel. `ext` supersedes upstream's
-            // cardinal parkour at this node; `jumps` runs the table. They differ
-            // on a climbable cell: a body hanging on a ladder has no footing to
-            // jam from (the envelope was measured from solid ground), so it
-            // climbs, transfers (climbTransfers) or steps off instead — and
-            // upstream's flat-cost parkour must not fill that gap.
+            // A blocked head+1 produces a bonked arc rather than forbidding jumps.
+            // A body hanging on a ladder has no footing for the ground-based
+            // envelope; it must climb, transfer or step off instead.
             const f0 = this.flagsAt(x, y, z);
             ext = (f0 & LIQUID) === 0 && (this.specialAt(x, y, z) & BUBBLE_MASK) === 0;
             jumps = ext && (f0 & CLIMBABLE) === 0;
             if (jumps) {
                 h0 = this.heightAt(x, y - 1, z);
                 lowTakeoff = !this.isSafe(this.flagsAt(x, y + 2, z));
+                this.lidHere = lowTakeoff && this.lidInStrip(x, y, z);
             }
         }
         for (let i = 0; i < 4; i++) {
@@ -481,31 +619,19 @@ export class MoveGen {
             this.moveForward(x, y, z, dx, dz);
             this.moveJumpUp(x, y, z, dx, dz);
             this.moveDropDown(x, y, z, dx, dz);
-            // Upstream's cardinal parkour is SUPERSEDED by the extended table, not
-            // complemented by it. It charges a flat 1 for a jump covering up to four
-            // blocks — less than a single walking step, which makes the octile
-            // heuristic inadmissible and lets A* buy distance with jumps (2b2t
-            // spawn: a plan costing 74.1 against upstream's 76.6 that was 3.5 blocks
-            // LONGER to walk) — and it applies neither the reach envelope nor the
-            // swept-corridor clearance, so it re-offers, at a cheaper price, exactly
-            // the jumps parkourExtTarget just vetoed. Nor is coverage a reason to
-            // keep it: over 120 seeded worlds and 108k parkour-bearing nodes it
-            // reaches 22.5k targets the table does not, and a prismarine-physics
-            // rollout — from the cell centre, the take-off corner, and one and two
-            // blocks of run-up — can fly 1.1% of them. The rest are jumps the bot
-            // cannot make, each one a planned stall. docs/ExtendedParkour.md, and
-            // test/movegen.test.ts pins the supersession.
+            // The extended table replaces cardinal parkour: flat-cost jumps
+            // undercut the octile heuristic and bypass reach and corridor checks.
             if (this.allowParkour && !ext)
                 this.moveParkourForward(x, y, z, dx, dz);
             if (jumps) {
                 const tab = this.extTable!;
                 if (dx !== 0) {
                     for (const t of tab.cardX)
-                        this.parkourExtTarget(x, y, z, dx, 1, h0, lowTakeoff, t);
+                        this.extTarget(x, y, z, dx, 1, h0, lowTakeoff, t);
                 }
                 else {
                     for (const t of tab.cardZ)
-                        this.parkourExtTarget(x, y, z, 1, dz, h0, lowTakeoff, t);
+                        this.extTarget(x, y, z, 1, dz, h0, lowTakeoff, t);
                 }
             }
         }
@@ -513,12 +639,12 @@ export class MoveGen {
             this.moveDiagonal(x, y, z, DIAGONAL_X[i], DIAGONAL_Z[i]);
             if (jumps) {
                 for (const t of this.extTable!.diag) {
-                    this.parkourExtTarget(x, y, z, DIAGONAL_X[i], DIAGONAL_Z[i], h0, lowTakeoff, t);
+                    this.extTarget(x, y, z, DIAGONAL_X[i], DIAGONAL_Z[i], h0, lowTakeoff, t);
                 }
             }
         }
-        // With momentum in the search state the chain is a transition from the
-        // landing's own slot (parkourExtTarget), not a compound edge.
+        // With momentum in search state, the re-jump leaves the landing's own
+        // state rather than becoming a compound edge.
         if (jumps && !this.parkourMomentum)
             this.momentumChains(x, y, z);
         this.moveDown(x, y, z);
@@ -530,16 +656,9 @@ export class MoveGen {
         if (this.parkourExtended)
             this.climbTransfers(x, y, z);
     }
-    /**
-     * Improvement (allowParkourExtended): step from one climbable cell to an
-     * adjacent one — sideways along a wall, or diagonally round a pillar
-     * corner, one up, level or one down. This is how a spiral of ladders on a
-     * 1x1 pillar is climbed: press into the corner at the top of one ladder,
-     * drift round onto the next. A diagonal needs one open corner column to
-     * sweep through (the other is usually the pillar itself). Cost is octile
-     * + |dy| + 0.5, so the heuristic stays admissible. Not a parkour node —
-     * the executor's physics rollouts drive it like any climb.
-     */
+    /** Transfer between neighboring climbable cells, including pillar corners.
+     * A diagonal needs one open corner column for the body to sweep through.
+     * Octile distance + |dy| + 0.5 keeps the heuristic admissible. */
   private climbTransfers (x: number, y: number, z: number): void {
         const f0 = this.flagsAt(x, y, z);
         if ((f0 & CLIMBABLE) === 0 || !this.isSafe(f0) || !this.climbUsable(x, y, z))
@@ -581,23 +700,15 @@ export class MoveGen {
             return true;
         return this.isSafe(this.flagsAt(cx, y + dy, cz)) && this.isSafe(this.flagsAt(cx, y + dy + 1, cz));
     }
-    /**
-     * Improvement (allowParkourExtended): slime bounce. A drop of `d ≥ 2` onto
-     * the slime stand cell (sx, sy, sz) — just generated by the caller — is
-     * ALSO an edge to every landing the rebound can reach: a support in one of
-     * the 12 columns around the slime whose top sits above the slime and at or
-     * under the bounce apex (BOUNCE_APEX, prismarine-physics-derived), with
-     * the column and the head cells passable. Ring-1 targets get the apex
-     * minus BOUNCE_MARGIN; ring-2 ones give up a block for the drift. The edge
-     * is A → C with the slime as `via`, so the search never has to know how
-     * much fall energy a node arrived with. Cost = octile + |dy| + 1 from the
-     * takeoff, which keeps the heuristic admissible.
-     */
+    /** Connect a drop of at least two blocks to landings reachable by the slime
+     * rebound, with the slime cell as `via` so search state needs no fall energy.
+     * Outer-ring targets reserve more height for drift; octile distance + |dy|
+     * + 1 keeps the heuristic admissible. */
   private slimeBounce (x: number, y: number, z: number, sx: number, sy: number, sz: number): void {
         const supIdx = this.cellIndex(sx, sy - 1, sz);
         if (supIdx < 0 || (this.special as Uint8Array)[supIdx] !== SPECIAL_SLIME)
             return;
-        // A dry landing on the slime top — water over it damps the rebound.
+        // Water over the slime damps the rebound.
         if ((this.flagsAt(sx, sy, sz) & LIQUID) !== 0)
             return;
         const d = y - sy;
@@ -609,7 +720,6 @@ export class MoveGen {
             const cx = sx + BOUNCE_X[i];
             const cz = sz + BOUNCE_Z[i];
             const maxTop = sy + apex - (i < BOUNCE_RING1 ? BOUNCE_MARGIN : BOUNCE_MARGIN_FAR);
-            // Highest cell whose top could still be under the apex.
             const lid = Math.floor(maxTop);
             if (lid < sy)
                 continue;
@@ -669,11 +779,8 @@ export class MoveGen {
             this.push(cx, nodeY, cz, cost, META_PARKOUR | META_BOUNCE);
         }
     }
-    /**
-     * Improvement (useBubbleColumns): ride one block up an up-column. The
-     * target cell (y+1) is the current head cell — already passable — so like
-     * moveUp only the NEW head cell (y+2) is charged.
-     */
+    /** Ride up one block; the target is the current head cell, so only the
+     * new head cell adds clearance cost. */
   private moveBubbleUp (x: number, y: number, z: number): void {
         this.beginMove();
         if (this.specialAt(x, y, z) !== BUBBLE_UP)
@@ -684,7 +791,7 @@ export class MoveGen {
             return;
         this.push(x, y + 1, z, cost, 0);
     }
-    /** Improvement (useBubbleColumns): sink one block down a down-column. */
+    /** Sink one block in a downward bubble column. */
   private moveBubbleDown (x: number, y: number, z: number): void {
         this.beginMove();
         if (this.specialAt(x, y, z) !== BUBBLE_DOWN)
@@ -699,18 +806,16 @@ export class MoveGen {
         this.beginMove();
         const fC = this.flagsAt(x + dx, y, z + dz);
         const fD = this.flagsAt(x + dx, y - 1, z + dz);
-        let cost = 1; // move cost
+        let cost = 1; 
         cost += this.exclusionAt(x + dx, y, z + dz);
-        // Upstream's !blockD.physical && !blockC.liquid branch is pure block
-        // placement — dead with zero scaffolding, so such a move is impossible.
-        // Improvement (useBubbleColumns): a bubble cell floats you like water.
+        // Without scaffolding, unsupported moves require water or bubble support.
         if ((fD & PHYSICAL) === 0 && (fC & LIQUID) === 0 &&
             (this.specialAt(x + dx, y, z + dz) & BUBBLE_MASK) === 0) {
             if (!this.parkourExtended)
                 return;
             if (this.tallStandAt(x + dx, y - 1, z + dz)) {
-                // Walk onto a fence/wall top sunk one below (top 0.5 above this
-                // floor — within step height), feet then 0.5 into the target cell.
+                // A fence or wall one cell below is within step height;
+                // the feet rest 0.5 blocks into the target cell.
                 if (this.heightAt(x + dx, y - 1, z + dz) - this.heightAt(x, y - 1, z) > 0.6)
                     return;
                 if (!this.isSafe(this.flagsAt(x + dx, y + 2, z + dz)))
@@ -719,18 +824,15 @@ export class MoveGen {
             else if ((fC & CLIMBABLE) === 0 || !this.isSafe(fC) || !this.climbUsable(x + dx, y, z + dz)) {
                 return;
             }
-            // else: step into a free-hanging ladder/vine cell — it catches.
         }
         else if (this.isThinFloor(fD)) {
-            // A thin floor one below is a step DOWN into that cell — moveDropDown
-            // produces the correct node; a same-level node here would float.
+            // A thin floor below needs a drop move; a same-level node would float.
             return;
         }
         const activatable = (fC & GATE) !== 0 || (this.doorMode && (fC & DOOR_CLOSED) !== 0);
         const throughClosedDoor = this.canOpenDoors && this.doorMode && (fC & DOOR_CLOSED) !== 0;
-        // blockB — the head cell. A closed door is TWO blocks tall: activating
-        // the lower half opens both, so in door mode the closed UPPER half must
-        // not veto the move (exclusion/entity weights still apply).
+        // Opening a door's lower half also opens its upper half. In door mode,
+        // the upper half must retain exclusion and entity costs without vetoing entry.
         const fB = this.flagsAt(x + dx, y + 1, z + dz);
         if (throughClosedDoor && (fB & DOOR_CLOSED) !== 0) {
             cost += this.exclusionAt(x + dx, y + 1, z + dz);
@@ -746,7 +848,7 @@ export class MoveGen {
             meta = META_USEONE;
         }
         else {
-            cost += this.safeOrBreak(x + dx, y, z + dz); // blockC
+            cost += this.safeOrBreak(x + dx, y, z + dz); 
             if (cost > 100)
                 return;
         }
@@ -760,8 +862,8 @@ export class MoveGen {
         const fH = this.flagsAt(x + dx, y + 2, z + dz);
         const fB = this.flagsAt(x + dx, y + 1, z + dz);
         const fC = this.flagsAt(x + dx, y, z + dz);
-        let cost = 2; // move cost (move+jump)
-        // Entity-above checks, upstream verbatim (falling-entity safety).
+        let cost = 2; 
+        // Entities above a removed support can fall into the jump path.
         if ((fA & PHYSICAL) !== 0 && this.entitiesAt(x, y + 3, z) > 0)
             return;
         if ((fH & PHYSICAL) !== 0 && this.entitiesAt(x + dx, y + 3, z + dz) > 0)
@@ -769,47 +871,46 @@ export class MoveGen {
         if ((fB & PHYSICAL) !== 0 && (fH & PHYSICAL) === 0 && (fC & PHYSICAL) === 0 &&
             this.entitiesAt(x + dx, y + 2, z + dz) > 0)
             return;
-        // Upstream's !blockC.physical branch requires placing — impossible here.
         if ((fC & PHYSICAL) === 0) {
-            // Extended: a fence/wall top is a stand too — feet land 0.5 into the
-            // node cell, so the head needs the cell above the usual pair.
+            // A fence or wall raises the feet 0.5 blocks into the node cell,
+            // so the head needs clearance one cell higher.
             if (!this.parkourExtended || !this.tallStandAt(x + dx, y, z + dz))
                 return;
             if (!this.isSafe(this.flagsAt(x + dx, y + 3, z + dz)))
                 return;
         }
         else if (this.isThinFloor(fC)) {
-            // A thin floor at the target feet cell is same-level ground (moveForward
-            // walks into it) — "jumping onto" it would land in the air above.
+            // A thin floor at feet level is walkable; jumping onto it would land in air.
             return;
         }
         else if (this.parkourExtended && (fC & CLIMBABLE) !== 0) {
-            // A ladder classifies as physical, so this would be a jump onto its
-            // 3/16-deep top edge. The extended repertoire reaches a ladder by
-            // stepping or jumping INTO its cell and climbing, never by hopping
-            // between edges — a plan the executor cannot fly.
+            // A ladder is physical, but its 3/16 top edge is not a viable hop
+            // target here. Enter the climbable cell instead.
             return;
         }
         const hC = this.heightAt(x + dx, y, z + dz);
         const h0 = this.heightAt(x, y - 1, z);
         if (hC - h0 > 1.2)
-            return; // Too high to jump
-        cost += this.safeOrBreak(x, y + 2, z); // blockA
+            return; 
+        let latched = false;
+        // Only the panel's open side permits this takeoff; leaving its end
+        // would require walking into the target block first.
+        if (!this.isSafe(fA) && this.parkourExtended && this.lidInStrip(x, y, z) && carrySide(this.carryAt(x, y - 1, z), dx, dz) === 1)
+            latched = true; // The ground flag persists on the tick the body leaves the strip.
+        else
+            cost += this.safeOrBreak(x, y + 2, z); 
         if (cost > 100)
             return;
-        cost += this.safeOrBreak(x + dx, y + 2, z + dz); // blockH
+        cost += this.safeOrBreak(x + dx, y + 2, z + dz); 
         if (cost > 100)
             return;
-        cost += this.safeOrBreak(x + dx, y + 1, z + dz); // blockB
+        cost += this.safeOrBreak(x + dx, y + 1, z + dz); 
         if (cost > 100)
             return;
-        this.push(x + dx, y + 1, z + dz, cost, 0);
+        this.push(x + dx, y + 1, z + dz, cost, latched ? META_PARKOUR : 0);
     }
-    /**
-     * Upstream getLandingBlock: scan down from (dx, -2, dz). Returns the
-     * landing STAND cell y (already +1 above the physical block, or the liquid
-     * cell itself), or NaN when there is no landing.
-     */
+    /** Scan down for a landing node: above a support or inside a catching cell.
+     * Return NaN when no landing is available. */
   private findLanding (x: number, y: number, z: number, dx: number, dz: number): number {
         const lx = x + dx;
         const lz = z + dz;
@@ -817,14 +918,14 @@ export class MoveGen {
         while (ly > this.worldMinY) {
             const idx = this.cellIndex(lx, ly, lz);
             if (idx < 0)
-                return NaN; // upstream null block → while condition fails → null
+                return NaN; 
             const f = this.flags[idx];
             if ((f & LIQUID) !== 0 && this.isSafe(f))
                 return ly;
-            // Improvement (useBubbleColumns): a column catches the fall like water.
+            // Bubble columns catch falls like water.
             if (this.special !== null && (this.special[idx] & BUBBLE_MASK) !== 0)
                 return ly;
-            // Extended: a ladder/vine below catches the drop (like findExtLanding).
+            // A usable ladder or vine can catch the drop.
             if (this.parkourExtended && (f & CLIMBABLE) !== 0 && this.isSafe(f) && this.climbUsable(lx, ly, lz)) {
                 if (y - ly <= this.maxDropDown)
                     return ly;
@@ -841,8 +942,7 @@ export class MoveGen {
                     return ly + 1;
                 return NaN;
             }
-            // Extended: a fence/wall top is a stand — feet 0.5 into the cell
-            // above it, head reaching one cell further up.
+            // A fence or wall raises the feet and head 0.5 blocks into the cells above.
             if (this.parkourExtended && this.isTallStand(f, this.heights[idx])) {
                 if (y - ly <= this.maxDropDown && this.isSafe(this.flagsAt(lx, ly + 3, lz)))
                     return ly + 1;
@@ -856,25 +956,25 @@ export class MoveGen {
     }
   private moveDropDown (x: number, y: number, z: number, dx: number, dz: number): void {
         this.beginMove();
-        let cost = 1; // move cost
+        let cost = 1; 
         const landY = this.findLanding(x, y, z, dx, dz);
         if (Number.isNaN(landY))
             return;
         if (!this.infiniteLiquidDropdownDistance && (y - landY) > this.maxDropDown)
             return;
-        cost += this.safeOrBreak(x + dx, y + 1, z + dz); // blockB
+        cost += this.safeOrBreak(x + dx, y + 1, z + dz); 
         if (cost > 100)
             return;
-        cost += this.safeOrBreak(x + dx, y, z + dz); // blockC
+        cost += this.safeOrBreak(x + dx, y, z + dz); 
         if (cost > 100)
             return;
-        cost += this.safeOrBreak(x + dx, y - 1, z + dz); // blockD
+        cost += this.safeOrBreak(x + dx, y - 1, z + dz); 
         if (cost > 100)
             return;
         if ((this.flagsAt(x + dx, y, z + dz) & LIQUID) !== 0)
-            return; // dont go underwater
+            return; 
         cost += this.entitiesAt(x + dx, landY, z + dz) * this.entityCost;
-        this.push(x + dx, landY, z + dz, cost, 0);
+        this.push(x + dx, landY, z + dz, cost, (y - landY) > this.maxDropDown ? META_DEEP : 0);
         if (this.parkourExtended && this.special !== null)
             this.slimeBounce(x, y, z, x + dx, landY, z + dz);
     }
@@ -883,17 +983,17 @@ export class MoveGen {
         // Can't descend against an up-column's push (ride edges handle columns).
         if (this.specialAt(x, y, z) === BUBBLE_UP)
             return;
-        let cost = 1; // move cost
+        let cost = 1; 
         const landY = this.findLanding(x, y, z, 0, 0);
         if (Number.isNaN(landY))
             return;
-        cost += this.safeOrBreak(x, y - 1, z); // block0 — with canDig: dig straight down
+        cost += this.safeOrBreak(x, y - 1, z); 
         if (cost > 100)
             return;
         if ((this.flagsAt(x, y, z) & LIQUID) !== 0)
-            return; // dont go underwater
+            return; 
         cost += this.entitiesAt(x, landY, z) * this.entityCost;
-        this.push(x, landY, z, cost, 0);
+        this.push(x, landY, z, cost, (y - landY) > this.maxDropDown ? META_DEEP : 0);
         if (this.parkourExtended && this.special !== null)
             this.slimeBounce(x, y, z, x, landY, z);
     }
@@ -904,16 +1004,23 @@ export class MoveGen {
             return;
         if (this.entitiesAt(x, y, z) > 0)
             return;
-        let cost = 1; // move cost
-        cost += this.safeOrBreak(x, y + 2, z); // block2
+        let cost = 1; 
+        cost += this.safeOrBreak(x, y + 2, z); 
         if (cost > 100)
             return;
-        // Upstream's non-climbable branch is 1x1 towering (placement) — dead.
-        if ((f1 & CLIMBABLE) === 0)
+        if ((f1 & CLIMBABLE) === 0) {
+            // A jump reaches a climbable cell starting at head height,
+            // allowing the climb to continue for the cost of a jump up.
+            if (!this.parkourExtended)
+                return;
+            const fH = this.flagsAt(x, y + 1, z);
+            if ((fH & CLIMBABLE) === 0 || !this.isSafe(fH) || !this.climbUsable(x, y + 1, z))
+                return;
+            this.push(x, y + 1, z, cost + 1, 0);
             return;
-        // Vines climb only with an adjacent solid block to press against —
-        // vanilla's collision climb, and the only way prismarine-physics
-        // ascends. A free-hanging curtain is passable but not climbable.
+        }
+        // Vines require an adjacent solid block for collision climbing;
+        // a free-hanging curtain is passable but cannot be climbed.
         if (this.specialAt(x, y, z) === SPECIAL_VINE &&
             (this.flagsAt(x + 1, y, z) & PHYSICAL) === 0 &&
             (this.flagsAt(x - 1, y, z) & PHYSICAL) === 0 &&
@@ -924,40 +1031,45 @@ export class MoveGen {
     }
   private moveDiagonal (x: number, y: number, z: number, dx: number, dz: number): void {
         this.beginMove();
-        let cost = Math.SQRT2; // move cost
+        let cost = Math.SQRT2; 
         const fC = this.flagsAt(x + dx, y, z + dz);
-        // Extended: never diagonally onto a ladder's top edge (see moveJumpUp);
-        // ladders are entered cardinally, caught, or transferred to.
+        // Ladder-top edges are not diagonal hop targets; enter or catch the cell instead.
         if (this.parkourExtended && (fC & (PHYSICAL | CLIMBABLE)) === (PHYSICAL | CLIMBABLE))
             return;
         // A thin floor at the target feet cell is same-level ground, not a +1 hop.
         const yo = (fC & PHYSICAL) !== 0 && !this.isThinFloor(fC) ? 1 : 0;
+        // Hazards have no collision box to deflect a diagonal past their corners.
+        // Check the body's full height, including the rise during a jump.
+        if (this.parkourExtended) {
+            for (let hy = y; hy <= y + yo + 1; hy++) {
+                if (this.hazardAt(x, hy, z + dz) || this.hazardAt(x + dx, hy, z))
+                    return;
+            }
+        }
         const h0 = this.heightAt(x, y - 1, z);
-        // Two corner alternatives, each with its own toBreak set (upstream
-        // toBreak1/toBreak2 — the cheaper corner's digs are kept).
+        // Each corner needs its own break list; keep the cheaper corner's digs.
         let cost1 = 0;
-        cost1 += this.safeOrBreak(x, y + yo + 1, z + dz); // blockB1
-        cost1 += this.safeOrBreak(x, y + yo, z + dz); // blockC1
+        cost1 += this.safeOrBreak(x, y + yo + 1, z + dz); 
+        cost1 += this.safeOrBreak(x, y + yo, z + dz); 
         const hD1 = this.heightAt(x, y + yo - 1, z + dz);
         if (hD1 - h0 > 1.2)
-            cost1 += this.safeOrBreak(x, y + yo - 1, z + dz); // blockD1
+            cost1 += this.safeOrBreak(x, y + yo - 1, z + dz); 
         const breaks1 = this.moveBreaks;
         this.moveBreaks = [];
         let cost2 = 0;
-        cost2 += this.safeOrBreak(x + dx, y + yo + 1, z); // blockB2
-        cost2 += this.safeOrBreak(x + dx, y + yo, z); // blockC2
+        cost2 += this.safeOrBreak(x + dx, y + yo + 1, z); 
+        cost2 += this.safeOrBreak(x + dx, y + yo, z); 
         const hD2 = this.heightAt(x + dx, y + yo - 1, z);
         if (hD2 - h0 > 1.2)
-            cost2 += this.safeOrBreak(x + dx, y + yo - 1, z); // blockD2
+            cost2 += this.safeOrBreak(x + dx, y + yo - 1, z); 
         const breaks2 = this.moveBreaks;
-        // Keep the cheaper corner's cost AND digs (upstream tie → corner 2).
+        // Keep the chosen corner's cost and break list together; ties select corner 2.
         if (cost1 < cost2) {
             cost += cost1;
             this.moveBreaks = breaks1;
         }
         else {
             cost += cost2;
-            // this.moveBreaks already breaks2
         }
         if (cost > 100)
             return;
@@ -970,10 +1082,10 @@ export class MoveGen {
         if ((this.flagsAt(x, y, z) & LIQUID) !== 0)
             cost += this.liquidCost;
         const fD = this.flagsAt(x + dx, y - 1, z + dz);
-        if (yo === 1) { // Case jump up by 1
+        if (yo === 1) { 
             const hC = this.heightAt(x + dx, y, z + dz);
             if (hC - h0 > 1.2)
-                return; // Too high to jump
+                return; 
             cost += this.safeOrBreak(x, y + 2, z);
             if (cost > 100)
                 return;
@@ -983,16 +1095,24 @@ export class MoveGen {
         else if (((fD & PHYSICAL) !== 0 && !this.isThinFloor(fD)) || (fC & LIQUID) !== 0 ||
             this.isThinFloor(fC) ||
             (this.specialAt(x + dx, y, z + dz) & BUBBLE_MASK) !== 0) {
-            this.push(x + dx, y, z + dz, cost, 0);
+            // Edge supports form continuous ground only where their faces meet.
+            // Disconnected ledges need a hop because the body loses support.
+            let hop = false;
+            if (this.parkourExtended) {
+                const cA = this.carryAt(x, y - 1, z);
+                const cB = cA === 0 ? 0 : this.carryAt(x + dx, y - 1, z + dz);
+                hop = cB !== 0 && !carryTouch(cA, cB, dx, dz);
+            }
+            this.push(x + dx, y, z + dz, hop ? cost + 0.5 : cost, hop ? META_PARKOUR : 0);
         }
         else if ((this.flagsAt(x + dx, y - 2, z + dz) & PHYSICAL) !== 0 || (fD & LIQUID) !== 0) {
             if (!this.isSafe(fD))
-                return; // don't self-immolate
+                return; 
             cost += this.entitiesAt(x + dx, y - 1, z + dz) * this.entityCost;
             this.push(x + dx, y - 1, z + dz, cost, 0);
         }
     }
-    // Jump up, down or forward over a 1 block gap — upstream verbatim (never digs).
+    // Gap jumps never dig through their flight path.
   private moveParkourForward (x: number, y: number, z: number, dx: number, dz: number): void {
         this.beginMove();
         const h0 = this.heightAt(x, y - 1, z);
@@ -1003,9 +1123,9 @@ export class MoveGen {
             !this.isSafe(this.flagsAt(x + dx, y + 1, z + dz)))
             return;
         if ((this.flagsAt(x, y, z) & LIQUID) !== 0)
-            return; // cant jump from water
+            return; 
         if ((this.specialAt(x, y, z) & BUBBLE_MASK) !== 0)
-            return; // cant jump while floating in a column
+            return; 
         let cost = 1;
         cost += this.entitiesAt(x + dx, y, z + dz) * this.entityCost;
         let ceilingClear = this.isSafe(this.flagsAt(x, y + 2, z)) && this.isSafe(this.flagsAt(x + dx, y + 2, z + dz));
@@ -1021,30 +1141,30 @@ export class MoveGen {
             if (this.isSafe(fCd))
                 cost += this.entitiesAt(x + dxx, y, z + dzz) * this.entityCost;
             if (ceilingClear && this.isSafe(fB) && this.isSafe(fCd) && (fDd & PHYSICAL) !== 0) {
-                // Forward
                 cost += this.exclusionAt(x + dxx, y + 1, z + dzz);
-                this.push(x + dxx, y, z + dzz, cost, META_PARKOUR);
+                if (!this.lavaFlanked(x + dxx, y, z + dzz))
+                    this.push(x + dxx, y, z + dzz, cost, META_PARKOUR);
                 break;
             }
             else if (ceilingClear && this.isSafe(fB) && (fCd & PHYSICAL) !== 0) {
-                // Up
-                if (this.isSafe(fA) && d !== 4) { // 4 forward 1 up fails often
+                if (this.isSafe(fA) && d !== 4) { 
                     cost += this.exclusionAt(x + dxx, y + 2, z + dzz);
                     const hC = this.heightAt(x + dxx, y, z + dzz);
                     if (hC - h0 > 1.2)
-                        break; // Too high to jump
+                        break; 
                     cost += this.entitiesAt(x + dxx, y + 1, z + dzz) * this.entityCost;
-                    this.push(x + dxx, y + 1, z + dzz, cost, META_PARKOUR);
+                    if (!this.lavaFlanked(x + dxx, y + 1, z + dzz))
+                        this.push(x + dxx, y + 1, z + dzz, cost, META_PARKOUR);
                     break;
                 }
             }
             else if ((ceilingClear || d === 2) && this.isSafe(fB) && this.isSafe(fCd) && this.isSafe(fDd) && floorCleared) {
-                // Down
                 const fE = this.flagsAt(x + dxx, y - 2, z + dzz);
                 if ((fE & PHYSICAL) !== 0) {
                     cost += this.exclusionAt(x + dxx, y - 1, z + dzz);
                     cost += this.entitiesAt(x + dxx, y - 1, z + dzz) * this.entityCost;
-                    this.push(x + dxx, y - 1, z + dzz, cost, META_PARKOUR);
+                    if (!this.lavaFlanked(x + dxx, y - 1, z + dzz))
+                        this.push(x + dxx, y - 1, z + dzz, cost, META_PARKOUR);
                 }
                 floorCleared = floorCleared && (fE & PHYSICAL) === 0;
             }
@@ -1054,20 +1174,10 @@ export class MoveGen {
             ceilingClear = ceilingClear && this.isSafe(fA);
         }
     }
-    /**
-     * Improvement (allowParkourExtended): momentum chains. Every parkour
-     * landing B this expansion just produced is also a possible RE-JUMP point:
-     * a body that lands and presses jump on the same tick keeps its speed and
-     * out-flies a running start (J_CHAIN). So for each such B that is a
-     * stepping stone — a support with no walkable cell beside it to run from —
-     * every table offset that continues the first jump's direction (angle
-     * gate CHAIN_MIN_COS) is tried from B with the chain row, and the ones a
-     * normal jump from B could not make become edges A → C with B as `via`.
-     * Redundant chains are never emitted: if B's own expansion would reach C
-     * (standing or running), this generates nothing. Cost is the sum of the
-     * two edges, so the heuristic stays admissible. The executor flies A → B
-     * as a parkour landing and presses jump toward C on the landing tick.
-     */
+    /** Chain jumps through stepping stones that have no adjacent run-up.
+     * A landing-tick re-jump retains speed; only direction-aligned targets
+     * beyond the stone's normal reach become compound edges with it as `via`.
+     * Summing both edge costs keeps the heuristic admissible. */
   private momentumChains (x: number, y: number, z: number): void {
         const nOut = this.outCount;
         const tab = this.extTable!;
@@ -1077,8 +1187,7 @@ export class MoveGen {
             const bx = this.outX[i];
             const by = this.outY[i];
             const bz = this.outZ[i];
-            // Landed ON a support: node above a physical top or a fence top —
-            // never a ladder/water/thin-floor catch, which has no landing tick.
+            // Catches have no support landing tick on which to re-jump.
             const fB = this.flagsAt(bx, by, bz);
             if ((fB & (LIQUID | CLIMBABLE)) !== 0 || this.isThinFloor(fB) ||
                 (this.specialAt(bx, by, bz) & BUBBLE_MASK) !== 0)
@@ -1089,8 +1198,7 @@ export class MoveGen {
             const fS = this.flags[idxS];
             if ((fS & PHYSICAL) === 0 && !this.isTallStand(fS, this.heights[idxS]))
                 continue;
-            // A stepping stone: nothing walkable beside it at its own level to
-            // run from — otherwise B's expansion already has running jumps.
+            // Adjacent walkable ground already gives the stone running jumps.
             const hB = this.heightAt(bx, by - 1, bz);
             let runnable = false;
             for (let d = 0; d < 4; d++) {
@@ -1109,7 +1217,7 @@ export class MoveGen {
                 continue;
             const lowB = !this.isSafe(this.flagsAt(bx, by + 2, bz));
             if (lowB)
-                continue; // no bonked-arc chain row measured
+                continue; // No bonked chain row is available.
             const abx = bx - x;
             const abz = bz - z;
             const ab2 = abx * abx + abz * abz;
@@ -1147,50 +1255,297 @@ export class MoveGen {
             return false;
         return dot * dot >= CHAIN_MIN_COS2 * ab2 * (bcx * bcx + bcz * bcz);
     }
-    /**
-     * Improvement (allowParkourExtended): one candidate landing for one
-     * extended-parkour offset — up (+1), same-level, drop (≤ maxDropDown), or a
-     * ladder / water / bubble catch. No upstream equivalent (baritone and
-     * azalea are cardinal-only, flat-only too). Rules: docs/ExtendedParkour.md.
-     * Never digs; the executor's physics sim validates the jump at run time.
-     *
-     * With `chainVia ≥ 0` the takeoff is a momentum-chain re-jump from the
-     * stepping stone (momentumChains): a landing a normal jump from here could
-     * make is skipped (that edge exists from the stone's own expansion), the
-     * rest are held to the J_CHAIN row from the landing point, and the push
-     * carries `chainVia` and the first hop's cost.
-     */
+  /** A lid inside the support panel's strip bonks a jump from the strip.
+     * On the tick the body leaves it, vertical movement resolves first and
+     * retains the ground flag; jumping then clears the lid. */
+  private lidInStrip (x: number, y: number, z: number): boolean {
+        const hb = this.thinShapeAt(x, y + 2, z);
+        const sb = this.thinShapeAt(x, y - 1, z);
+        if (hb === 0 || sb === 0)
+            return false;
+        const c = this.carryAt(x, y - 1, z);
+        if (c < CARRY_W_NONE || c > CARRY_S_NONE)
+            return false;
+        if ((this.flagsAt(x, y + 2, z) & LIQUID) !== 0)
+            return false;
+        return THIN_LO[hb & 15] >= THIN_LO[sb & 15] && THIN_HI[hb & 15] <= THIN_HI[sb & 15] &&
+            THIN_LO[hb >> 4] >= THIN_LO[sb >> 4] && THIN_HI[hb >> 4] <= THIN_HI[sb >> 4];
+    }
+    /** Whether a step leaves the panel's strip without entering level support
+     * that would keep the body carried under the next cell's lid. */
+  private leavesLid (x: number, y: number, z: number, dx: number, dz: number, h0: number): boolean {
+        const c = this.carryAt(x, y - 1, z);
+        if ((dx !== 0 && carrySide(c, dx, 0) === 1) || (dz !== 0 && carrySide(c, 0, dz) === 1))
+            return true;
+        if (dx !== 0 && this.levelSupport(x + dx, y - 1, z, h0))
+            return false;
+        if (dz !== 0 && this.levelSupport(x, y - 1, z + dz, h0))
+            return false;
+        if (dx !== 0 && dz !== 0 && this.levelSupport(x + dx, y - 1, z + dz, h0))
+            return false;
+        return dx !== 0 || dz !== 0;
+    }
+  private levelSupport (x: number, y: number, z: number, h0: number): boolean {
+        return (this.flagsAt(x, y, z) & PHYSICAL) !== 0 && Math.abs(this.heightAt(x, y, z) - h0) < 0.07;
+    }
+  /** Floor beneath an obstructing thin shape is not a walkable route;
+   * it must not veto a jump that passes beside the shape. */
+  private thinStands (cx: number, y: number, cz: number): boolean {
+        return (this.thinShapeAt(cx, y, cz) !== 0 && !this.isSafe(this.flagsAt(cx, y, cz))) ||
+            (this.thinShapeAt(cx, y + 1, cz) !== 0 && !this.isSafe(this.flagsAt(cx, y + 1, cz)));
+    }
+    /** Footprint byte; a lid byte reads as 0, meaning a full-footprint block. */
+  private thinShapeAt (cx: number, ly: number, cz: number): number {
+        const b = this.thinAt(cx, ly, cz);
+        return isLidByte(b) ? 0 : b;
+    }
+    /** Lid list of the candidate being evaluated: bonk height, path span. */
+  private readonly lidHb = new Float64Array(LID_MAX);
+  private readonly lidLo = new Float64Array(LID_MAX);
+  private readonly lidHi = new Float64Array(LID_MAX);
+  private spanLo = 0;
+  private readonly grHb = new Float64Array(16);
+  private readonly grLo = new Float64Array(16);
+  private readonly grHi = new Float64Array(16);
+  private spanHi = 0;
+    /** Path interval where the hitbox overlaps a cell's thin footprint;
+     * false when the path stays clear. */
+  private thinSpan (cx: number, ly: number, cz: number, ax: number, az: number, t: ParkourExtEntry, sx: number, sz: number): boolean {
+        const b = this.thinShapeAt(cx, ly, cz);
+        let x0 = THIN_LO[b & 15] / 16;
+        let x1 = THIN_HI[b & 15] / 16;
+        let z0 = THIN_LO[b >> 4] / 16;
+        let z1 = THIN_HI[b >> 4] / 16;
+        if (sx < 0) { const lo = 1 - x1; x1 = 1 - x0; x0 = lo; }
+        if (sz < 0) { const lo = 1 - z1; z1 = 1 - z0; z0 = lo; }
+        x0 += ax - THIN_BODY_HALF; x1 += ax + THIN_BODY_HALF;
+        z0 += az - THIN_BODY_HALF; z1 += az + THIN_BODY_HALF;
+        const p = t.pts;
+        let acc = 0;
+        let lo = Infinity;
+        let hi = -Infinity;
+        for (let i = 0; i + 3 < p.length; i += 2) {
+            const dx = p[i + 2] - p[i];
+            const dz = p[i + 3] - p[i + 1];
+            const len = Math.sqrt(dx * dx + dz * dz);
+            let t0 = 0;
+            let t1 = 1;
+            let miss = false;
+            if (dx === 0) { if (p[i] <= x0 || p[i] >= x1) miss = true; }
+            else { let e = (x0 - p[i]) / dx; let q = (x1 - p[i]) / dx; if (e > q) { const w = e; e = q; q = w; } if (e > t0) t0 = e; if (q < t1) t1 = q; }
+            if (dz === 0) { if (p[i + 1] <= z0 || p[i + 1] >= z1) miss = true; }
+            else { let e = (z0 - p[i + 1]) / dz; let q = (z1 - p[i + 1]) / dz; if (e > q) { const w = e; e = q; q = w; } if (e > t0) t0 = e; if (q < t1) t1 = q; }
+            if (!miss && t1 - t0 > 1e-9) {
+                if (acc + t0 * len < lo) lo = acc + t0 * len;
+                if (acc + t1 * len > hi) hi = acc + t1 * len;
+            }
+            acc += len;
+        }
+        this.spanLo = lo;
+        this.spanHi = hi;
+        return hi >= lo;
+    }
+    /** Walk an arc against lids; vertical motion resolves before horizontal.
+     * A lid overhead caps the rise and resets vertical velocity. Entering a
+     * lid's span above its bonk height is a side collision and returns NaN.
+     * Return the cap, or Infinity with no bonk, stopping at touchdown. */
+  private lidWalkWindow (n: number, r: number, s0: number, landRise: number, landIn: number): number {
+        // Running takeoffs vary within a stride, so the whole phase window
+        // must clear the lids; a standing takeoff has a fixed position.
+        if (r === 0)
+            return this.lidWalk(n, r, s0, landRise, landIn);
+        let cap = Infinity;
+        for (let k = -2; k <= 2; k++) {
+            const c = this.lidWalk(n, r, s0 + k * 0.07, landRise, landIn);
+            if (Number.isNaN(c))
+                return NaN;
+            if (c < cap)
+                cap = c;
+        }
+        return cap;
+    }
+  private lidWalk (n: number, r: number, s0: number, landRise: number, landIn: number): number {
+        const curve = FLIGHT_ROW[r];
+        let capped = false;
+        let cap = Infinity;
+        let yy = 0;
+        let vy = 0;
+        let sPrev = s0;
+        for (let i = 0; i < curve.length; i += 2) {
+            let yn;
+            if (!capped) {
+                yn = curve[i + 1];
+                let hbHere = Infinity;
+                for (let j = 0; j < n; j++) {
+                    if (this.lidLo[j] <= sPrev && sPrev <= this.lidHi[j] && this.lidHb[j] < hbHere)
+                        hbHere = this.lidHb[j];
+                }
+                if (yn > hbHere) {
+                    capped = true;
+                    cap = hbHere;
+                    yn = hbHere;
+                    vy = 0;
+                }
+            }
+            else {
+                vy = (vy - 0.08) * 0.98;
+                yn = yy + vy;
+            }
+            yy = yn;
+            const sNext = s0 + curve[i];
+            for (let j = 0; j < n; j++) {
+                if (this.lidLo[j] > sPrev && this.lidLo[j] <= sNext && yy > this.lidHb[j])
+                    return NaN;
+            }
+            sPrev = sNext;
+            if (yy <= landRise && sNext >= landIn)
+                break;
+        }
+        return cap;
+    }
+    /** Thin footprint byte of a cell (0 = solid, or no thin grid). */
+  private thinAt (cx: number, ly: number, cz: number): number {
+        if (this.thin === null)
+            return 0;
+        const idx = this.cellIndex(cx, ly, cz);
+        return idx < 0 ? 0 : this.thin[idx];
+    }
+    /** A blocked corridor cell can contain a thin shape the hitbox misses.
+     * Mirror its world footprint into table space before checking the path;
+     * byte 0 represents a solid cell and always vetoes it. */
+  private thinClear (cx: number, ly: number, cz: number, t: ParkourExtEntry, k: number, sx: number, sz: number): boolean {
+        const b = this.thinShapeAt(cx, ly, cz);
+        if (b === 0)
+            return false;
+        let x0 = THIN_LO[b & 15] / 16;
+        let x1 = THIN_HI[b & 15] / 16;
+        let z0 = THIN_LO[b >> 4] / 16;
+        let z1 = THIN_HI[b >> 4] / 16;
+        if (sx < 0) {
+            const lo = 1 - x1;
+            x1 = 1 - x0;
+            x0 = lo;
+        }
+        if (sz < 0) {
+            const lo = 1 - z1;
+            z1 = 1 - z0;
+            z0 = lo;
+        }
+        const ax = t.cells[k * 2];
+        const az = t.cells[k * 2 + 1];
+        x0 += ax - THIN_BODY_HALF;
+        x1 += ax + THIN_BODY_HALF;
+        z0 += az - THIN_BODY_HALF;
+        z1 += az + THIN_BODY_HALF;
+        const p = t.pts;
+        for (let i = 0; i + 3 < p.length; i += 2) {
+            if (segHits(p[i], p[i + 1], p[i + 2] - p[i], p[i + 3] - p[i + 1], x0, x1, z0, z1))
+                return false;
+        }
+        return true;
+    }
+    /** Try shifted lines after a corridor refusal; a successful centre line
+     * makes them redundant. Momentum chains cannot shift without a line-up.
+     * A solid-cell refusal also excludes sibling lines sweeping that cell. */
+  private extTarget (x: number, y: number, z: number, sx: number, sz: number, h0: number, lowTakeoff: boolean, t: ParkourExtEntry): void {
+        this.extTargetLines(x, y, z, sx, sz, h0, lowTakeoff, t);
+        // A head-height climbable catch is separate from the column's landing,
+        // so a ladder above a floor remains a candidate.
+        const tx = x + t.tx * sx;
+        const tz = z + t.tz * sz;
+        const fU = this.flagsAt(tx, y + 1, tz);
+        if ((fU & CLIMBABLE) !== 0 && this.isSafe(fU) && this.climbUsable(tx, y + 1, tz)) {
+            this.extUpCatch = true;
+            this.parkourExtTarget(x, y, z, sx, sz, h0, lowTakeoff, t);
+            this.extUpCatch = false;
+        }
+    }
+  private extTargetLines (x: number, y: number, z: number, sx: number, sz: number, h0: number, lowTakeoff: boolean, t: ParkourExtEntry): void {
+        this.extTryMask = 0;
+        this.parkourExtTarget(x, y, z, sx, sz, h0, lowTakeoff, t);
+        let mask = this.extTryMask;
+        if (mask === 0)
+            return;
+        // An offset takeoff needs a full support top; narrow supports only
+        // allow variants that keep the takeoff centred.
+        if (this.catchAt(x, y - 1, z) !== 0 || this.carryAt(x, y - 1, z) !== 0) {
+            mask &= AIM_P0_MASK;
+            if (mask === 0)
+                return;
+        }
+        const vs = t.variants;
+        for (let v = 0; v < vs.length && mask !== 0; v++) {
+            if ((mask >> v & 1) === 0)
+                continue;
+            this.extTryMask = -1;
+            this.parkourExtTarget(x, y, z, sx, sz, h0, lowTakeoff, vs[v]);
+            mask &= this.extTryMask;
+        }
+    }
+  /** Evaluate one extended-parkour landing without digging.
+   * With chainVia, use the landing-tick re-jump envelope, skip targets within
+   * normal reach, and retain the first hop's cost and stepping stone. */
   private parkourExtTarget (x: number, y: number, z: number, sx: number, sz: number, h0: number, lowTakeoff: boolean, t: ParkourExtEntry, chainVia = -1, chainBase = 0): void {
         this.beginMove();
         const cells = t.cells;
-        // Flat-ground fast-out: walkable floor on the first flight-line cell
-        // means this isn't a gap (2 probes; kills almost every open-terrain node).
+        // Walkable ground on the first flight-line cell means there is no gap.
         const flx = x + cells[0] * sx;
         const flz = z + cells[1] * sz;
-        if ((this.flagsAt(flx, y - 1, flz) & PHYSICAL) !== 0 && this.heightAt(flx, y - 1, flz) >= h0)
+        // Floor under an obstruction is not walkable; a shifted jump can pass beside it.
+        if ((this.flagsAt(flx, y - 1, flz) & PHYSICAL) !== 0 && this.heightAt(flx, y - 1, flz) >= h0 &&
+            !this.thinStands(flx, y, flz) &&
+            this.isSafe(this.flagsAt(flx, y, flz)) && this.isSafe(this.flagsAt(flx, y + 1, flz))) {
+            // Every aimed line must also have a walkable route over this floor.
+            if (t.aimIndex !== 0)
+                this.extTryMask &= t.lineAvoid[0];
             return;
+        }
         const tx = x + t.tx * sx;
         const tz = z + t.tz * sz;
-        const idxT = this.cellIndex(tx, y, tz);
-        const fT = idxT < 0 ? 0 : this.flags[idxT];
         let nodeY;
         let cost = t.cost;
-        // Top-catch class of the support the feet land ON (0 full … 3 post);
-        // -1 for landings that ENTER a cell (ladder, water, thin floor) and get
-        // the full cell-width credit.
+        // Support landings use the top-catch class; catches use cell-width credit.
         let landCatch = -1;
-        // The cell whose collision top the feet land on (support landings): the
-        // reach bucket is the REAL rise from the takeoff support to it, which
-        // node cells do not carry — a fence stand (feet 0.5 into its node) to a
-        // head (feet at its node's floor) is a flat jump one node cell up.
+        // An overhang above a drop landing must clear the descending arc.
+        let landLid1 = false;
+        // Reach uses collision-top rise rather than node height: a fence top
+        // to a head can be flat even when the destination node is a cell higher.
         let supY = NaN;
-        if ((fT & CLIMBABLE) !== 0 && this.isSafe(fT) && this.climbUsable(tx, y, tz)) {
-            // Grab a ladder/vine at flight level. Checked before PHYSICAL because
-            // ladders classify as physical too (type-level bbox 'block') — and
-            // grabbing one is real, landing on its thin collision top is not.
-            // The arc may enter the column a cell lower where the ladder
-            // continues: more airtime, so a longer reach — the catch is the
-            // lowest contiguous ladder cell up to two below flight level.
+        const idxT = t.aimIndex !== 0 ? -1 : this.cellIndex(tx, y, tz);
+        const fT = idxT < 0 ? 0 : this.flags[idxT];
+        if (this.extUpCatch) {
+            // A catch one block up needs air at flight level and headroom above
+            // the climbable. A block or ladder at flight level is its own landing.
+            if ((fT & (PHYSICAL | CLIMBABLE | LIQUID)) !== 0 || !this.isSafe(fT) ||
+                (this.specialAt(tx, y, tz) & BUBBLE_MASK) !== 0 || !this.isSafe(this.flagsAt(tx, y + 2, tz)))
+                return;
+            // Entering across the ladder's 3/16 strip hits its end; catches
+            // approach through the open face or along it.
+            const pc = this.carryAt(tx, y + 1, tz);
+            if (pc !== 0 && ((t.tx !== 0 && carrySide(pc, sx, 0) === 1) || (t.tz !== 0 && carrySide(pc, 0, sz) === 1)))
+                return;
+            // A missed catch must fall onto another planner landing.
+            if (Number.isNaN(this.findExtLanding(tx, y, tz)))
+                return;
+            nodeY = y + 1;
+            cost += 1;
+        }
+        else if (t.aimIndex !== 0) {
+            // Aimed variants reuse the centre line's full-top landing.
+            nodeY = this.extLandY;
+            supY = this.extLandSupY;
+            landLid1 = this.extLandLid1;
+            // Aimed dives under a drop-landing overhang are outside the lid model.
+            if (landLid1)
+                return;
+            landCatch = 0;
+            if (nodeY > y)
+                cost += nodeY - y;
+        }
+        else if ((fT & CLIMBABLE) !== 0 && this.isSafe(fT) && this.climbUsable(tx, y, tz)) {
+            // Check ladders before PHYSICAL: catch their cells rather than land
+            // on their thin tops. Up to two contiguous cells below flight level
+            // add airtime and extend the catch's reach.
             if (!this.isSafe(this.flagsAt(tx, y + 1, tz)))
                 return;
             nodeY = y;
@@ -1203,16 +1558,14 @@ export class MoveGen {
             }
         }
         else if (this.isThinFloor(fT)) {
-            // Thin floor at flight level (carpeted landing): a same-level jump —
-            // feet land IN the cell, exactly like the air-branch landing below.
+            // Thin floors land the feet inside the cell, so this is a same-level jump.
             if (!this.isSafe(this.flagsAt(tx, y + 1, tz)))
                 return;
             nodeY = y;
         }
         else if ((fT & PHYSICAL) !== 0) {
-            // Up variant: the flight-level cell is the landing block, land on top.
             if (this.heightAt(tx, y, tz) - h0 > 1.2)
-                return; // too high to jump
+                return; 
             if (!this.isSafe(this.flagsAt(tx, y + 1, tz)) || !this.isSafe(this.flagsAt(tx, y + 2, tz)))
                 return;
             nodeY = y + 1;
@@ -1221,10 +1574,9 @@ export class MoveGen {
             supY = y;
         }
         else if (idxT >= 0 && this.isTallStand(fT, this.heights[idxT])) {
-            // Fence/wall top at flight level: an up landing onto its 1.5 top —
-            // feet 0.5 into the node cell, so the head needs one more cell. A pot
-            // (or any low block) sitting on the post keeps the feet on the post's
-            // tip but puts the node above the pot: the rise is still the tip's.
+            // Fence and wall tops raise feet and head clearance by 0.5 blocks.
+            // A low block on the post can raise the node without changing the
+            // support height used for reach.
             if (this.heightAt(tx, y, tz) - h0 > 1.2)
                 return;
             const f1 = this.flagsAt(tx, y + 1, tz);
@@ -1247,12 +1599,15 @@ export class MoveGen {
             supY = y;
         }
         else {
-            if (!this.isSafe(fT) || !this.isSafe(this.flagsAt(tx, y + 1, tz)))
+            if (!this.isSafe(fT))
                 return;
+            landLid1 = !this.isSafe(this.flagsAt(tx, y + 1, tz));
             nodeY = this.findExtLanding(tx, y, tz);
             if (Number.isNaN(nodeY))
                 return;
-            // Landed ON a support (node above it) rather than IN a catching cell?
+            // An overhang at landing height leaves no room to stand.
+            if (landLid1 && nodeY >= y)
+                return;
             const fN = this.flagsAt(tx, nodeY, tz);
             if ((fN & (LIQUID | CLIMBABLE)) === 0 && !this.isThinFloor(fN) &&
                 (this.specialAt(tx, nodeY, tz) & BUBBLE_MASK) === 0) {
@@ -1260,33 +1615,41 @@ export class MoveGen {
                 supY = nodeY - 1;
             }
         }
-        // Corridor pass 1 — body cells at feet/head level must be passable, line
-        // cells with walkable floor void the jump, and a blocked head+1 anywhere
-        // (takeoff included) puts the jump into the head-hitter class: the arc
-        // bonks at +0.2 and flies flattened, so y+2 clearance is NOT required.
-        let low = lowTakeoff;
+        if (landCatch === 0 && t.aimIndex === 0) {
+            this.extLandY = nodeY;
+            this.extLandSupY = supY;
+            this.extLandLid1 = landLid1;
+        }
+        // Body cells must be passable and walkable floor rules out a gap.
+        // A head+1 obstruction flattens the arc rather than requiring clearance;
+        // a lid inside the support strip is cleared by a latched takeoff.
+        const latchedOff = this.lidHere && chainVia < 0 && this.leavesLid(x, y, z, t.tx > 0 ? sx : 0, t.tz > 0 ? sz : 0, h0);
+        const bonk = lowTakeoff;
+        let low = false;
         for (let k = 0; k * 2 < cells.length; k++) {
             const cx = x + cells[k * 2] * sx;
             const cz = z + cells[k * 2 + 1] * sz;
-            if (!this.isSafe(this.flagsAt(cx, y, cz)) ||
-                !this.isSafe(this.flagsAt(cx, y + 1, cz)))
+            for (let ly = y; ly <= y + 1; ly++) {
+                if (this.isSafe(this.flagsAt(cx, ly, cz)) || this.thinClear(cx, ly, cz, t, k, sx, sz))
+                    continue;
+                // Any aimed line may avoid a thin shape; only lines missing the
+                // entire cell can avoid a full cube. Shifted landings need a full top.
+                if (landCatch === 0)
+                    this.extTryMask = this.thinShapeAt(cx, ly, cz) !== 0 ? -1 : t.avoid[k];
                 return;
-            if (!this.isSafe(this.flagsAt(cx, y + 2, cz)))
-                low = true;
+            }
             if (k < t.nLine && (this.flagsAt(cx, y - 1, cz) & PHYSICAL) !== 0 &&
-                this.heightAt(cx, y - 1, cz) >= h0)
-                return; // walkable — not a gap
+                this.heightAt(cx, y - 1, cz) >= h0 && !this.thinStands(cx, y, cz)) {
+                if (t.aimIndex !== 0)
+                    this.extTryMask &= t.lineAvoid[k];
+                return; // Walkable floor rules out a gap.
+            }
         }
-        // Reach envelope: flight needed (per-axis corner credits, precomputed in
-        // the table) vs usable flight for the landing bucket, at the speed the
-        // takeoff supports — a run-up cell behind the flight line upgrades a
-        // standing corner-creep jump to a running delayed jump. Head-hitter
-        // jumps use the bonked-arc rows (+1 landings impossible there).
-        // Real rise for support landings; node delta for catches. A fractional
-        // rise (a post to a head, a head to a slab) interpolates between the two
-        // integer rows — `frac` is how far from the lower-landing (longer-reach)
-        // row toward the higher one; a rise above +1 keeps the +1 row (the 1.2
-        // height check already gates it).
+        let nLid = 0;
+        // Compare required flight with the landing bucket's reach at the
+        // available takeoff speed. Bonked arcs use separate reach rows.
+        // Interpolate fractional collision-top rises between neighboring rows.
+        // Rises above +1 use the +1 row within the 1.2-block height limit.
         let dy;
         let frac = 0;
         let rise = 0;
@@ -1294,10 +1657,8 @@ export class MoveGen {
             dy = nodeY - y;
         }
         else {
-            // A bottom stair is landed on its full-footprint 0.5 slab (the
-            // body walks up the step from there): half a block lower than the
-            // top, so half a block more usable flight. Any other support lands
-            // on its collision top.
+            // Land on a bottom stair's full-footprint slab before walking up
+            // its step; reach uses that half-block-lower landing height.
             const landTop = (this.specialAt(tx, supY, tz) & SPECIAL_STAIR) !== 0
                 ? supY + 0.5
                 : this.heightAt(tx, supY, tz);
@@ -1310,119 +1671,334 @@ export class MoveGen {
             }
         }
         const bucket = reachBucket(dy);
-        // Reach is a function of the RUN available before the lip (J_RUN rows,
-        // parkourEnvelope.ts): the support itself — rear overhang to the front
-        // lip, 1.38 on a full block, 0.81 on a post — plus a block per walkable
-        // cell behind the flight line, level or one step lower. Flight needed
-        // is credited per axis at the lip; narrow supports (fence posts, heads,
-        // pots) at either end shrink the credits and are recomputed here from
-        // the table's offset, full-block ends take the precomputed value bit
-        // for bit.
+        // Run-up includes the support's width and walkable cells behind it.
+        // Narrow supports shrink the per-axis takeoff and landing credits;
+        // full-block ends reuse the table's precomputed flight requirement.
         const takeoffCatch = this.catchAt(x, y - 1, z);
-        // A ladder's top edge is not a takeoff (its class says post-width, its
-        // 3/16 depth says otherwise): jumps start from real stands only.
-        if ((this.flagsAt(x, y - 1, z) & CLIMBABLE) !== 0)
+        // A ladder's 3/16 top strip permits only a standing takeoff here: no
+        // run-up, momentum lip or rise is supported by this envelope.
+        const ladderTop = (this.flagsAt(x, y - 1, z) & CLIMBABLE) !== 0;
+        if (ladderTop && nodeY > y)
             return;
-        const lCred = landCatch < 0 ? LAND_HALF : LAND_NARROW_MARGIN + CATCH_HALF[landCatch];
+        if (ladderTop)
+            cost += LADDER_TOP_COST;
+        // The tight pass restores the catch credit for a precise catch along the strip.
+        let ladderCatchFix = false;
+        const lCred = this.extUpCatch ? UP_CATCH_CREDIT : landCatch < 0 ? LAND_HALF : LAND_NARROW_MARGIN + CATCH_HALF[landCatch];
         const half = CATCH_HALF[takeoffCatch];
-        const front = Math.min(TAKEOFF_STAND, TAKEOFF_NARROW_MARGIN + half);
-        let run = front + half + TAKEOFF_NARROW_MARGIN;
+        // Edge strips and pane lines give direction-dependent carry credit.
+        // Toward a strip's far side the body is already past centre; along a
+        // line it retains full credit. Centred supports use their class credit.
+        const major = t.tx > t.tz ? t.tx : t.tz;
+        const majX = t.tx > t.tz;
+        const tCarry = this.carryAt(x, y - 1, z);
+        // Each offset endpoint needs a full support top; an unshifted endpoint
+        // may still use a narrow support.
+        if (t.pOff !== 0 && (takeoffCatch !== 0 || tCarry !== 0))
+            return;
+        if (t.qOff !== 0 && landCatch !== 0)
+            return;
+        const fwdX = majX ? sx : 0;
+        const fwdZ = majX ? 0 : sz;
+        const cFront = carrySide(tCarry, fwdX, fwdZ);
+        const cBack = carrySide(tCarry, -fwdX, -fwdZ);
+        // When the minor axis crosses an edge panel's empty side, the flight
+        // crosses its 3/16 width and gets neither creep nor run-up credit.
+        // A major-axis exit uses the ordinary ledge model; pure diagonals cross.
+        const offPanel = tCarry !== 0 && t.tx !== 0 && t.tz !== 0 &&
+            (carrySide(tCarry, majX ? 0 : sx, majX ? sz : 0) === 1 || (t.tx === t.tz && cFront === 1));
+        const front = offPanel || cFront === 1 ? 0 : cFront === 2 ? TAKEOFF_STAND : Math.min(TAKEOFF_STAND, TAKEOFF_NARROW_MARGIN + half);
+        const back = offPanel || cBack === 1 ? 0 : cBack === 2 ? 0.5 + TAKEOFF_NARROW_MARGIN : half + TAKEOFF_NARROW_MARGIN;
+        /** Half-extent the lip take-off (allowParkourMomentum) leaves from, toward the target. */
+        const lipHalf = offPanel || cFront === 1 ? -LAND_NARROW_MARGIN : cFront === 2 ? 0.5 : half;
+        let run = ladderTop ? front : front + back;
+        let lCredX = lCred;
+        let lCredZ = lCred;
+        if (landCatch > 0 && !Number.isNaN(supY)) {
+            const lCarry = this.carryAt(tx, supY, tz);
+            if (lCarry !== 0) {
+                if (t.tx !== 0) {
+                    const c = carrySide(lCarry, -sx, 0);
+                    lCredX = c === 2 ? LAND_HALF : c === 1 ? 0 : lCred;
+                }
+                if (t.tz !== 0) {
+                    const c = carrySide(lCarry, 0, -sz);
+                    lCredZ = c === 2 ? LAND_HALF : c === 1 ? 0 : lCred;
+                }
+            }
+        }
         const rx = x + t.runX * sx;
         const rz = z + t.runZ * sz;
-        if (this.isSafe(this.flagsAt(rx, y, rz)) && this.isSafe(this.flagsAt(rx, y + 1, rz))) {
+        if (!offPanel && !ladderTop && this.isSafe(this.flagsAt(rx, y, rz)) && this.isSafe(this.flagsAt(rx, y + 1, rz))) {
             if ((this.flagsAt(rx, y - 1, rz) & PHYSICAL) !== 0 && this.catchAt(rx, y - 1, rz) === 0) {
-                // Level (or within step height) cell behind.
                 const hR = this.heightAt(rx, y - 1, rz);
                 if (hR - h0 <= 0.2 && h0 - hR <= 0.6)
                     run += 1;
             }
             else if (this.isSafe(this.flagsAt(rx, y - 1, rz)) &&
                 (this.flagsAt(rx, y - 2, rz) & PHYSICAL) !== 0 && this.catchAt(rx, y - 2, rz) === 0) {
-                // One step lower: sprinting up a step keeps the run. A full block
-                // is a jump, not a step (arena spiral3-c: a 1x1 post over a
-                // lower ring was credited a run-up no body can make).
+                // Sprinting up a step preserves the run; a full-block rise requires a jump.
                 const hR = this.heightAt(rx, y - 2, rz);
                 if (h0 - hR <= 0.6)
                     run += 1;
             }
         }
-        const row = runRow(run);
+        let row = runRow(run);
         if (bucket < 0)
-            return; // a rise above one block: no jump
-        const rows = (low ? J_LOW_RUN : J_RUN)[row];
-        // bucket = the row for the floor of the rise (the longer reach); the
-        // next-higher landing is the row below it in the table.
+            return; 
+        let fn = takeoffCatch === 0 && landCatch <= 0 && !this.extUpCatch
+            ? t.fnStand
+            : flightFrom2(t.tx, t.tz, t.dist, front * t.dist / major, lCredX, lCredZ);
+        // Leaving a panel's empty side starts against the wall without the
+        // standing row's sprint impulse, so the jump needs extra clearance.
+        if (offPanel)
+            fn += OFF_PANEL_MARGIN;
+        // A shifted line adds distance beyond the centre line's base cost.
+        fn += t.extra;
+        if (ladderTop) {
+            if (offPanel) {
+                // A diagonal ladder-top takeoff uses per-axis credit: along
+                // the strip on one axis and pressed to the wall on the other.
+                const cX = t.tx === 0 ? 0 : carrySide(tCarry, sx, 0) === 2 ? TAKEOFF_STAND : 0;
+                const cZ = t.tz === 0 ? 0 : carrySide(tCarry, 0, sz) === 2 ? TAKEOFF_STAND : 0;
+                const ex = t.tx - cX - lCredX;
+                const ez = t.tz - cZ - lCredZ;
+                fn = Math.sqrt((ex > 0 ? ex * ex : 0) + (ez > 0 ? ez * ez : 0)) + OFF_PANEL_MARGIN + t.extra;
+            }
+            else if (landCatch < 0 && (t.tx === 0 || t.tz === 0)) {
+                fn += LADDER_CATCH_OVERCREDIT;
+                ladderCatchFix = true;
+            }
+        }
+        // If the default arc hits a lid side-on, try a slower takeoff that
+        // passes underneath and still reaches the landing.
+        let lidCap = Infinity;
+        const s0 = front * t.dist / major;
+        const landRise = Number.isNaN(supY) ? nodeY - y : rise;
+        const landIn = t.headIn[(t.headCells.length >> 1) - 1];
+        let nGr = 0;
+        let nGrWalk = 0;
+        {
+            // Each lid caps the arc at its own bonk height: 0.2 for a full
+            // block, 0.7 for a top slab, 1.0125 for a top trapdoor.
+            // A thin lid left behind before takeoff does not cap the arc.
+            let capT = Infinity;
+            // A latched takeoff leaves the support strip's lid before jumping.
+            if (!latchedOff && !this.isSafe(this.flagsAt(x, y + 2, z))) {
+                const b = this.thinAt(x, y + 2, z);
+                if (b !== 0 && !isLidByte(b)) {
+                    if (takeoffCatch !== 0 || tCarry !== 0 || (this.thinSpan(x, y + 2, z, 0, 0, t, sx, sz) && this.spanHi >= (row > 0 ? Math.min(s0, TAKEOFF_RUN * t.dist / major) : s0)))
+                        capT = y + 2 - 1.8 - h0;
+                }
+                else
+                    capT = y + 2 + (b !== 0 ? (b & 15) / 16 : 0) - 1.8 - h0;
+            }
+            let capC = Infinity;
+            for (let k = 0; k * 2 < cells.length; k++) {
+                const cx = x + cells[k * 2] * sx;
+                const cz = z + cells[k * 2 + 1] * sz;
+                if (this.isSafe(this.flagsAt(cx, y + 2, cz)) || this.thinClear(cx, y + 2, cz, t, k, sx, sz))
+                    continue;
+                const b = this.thinAt(cx, y + 2, cz);
+                const hb = y + 2 + (isLidByte(b) ? (b & 15) / 16 : 0) - 1.8 - h0;
+                if (isLidByte(b)) {
+                    // A lid outside part of the takeoff window can be hit side-on;
+                    // walking the arc determines whether it clears.
+                    const ax = cells[k * 2];
+                    const az = cells[k * 2 + 1];
+                    const hc = t.headCells;
+                    let lo = -1e9;
+                    let hi = 1e9;
+                    for (let h = 0; h * 2 < hc.length; h++) {
+                        if (hc[h * 2] === ax && hc[h * 2 + 1] === az) { lo = t.headIn[h]; hi = t.headOut[h]; break; }
+                    }
+                    if (lo > s0 - 0.14 && nGr < 16) {
+                        this.grHb[nGr] = hb; this.grLo[nGr] = lo; this.grHi[nGr] = hi; nGr++;
+                        continue;
+                    }
+                }
+                if (hb < capC)
+                    capC = hb;
+            }
+            let cap = capT < capC ? capT : capC;
+            // Apply the corridor cap along the whole path, but the takeoff lid
+            // only over its head span; the arc can rise past it after leaving.
+            const seedLids = (): number => {
+                let n = 0;
+                if (capC < FREE_APEX) { this.lidHb[n] = capC; this.lidLo[n] = -1e9; this.lidHi[n] = 1e9; n++; }
+                if (capT < FREE_APEX) { this.lidHb[n] = capT; this.lidLo[n] = t.headIn[0]; this.lidHi[n] = t.headOut[0]; n++; }
+                return n;
+            };
+            let grBelow = false;
+            for (let j = 0; j < nGr; j++) if (this.grHb[j] < capC && this.grHb[j] < FREE_APEX) grBelow = true;
+            if (grBelow) {
+                // A side collision falls back to the conservative 0.2-block cap.
+                let n = seedLids();
+                for (let j = 0; j < nGr; j++) if (this.grHb[j] < capC && this.grHb[j] < FREE_APEX) { this.lidHb[n] = this.grHb[j]; this.lidLo[n] = this.grLo[j]; this.lidHi[n] = this.grHi[j]; n++; }
+                const c = this.lidWalkWindow(n, row, s0, Number.isNaN(supY) ? nodeY - y : rise, t.headIn[(t.headCells.length >> 1) - 1]);
+                if (Number.isNaN(c)) {
+                    const old = y + 2 - 1.8 - h0;
+                    if (old < cap) cap = old;
+                }
+                else if (!landLid1) {
+                    nLid = n;
+                }
+                else {
+                    nGrWalk = n;
+                }
+            }
+            lidCap = cap >= FREE_APEX ? Infinity : cap;
+            low = lidCap !== Infinity;
+            if (landLid1) {
+                // A drop-landing overhang needs an arc check against its face;
+                // a slower takeoff can pass beneath it.
+                nLid = nGrWalk;
+                if (nLid === 0)
+                    nLid = seedLids();
+                const nh = t.headCells.length >> 1;
+                const b1 = this.thinAt(tx, y + 1, tz);
+                let lo = t.headIn[nh - 1];
+                let hi = t.headOut[nh - 1];
+                let ok = true;
+                if (b1 !== 0 && !isLidByte(b1)) {
+                    if (this.thinSpan(tx, y + 1, tz, t.tx, t.tz, t, sx, sz)) { lo = this.spanLo; hi = this.spanHi; }
+                    else ok = false;
+                }
+                if (ok) {
+                    this.lidHb[nLid] = y + 1 + (isLidByte(b1) ? (b1 & 15) / 16 : 0) - 1.8 - h0;
+                    this.lidLo[nLid] = lo;
+                    this.lidHi[nLid] = hi;
+                    nLid++;
+                }
+                else if (nGrWalk === 0) nLid = 0;
+            }
+        }
+        // Arc walking cannot raise reach beyond the existing lid caps.
+        const rowCap = lidCap;
+        if (nLid > 0) {
+            let found = false;
+            for (let r = row; r >= 0; r--) {
+                const cw = this.lidWalkWindow(nLid, r, s0, landRise, landIn);
+                if (Number.isNaN(cw))
+                    continue;
+                const c = cw < rowCap ? cw : rowCap;
+                if (r < row) {
+                    const rr = lidRows(c)[r];
+                    let u = rr[bucket];
+                    if (frac > 0)
+                        u = u + (rr[bucket - 1] - u) * frac;
+                    if (fn > u + this.tightCredit)
+                        continue;
+                }
+                row = r;
+                lidCap = c;
+                found = true;
+                break;
+            }
+            if (!found) {
+                if (landCatch === 0 && t.aimIndex === 0)
+                    this.extTryMask = -1;
+                return;
+            }
+            low = lidCap !== Infinity;
+        }
+        const rows = lidRows(lidCap)[row];
+        // Interpolate from the lower landing's longer-reach row toward the higher landing.
         let usable = rows[bucket];
         if (frac > 0)
             usable = usable + (rows[bucket - 1] - usable) * frac;
-        usable += this.marginCredit;
-        const fn = takeoffCatch === 0 && landCatch <= 0
-            ? t.fnStand
-            : flightFrom(t.tx, t.tz, t.dist, front * t.dist / (t.tx > t.tz ? t.tx : t.tz), lCred);
-        let feasible = fn <= usable;
-        // Any run at all flies the running arc (the corridor curves).
-        let needsRunning = row >= 1;
-        // Would the STANDING row (a creep to the lip, jump from rest) fly it?
-        // Executor information only (META_RUN); never changes what is emitted.
-        const standRows = (low ? J_LOW_RUN : J_RUN)[0];
+        // Standing reach sets executor metadata without changing which moves are emitted.
+        const standRows = lidRows(lidCap)[0];
         let usableStand = standRows[bucket];
         if (frac > 0)
             usableStand = usableStand + (standRows[bucket - 1] - usableStand) * frac;
-        const runNeeded = fn > usableStand + this.marginCredit;
+        // When normal reach falls short, retry with no safety margin at all.
+        // TIGHT_COST keeps precise jumps less attractive than comfortable ones.
+        let mc = this.marginCredit;
+        let tight = false;
+        let feasible = false;
+        let needsRunning = false;
+        let runNeeded = false;
         let chained = false;
         let lipJump = false;
-        if (chainVia < 0) {
-            if (!feasible && this.parkourMomentum) {
-                // Momentum (allowParkourMomentum): a RUNNING take-off leaves from
-                // the lip — half + 0.3 past centre plus the median tick phase
-                // (parkourEnvelope.ts LIP_STRIDE / LIP_PHASE) — tried only where
-                // the creep credit falls short, so every edge the plain model
-                // emits keeps its arc and its corridor; the lip corridor
-                // (mfLip) bounds the later, lower rising arc.
-                const sLip = (half + LAND_NARROW_MARGIN + LIP_PHASE) * t.dist / (t.tx > t.tz ? t.tx : t.tz);
-                if (flightFrom(t.tx, t.tz, t.dist, sLip, lCred) <= usable) {
-                    feasible = true;
-                    lipJump = true;
+        for (;;) {
+            const usableM = usable + mc;
+            let ok = true;
+            feasible = fn <= usableM;
+            // Any run-up uses the running corridor arc.
+            needsRunning = row >= 1;
+            runNeeded = fn > usableStand + mc;
+            chained = false;
+            lipJump = false;
+            if (chainVia < 0) {
+                if (!feasible && this.parkourMomentum && !offPanel && !ladderTop && !this.extUpCatch) {
+                    // A running lip takeoff gains overhang and tick-phase credit.
+                    // Try it only beyond creep reach, using its later, lower arc.
+                    const sLip = (lipHalf + LAND_NARROW_MARGIN + LIP_PHASE) * t.dist / major;
+                    let usableLip = usableM;
+                    // The later lip arc needs its own lid check.
+                    if (nLid > 0) {
+                        const cw = this.lidWalkWindow(nLid, row, sLip, landRise, landIn);
+                        if (Number.isNaN(cw))
+                            usableLip = -Infinity;
+                        else {
+                            const rr = lidRows(cw < rowCap ? cw : rowCap)[row];
+                            usableLip = rr[bucket] + (frac > 0 ? (rr[bucket - 1] - rr[bucket]) * frac : 0) + mc;
+                        }
+                    }
+                    if (flightFrom2(t.tx, t.tz, t.dist, sLip, lCredX, lCredZ) <= usableLip) {
+                        feasible = true;
+                        lipJump = true;
+                    }
+                }
+                if (!feasible) {
+                    // A direction-aligned landing-tick re-jump retains momentum
+                    // from the far-side landing point, reduced by turn loss.
+                    // Lids are excluded because there is no bonked chain row.
+                    if (this.momIn === MOM_NONE || low || bonk || nLid > 0 || t.aimIndex !== 0 || offPanel || this.extUpCatch ||
+                        !this.chainAligned(this.momDx, this.momDz, this.momD2, t.tx * sx, t.tz * sz)) {
+                        ok = false;
+                    }
+                    else {
+                        const sChain = front * CHAIN_TAKEOFF_FRACTION * t.dist / major;
+                        const cosTurn = (this.momDx * (t.tx * sx) + this.momDz * (t.tz * sz)) / Math.sqrt(this.momD2 * (t.tx * t.tx + t.tz * t.tz));
+                        if (flightFrom2(t.tx, t.tz, t.dist, sChain, lCredX, lCredZ) > J_CHAIN[bucket] - CHAIN_TURN_LOSS * (1 - cosTurn) + mc) {
+                            ok = false;
+                        }
+                        else {
+                            needsRunning = true;
+                            chained = true;
+                        }
+                    }
                 }
             }
-            if (!feasible) {
-                // Momentum (allowParkourMomentum): the body LANDED here from a
-                // jump along momIn; a re-jump on the landing tick that continues
-                // it (CHAIN_MIN_COS cone) flies the chain row from the same
-                // far-side landing point the compound chain below uses, less the
-                // measured turn loss. Never under a lid (no bonked chain row).
-                if (this.momIn === MOM_NONE || low ||
-                    !this.chainAligned(this.momDx, this.momDz, this.momD2, t.tx * sx, t.tz * sz))
+            else {
+                // Emit a chain only beyond the stone's normal reach. The first
+                // hop lands on its far side, then re-jumps on the running arc;
+                // lids are excluded because there is no bonked chain row.
+                if (feasible || low || nLid > 0)
                     return;
-                const sChain = Math.min(TAKEOFF_STAND, TAKEOFF_NARROW_MARGIN + CATCH_HALF[takeoffCatch]) * CHAIN_TAKEOFF_FRACTION * t.dist / (t.tx > t.tz ? t.tx : t.tz);
-                const cosTurn = (this.momDx * (t.tx * sx) + this.momDz * (t.tz * sz)) / Math.sqrt(this.momD2 * (t.tx * t.tx + t.tz * t.tz));
-                if (flightFrom(t.tx, t.tz, t.dist, sChain, lCred) > J_CHAIN[bucket] - CHAIN_TURN_LOSS * (1 - cosTurn) + this.marginCredit)
-                    return;
-                needsRunning = true;
-                chained = true;
+                const sChain = front * CHAIN_TAKEOFF_FRACTION * t.dist / major;
+                if (flightFrom2(t.tx, t.tz, t.dist, sChain, lCredX, lCredZ) > J_CHAIN[bucket] + mc)
+                    ok = false;
+                else
+                    needsRunning = true;
             }
-        }
-        else {
-            // A chain is only worth an edge where the stone's own jump falls
-            // short. The executor lands the first hop on the FAR side of the stone
-            // (the same creep credit a standing jump gets, so a post lands at its
-            // tip's edge), and the re-jump flies the chain row from there — never
-            // under a lid, on the running arc.
-            if (feasible || low)
+            if (ok)
+                break;
+            // A catch one block up uses only the normal creep/run envelope.
+            if (tight || mc >= this.tightCredit || this.extUpCatch)
                 return;
-            const sChain = Math.min(TAKEOFF_STAND, TAKEOFF_NARROW_MARGIN + CATCH_HALF[takeoffCatch]) * CHAIN_TAKEOFF_FRACTION * t.dist / (t.tx > t.tz ? t.tx : t.tz);
-            if (flightFrom(t.tx, t.tz, t.dist, sChain, lCred) > J_CHAIN[bucket] + this.marginCredit)
-                return;
-            needsRunning = true;
+            tight = true;
+            mc = this.tightCredit;
+            if (ladderCatchFix)
+                fn -= LADDER_CATCH_OVERCREDIT;
         }
-        // Corridor pass 2 — per cell the flight-curve bound mf = the lowest the
-        // feet can be over that cell (standing curve when a standing takeoff is
-        // possible — it is the lower of the two; bonked curves for head-hitters).
-        // Cells the body sweeps through must be passable; cells fully below the
-        // feet line only veto when a tall shape (fence, wall) pokes up across
-        // it. This is what lets a drop-jump fly over same-level corners near
-        // takeoff (feet at apex there) instead of demanding full landing-depth
-        // clearance everywhere.
+        if (tight)
+            cost += TIGHT_COST;
+        // Check each cell against the lowest feet height on the chosen arc.
+        // Blocks below that line only matter if a tall shape protrudes into it,
+        // allowing drop jumps over corners near takeoff.
         const mf = lipJump
             ? (low ? t.mfLowLip : t.mfLip)
             : low
@@ -1431,18 +2007,24 @@ export class MoveGen {
         for (let k = 0; k * 2 < cells.length; k++) {
             const cx = x + cells[k * 2] * sx;
             const cz = z + cells[k * 2 + 1] * sz;
-            // lim = lowest the feet get over this cell (+ grazing tolerance). One
-            // cell below the body range is still probed: a fence top reaches 1.5
-            // above its own cell.
+            // Probe one cell below the feet bound, including grazing tolerance:
+            // fence tops reach 1.5 blocks above their cell floor.
             const lim = h0 + mf[k] + 0.05;
             const loLy = Math.floor(lim) - 1;
             for (let ly = y - 1; ly >= loLy; ly--) {
+                // A refusal belongs to this arc; only the centre line selects
+                // alternate variants, since their arcs differ.
                 if (ly + 1 > lim) {
-                    if (!this.isSafe(this.flagsAt(cx, ly, cz)))
-                        return; // body cell
+                    if (!this.isSafe(this.flagsAt(cx, ly, cz)) && !this.thinClear(cx, ly, cz, t, k, sx, sz)) {
+                        if (landCatch === 0 && t.aimIndex === 0)
+                            this.extTryMask = this.thinShapeAt(cx, ly, cz) !== 0 ? -1 : t.avoid[k];
+                        return; 
+                    }
                 }
-                else if (this.heightAt(cx, ly, cz) > lim) {
-                    return; // pokes up into the flight path
+                else if (this.heightAt(cx, ly, cz) > lim && !this.thinClear(cx, ly, cz, t, k, sx, sz)) {
+                    if (landCatch === 0 && t.aimIndex === 0)
+                        this.extTryMask = this.thinShapeAt(cx, ly, cz) !== 0 ? -1 : t.avoid[k];
+                    return; 
                 }
             }
         }
@@ -1453,41 +2035,34 @@ export class MoveGen {
         cost += this.exclusionAt(tx, nodeY, tz);
         if (cost > 100)
             return;
-        // A NARROW support landing carries its flight direction as momentum.
-        // A catch (ladder, water, thin floor, bubble) has no landing tick to
-        // re-jump on, and neither has a landing that hurts: past three blocks
-        // of fall (the 1.25 apex plus the drop) the server answers the damage
-        // with a velocity packet that zeroes the body's horizontal motion on
-        // the landing tick — measured on parkouradv1's fence-to-fence
-        // (3,-3,5), where the next hop then left from rest and fell short. A
-        // full block carries none because it needs none: its lip take-off
-        // (0.94 of credit on the run rows) out-reaches a landing-tick re-jump
-        // (0.3 on J_CHAIN) in every bucket, so a momentum state there is a
-        // second copy of the cell's expansion — 3-5x the visited count on the
-        // arena's route book for no edge the cell lacks.
+        // Only narrow support landings retain momentum; catches lack a re-jump
+        // tick, and fall damage can zero horizontal velocity. Full supports
+        // already have greater lip reach, so momentum would duplicate states.
+        if (this.lavaFlanked(tx, nodeY, tz))
+            return;
         if (this.parkourMomentum && landCatch >= 1 && rise >= -MOMENTUM_MAX_DROP)
             this.pendingMom = momentumOf(t.tx * sx, t.tz * sz);
-        const runBit = (runNeeded || lipJump) ? META_RUN : 0;
+        const runBit = (runNeeded || lipJump || tight) ? META_RUN : 0;
         if (chainVia >= 0) {
             this.pendingVia = chainVia;
             this.push(tx, nodeY, tz, chainBase + cost, META_PARKOUR | META_CHAIN | META_RUN);
         }
         else if (chained) {
-            // The stone is this node itself: the path shows it as the previous
-            // node, and the executor lands it far-side and re-jumps from it.
+            // This node is the stepping stone; the executor lands far-side and re-jumps.
             this.pendingVia = this.cellIndex(x, y, z);
             this.push(tx, nodeY, tz, cost, META_PARKOUR | META_CHAIN | META_RUN);
         }
         else {
-            this.push(tx, nodeY, tz, cost, META_PARKOUR | runBit);
+            // Mirroring one axis flips the aimed line's perpendicular; two do not.
+            if (t.aimIndex !== 0)
+                this.pendingAim = t.aimIndex | (sx * sz < 0 ? 0x80 : 0);
+            const shiftBit = t.aimIndex !== 0 ? META_AIM : 0;
+            // Deep liquid catches have no return path and carry META_DEEP.
+            this.push(tx, nodeY, tz, cost, META_PARKOUR | runBit | shiftBit | ((y - nodeY) > this.maxDropDown ? META_DEEP : 0));
         }
     }
-    /**
-     * Landing scan for extended parkour: first support below flight level in
-     * the target column — a physical top (node above it), or a water / bubble /
-     * climbable catch (node at the cell itself). NaN when nothing in range.
-     * Probe order mirrors findLanding, with the climbable case added.
-     */
+    /** Scan the target column for support below flight level. Return the node
+     * above a physical top or inside a catching cell, or NaN if none is in range. */
   private findExtLanding (tx: number, y: number, tz: number): number {
         let ly = y - 1;
         while (ly > this.worldMinY) {
@@ -1530,7 +2105,7 @@ export class MoveGen {
         }
         return NaN;
     }
-    /** Vanilla climbs vines only against a wall (mirrors moveUp's rule). */
+    /** Vines require an adjacent solid wall for vanilla collision climbing. */
   private climbUsable (x: number, y: number, z: number): boolean {
         if (this.specialAt(x, y, z) !== SPECIAL_VINE)
             return true;

@@ -18,7 +18,7 @@ import {
   BOT_NAMES, HOST, JAR_PATH, MC_VERSION, PAPER_VERSION, PORT, RUN_DIR, SERVER_HEAP, SERVER_KIND, VIEW_DISTANCE, WORLD_NAME
 } from './config.js'
 
-const UA = 'bulba-pathfinder-arena/1.0 (+https://github.com/bulbastore)'
+const UA = 'bulba-pathfinder-arena/1.0 (+https://github.com/Vinciepincie/bulba-pathfinder)'
 
 async function exists (path: string): Promise<boolean> {
   try { await access(path); return true } catch { return false }

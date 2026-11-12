@@ -1,6 +1,6 @@
 // Executor-level tests: the full plugin driving a fake bot through fake
 // voxel physics. Covers the goto() promise contract (verbatim upstream error
-// names — the bulbastore wrapper string-matches them), events, stop()
+// names, since applications match on them), events, stop()
 // semantics, replan-on-block-update, and the improvement knobs.
 import { expect } from 'chai'
 import { Vec3 } from 'vec3'

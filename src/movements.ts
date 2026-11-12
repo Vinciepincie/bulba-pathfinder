@@ -1,35 +1,20 @@
-// API-compatible port of mineflayer-pathfinder's Movements class. Every
-// upstream field exists with the same meaning so existing code that tweaks a
-// Movements profile keeps working unchanged.
-//
-// Deliberate divergences:
-//   - canDig defaults to FALSE (upstream: true). Digging is fully supported
-//     with the upstream cost model when enabled, but it is opt-in — a
-//     pathfinder that silently digs is how bots get banned.
-//   - scafoldingBlocks defaults to [] and allow1by1towers to false. Non-empty
-//     scaffolding / towers are ignored with a one-time warning: this planner
-//     generates no placement moves (digging yes, placing no).
+// Unlike mineflayer-pathfinder, digging defaults off and block placement is unsupported.
 import { Vec3 } from 'vec3'
 import type { Bot } from 'mineflayer'
 import prismarineBlockLoader from 'prismarine-block'
+import type { Block } from 'prismarine-block'
 import type { MovementsConfig } from './types.js'
 import { interactableBlocks as interactableJson } from './interactableBlocks.js'
 import { passableEntities as passableEntitiesJson } from './passableEntities.js'
 
-/**
- * Should vines default to climbable on this version? True from 1.16 (the
- * vanilla `climbable` block tag — vines climb unconditionally in Java from
- * there). Uses the registry's own comparator when present (minecraft-data
- * ships one on every version); otherwise parses "major.minor" from the
- * version string and answers conservatively (false) when it can't tell.
- */
+/** Whether vines are climbable by default on this version (Java 1.16+).
+ * Uses the registry comparator or parses the version; unknown versions default to false. */
 export function vineClimbingDefault (registry: unknown, version: string | undefined): boolean {
   const reg = registry as { isNewerOrEqualTo?: (v: string) => boolean, version?: { minecraftVersion?: string } }
   if (typeof reg.isNewerOrEqualTo === 'function') {
     try {
       return reg.isNewerOrEqualTo('1.16')
     } catch {
-      // fall through to string parsing
     }
   }
   const source = version ?? reg.version?.minecraftVersion ?? ''
@@ -40,23 +25,87 @@ export function vineClimbingDefault (registry: unknown, version: string | undefi
   return major > 1 || (major === 1 && minor >= 16)
 }
 
-export type ExclusionArea = (block: unknown) => number
+/** Extra cost for a block, from a function of yours. It receives the live block from bot.blockAt. */
+export type ExclusionArea = (block: Block) => number
+
+/** Additional vines in the vanilla climbable tag: nether vines from 1.16 and cave vines from 1.17. */
+export const VINE_CLIMBABLES = ['weeping_vines', 'weeping_vines_plant', 'twisting_vines', 'twisting_vines_plant', 'cave_vines', 'cave_vines_plant'] as const
+const VINE_CLIMBABLE_NAMES: ReadonlySet<string> = new Set(VINE_CLIMBABLES)
+
+/** Named sets of movement flags for `Movements.applyPreset`. */
+export type MovementPreset = 'default' | 'parkour'
+
+/** Is this one of the vines only a patched prismarine-physics climbs? */
+export function isVineClimbable (name: string): boolean {
+  return VINE_CLIMBABLE_NAMES.has(name)
+}
+
+const vineProbe = new WeakMap<object, boolean>()
+
+/**
+ * Does the bot's prismarine-physics climb nether and cave vines? Stock does not, and
+ * scripts/patchPhysics.mjs adds them. One tick of falling through a vine cell tells:
+ * a climbable caps the fall, stock falls on. True when it cannot be told (a stand-in physics).
+ */
+export function physicsClimbsVines (bot: unknown): boolean {
+  const b = bot as { physics?: { simulatePlayer?: (state: unknown, world: unknown) => void }, registry?: { blocksByName?: Record<string, { id: number, name: string } | undefined> } }
+  const physics = b.physics
+  if (physics?.simulatePlayer === undefined) return true
+  const known = vineProbe.get(physics)
+  if (known !== undefined) return known
+  const vine = b.registry?.blocksByName?.weeping_vines ?? b.registry?.blocksByName?.cave_vines
+  if (vine === undefined) return true
+  const cell = { type: vine.id, name: vine.name, shapes: [], boundingBox: 'empty', position: new Vec3(0, 1000, 0), getProperties: () => ({}) }
+  const state = {
+    pos: new Vec3(0.5, 1000, 0.5),
+    vel: new Vec3(0, -0.5, 0),
+    control: { forward: false, back: false, left: false, right: false, jump: false, sprint: false, sneak: false },
+    onGround: false,
+    isInWater: false,
+    isInLava: false,
+    isInWeb: false,
+    isCollidedHorizontally: false,
+    isCollidedVertically: false,
+    elytraFlying: false,
+    jumpTicks: 0,
+    jumpQueued: false,
+    fireworkRocketDuration: 0,
+    yaw: 0,
+    pitch: 0,
+    jumpBoost: 0,
+    speed: 0,
+    slowness: 0,
+    dolphinsGrace: 0,
+    slowFalling: 0,
+    levitation: 0,
+    depthStrider: 0
+  }
+  try {
+    physics.simulatePlayer(state, {
+      getBlock: (p: Vec3) => Math.floor(p.x) === 0 && Math.floor(p.y) === 1000 && Math.floor(p.z) === 0 ? cell : null
+    })
+  } catch {
+    return true // Not memoized: the physics may not be ready yet.
+  }
+  const climbs = state.vel.y >= -0.5
+  vineProbe.set(physics, climbs)
+  return climbs
+}
 
 export class Movements {
   bot: Bot
 
-  // ── upstream-compatible knobs ────────────────────────────────────────────
-  /** Default false (opt-in). When true, dig moves use the upstream cost model. */
+  /** Enable digging with the mineflayer-pathfinder cost model. Default false, unlike mineflayer-pathfinder. */
   canDig: boolean
   digCost: number
   placeCost: number
   liquidCost: number
   entityCost: number
-  /** Improvement (opt-in): ride bubble-column elevators (soul sand up, magma down). */
+  /** Enable bubble-column elevators: soul sand pushes up, magma pulls down. Default false. */
   useBubbleColumns: boolean
-  /** Cost per block of bubble-column ride (default 1; true ride is faster). */
+  /** Cost per block of bubble-column travel. Default 1. */
   bubbleCost: number
-  /** Blocks of jump reach left unused as a buffer for tick timing and lagbacks. 0 = frame-perfect. */
+  /** Blocks of jump reach reserved for timing uncertainty and server corrections; 0 allows frame-perfect jumps. */
   parkourSafetyMargin: number
 
   dontCreateFlow: boolean
@@ -64,80 +113,38 @@ export class Movements {
   allow1by1towers: boolean
   allowFreeMotion: boolean
   allowParkour: boolean
-  /** Improvement (opt-in): extended parkour — see MovementsConfig.allowParkourExtended. */
+  /** Enable diagonal, long, raised and drop jumps, including ladder and liquid catches. Default false. */
   allowParkourExtended: boolean
-  /** Improvement (opt-in, needs allowParkourExtended): momentum-aware search — see MovementsConfig.allowParkourMomentum. */
+  /** Carry landing direction into search state to chain jumps. Default false; requires allowParkourExtended. */
   allowParkourMomentum: boolean
+  /** Offer frame-perfect jumps at a cost premium as a fallback. Default true; requires allowParkourExtended. */
+  allowParkourTight: boolean
+  /** Use physics-verified hops when table search fails. Default false; requires allowParkourExtended. */
+  allowParkourPhysics: boolean
   allowSprinting: boolean
-  /**
-   * Improvement (opt-in): hold jump while sprinting across open ground.
-   *
-   * Sprint-hopping is how a player actually crosses a plain — the jump keeps
-   * the sprint boost that ground friction eats. Measured on the arena's own
-   * server: 6.97 blocks/s against 5.56 sprinting, a 25% gain, with zero
-   * position corrections. It is only taken when a rollout of BOTH gaits down
-   * the same path says the hop gets further without losing height, so a ledge
-   * or a low ceiling simply declines it.
-   *
-   * Executor-only: the search never sees it, paths are unchanged and the wasm
-   * core needs nothing. Off by default — upstream has no such gait, and the
-   * package's promise is that the walking outcome matches until you ask for
-   * more.
-   */
+  /** Enable sprint-hopping when a rollout shows more progress without losing height.
+   * Airborne travel preserves the sprint boost that ground friction reduces. Default false. */
   allowSprintHop: boolean
-  /**
-   * Improvement (opt-in, needs allowSprintHop): hop through LOW-headroom
-   * ground instead of walking round or under it — a tunnel, an overhang, a
-   * single block in the way overhead.
-   *
-   * A 2-block roof is the fastest ground in the game for a bot that re-presses
-   * jump on each landing: the arc bonks off the ceiling and lands in ~5 ticks,
-   * so the sprint boost is renewed four times as often as it is under open
-   * sky. Measured on flat stone, same physics the executor rolls out against:
-   * sprint 5.59 blocks/s, hold-jump 6.50, press-on-landing 9.68.
-   *
-   * What it changes is only how far ahead a DROP in the ceiling vetoes a
-   * take-off. Off, that is the whole comparison horizon, which is safe and
-   * also switches the gait off for an entire passage — in a mostly-2-high
-   * tunnel every 3-high pocket has a low section within six nodes. On, the
-   * veto spans the arc's own footprint, so the bot sprints the last step into
-   * a low section and hops the moment it is under it, and never takes off
-   * from high ground into a ceiling it would hit side-on.
-   */
+  /** When false, stopping releases controls without snapping position or zeroing momentum. */
+  allowStopSnap: boolean
+  /** Limit ceiling-drop checks to the jump's footprint so low tunnels remain eligible for hopping.
+   * Prevents takeoff into the side of a lower ceiling. Default false; requires allowSprintHop. */
   allowLowCeilingHop: boolean
-  /**
-   * Improvement: steer at the furthest node reachable in a straight line the
-   * body fits down, instead of visiting every cell centre in turn.
-   *
-   * The planner routes over eight directions, so a run a few degrees off a
-   * cardinal comes back as an alternating zig-zag; a follower that aims at
-   * each centre walks every zig and swings its heading at every one. Skipped
-   * nodes retire by being gone by rather than by being stood on, and only
-   * where a swept hitbox says the line is walkable and the skipped nodes stay
-   * within collecting range of it.
-   *
-   * Executor-only: the plan is unchanged, and turning this off restores
-   * node-by-node following exactly.
-   */
+  /** Steer to the furthest node reachable by a swept hitbox to smooth the planner's zig-zags.
+   * Skipped nodes stay within collecting range. Default true; disabling follows each node. */
   allowCornerCut: boolean
-  /**
-   * Improvement (opt-in, executor only): line up a RUN for a parkour jump no
-   * gate authorises from where the body stands — back off to the rear of the
-   * support, sprint in, let the gates pick the take-off tick — instead of
-   * creeping to the lip and jumping from rest. The planner marks the jumps
-   * that need it (Move.run). Off, the executor keeps the single run-back
-   * attempt it always had. Measured on the arena's basic3 (a 4x4 diagonal
-   * the standing reach cannot fly): 2.5-3.2 s of standing at the lip gone.
-   */
+  /** Back off and sprint across the support for jumps that standing reach cannot clear.
+   * Executor only; default false. */
   allowRunUp: boolean
-  /**
-   * Improvement (opt-in, executor only): retire a parkour landing the body
-   * came down PAST — just landed, within a block, beyond the node along its
-   * flight — instead of turning round to enter its 0.35 box. Measured on the
-   * arena's basic1 (a chain of 2-block hops): 8 ticks per hop from landing to
-   * the next take-off became 2, 11.3 s → 10.0 s.
-   */
+  /** Retire a parkour landing when the body lands within a block beyond it along the flight line,
+   * avoiding a turn back into the node's arrival box. Default false. */
   allowLandingRetire: boolean
+  /** Let the physics kernel choose and replay the fastest run-and-jump schedule through nearby gaps
+   * and rises. Default false; requires allowSprintHop. */
+  allowHopIntoJump: boolean
+  /** Run and hop with 45-degree strafe input: its magnitude is 1.0 versus 0.98 for forward alone.
+   * Default false; requires allowHopIntoJump. */
+  allowStrafe: boolean
   allowEntityDetection: boolean
 
   entitiesToAvoid: Set<string>
@@ -157,11 +164,8 @@ export class Movements {
   openable: Set<number>
 
   canOpenDoors: boolean
-  /**
-   * Improvement over upstream: when canOpenDoors is set, also traverse
-   * closed non-iron doors by activating them (upstream only handles fence
-   * gates). Set to false for strict upstream reachability parity.
-   */
+  /** Also activate closed non-iron doors when canOpenDoors is enabled. Default true;
+   * mineflayer-pathfinder handles only fence gates. */
   canOpenRealDoors: boolean
   /** Non-iron door block ids (traversed via activate when doors are enabled). */
   doors: Set<number>
@@ -179,28 +183,33 @@ export class Movements {
     const registry = bot.registry
     this.bot = bot
 
-    this.canDig = false // divergence from upstream default (true): digging is opt-in
+    this.canDig = false 
     this.digCost = 1
     this.placeCost = 1
     this.liquidCost = 1
     this.entityCost = 1
-    this.useBubbleColumns = false // improvement, opt-in (upstream: columns are plain air)
+    this.useBubbleColumns = false 
     this.bubbleCost = 1
     this.parkourSafetyMargin = 0.1
 
     this.dontCreateFlow = true
     this.dontMineUnderFallingBlock = true
-    this.allow1by1towers = false // divergence: no placement moves exist
+    this.allow1by1towers = false 
     this.allowFreeMotion = false
     this.allowParkour = true
-    this.allowParkourExtended = false // improvement, opt-in (upstream only jumps straight and flat)
-    this.allowParkourMomentum = false // improvement, opt-in (landing momentum as search state)
+    this.allowParkourExtended = false 
+    this.allowParkourMomentum = false 
+    this.allowParkourTight = true 
+    this.allowParkourPhysics = false 
     this.allowSprinting = true
-    this.allowSprintHop = false // improvement, opt-in (executor gait only)
-    this.allowLowCeilingHop = false // improvement, opt-in (executor gait only)
-    this.allowCornerCut = true // improvement, on (executor steering only; plan unchanged)
-    this.allowRunUp = false // improvement, opt-in (executor take-off only)
-    this.allowLandingRetire = false // improvement, opt-in (executor arrival only)
+    this.allowSprintHop = false 
+    this.allowStopSnap = true 
+    this.allowLowCeilingHop = false 
+    this.allowCornerCut = true 
+    this.allowRunUp = false 
+    this.allowLandingRetire = false 
+    this.allowHopIntoJump = false 
+    this.allowStrafe = false 
     this.allowEntityDetection = true
 
     this.entitiesToAvoid = new Set()
@@ -232,18 +241,14 @@ export class Movements {
 
     this.climbables = new Set()
     this.climbables.add(registry.blocksByName.ladder.id)
-    // Improvement over upstream (which ships `climbables.add(vine)` commented
-    // out): vines are unconditionally climbable in vanilla Java since the
-    // 1.16 `climbable` block tag, and prismarine-physics climbs them, so the
-    // executor can perform every vine plan. Auto-enabled on 1.16+ only —
-    // older versions gated vine climbing on a backing block, which the
-    // planner can't verify, so there we keep upstream's behavior. Opt out
-    // with `movements.climbables.delete(vineId)`. Deliberately ladder+vine
-    // ONLY: nether/cave vines are in the vanilla climbable tag too, but
-    // prismarine-physics does NOT climb them — planning them would produce
-    // paths the bot physically cannot walk.
+    // Before Java 1.16, vines require a backing block that the planner cannot verify.
+    // Nether and cave vines rely on the package's prismarine-physics patch for climbing.
     if (registry.blocksByName.vine && vineClimbingDefault(registry, (bot as { version?: string }).version)) {
       this.climbables.add(registry.blocksByName.vine.id)
+      for (const name of physicsClimbsVines(bot) ? VINE_CLIMBABLES : []) {
+        const b = registry.blocksByName[name]
+        if (b !== undefined) this.climbables.add(b.id)
+      }
     }
 
     this.emptyBlocks = new Set()
@@ -255,12 +260,10 @@ export class Movements {
     this.replaceables.add(registry.blocksByName.water.id)
     this.replaceables.add(registry.blocksByName.lava.id)
 
-    // Divergence: upstream defaults to [dirt, cobblestone]; this planner has
-    // no placement moves, so scaffolding is inert and defaults empty.
+    // Scaffolding defaults empty because the planner generates no placement moves.
     this.scafoldingBlocks = []
 
-    // Same classification pass as upstream: per block TYPE from its default
-    // state — fences are anything with collision top > 1, carpets < 0.1.
+    // Classification uses each block type's default state: fences have tops > 1, carpets < 0.1.
     const Block = prismarineBlockLoader(bot.registry)
     this.fences = new Set()
     this.carpets = new Set()
@@ -298,23 +301,22 @@ export class Movements {
     this.entityIntersections = {}
   }
 
-  // ── upstream-compatible helpers used by the plugin ───────────────────────
 
-  exclusionPlace (block: unknown): number {
+  exclusionPlace (block: Block): number {
     if (this.exclusionAreasPlace.length === 0) return 0
     let weight = 0
     for (const a of this.exclusionAreasPlace) weight += a(block)
     return weight
   }
 
-  exclusionStep (block: unknown): number {
+  exclusionStep (block: Block): number {
     if (this.exclusionAreasStep.length === 0) return 0
     let weight = 0
     for (const a of this.exclusionAreasStep) weight += a(block)
     return weight
   }
 
-  exclusionBreak (block: unknown): number {
+  exclusionBreak (block: Block): number {
     if (this.exclusionAreasBreak.length === 0) return 0
     let weight = 0
     for (const a of this.exclusionAreasBreak) weight += a(block)
@@ -346,10 +348,7 @@ export class Movements {
     this.entityIntersections = {}
   }
 
-  /**
-   * Finds blocks intersected by entity bounding boxes, upstream-identical.
-   * The result is baked into the solver snapshot per compute.
-   */
+  /** Index blocks intersected by entity bounding boxes for the solver snapshot. */
   updateCollisionIndex (): void {
     for (const ent of Object.values(this.bot.entities)) {
       if (ent === this.bot.entity) continue
@@ -385,11 +384,7 @@ export class Movements {
     return this.entityIntersections[`${pos.x + dx},${pos.y + dy},${pos.z + dz}`] ?? 0
   }
 
-  /**
-   * Upstream-compatible pseudo-block probe (external consumers use this).
-   * The internal solver does NOT go through here — it reads the LUT — but
-   * both implement the identical classification.
-   */
+  /** Pseudo-block probe for external consumers; the internal solver reads the equivalent LUT classification. */
   getBlock (pos: { x: number, y: number, z: number } | null, dx: number, dy: number, dz: number): Record<string, unknown> {
     const b = pos
       ? (this.bot.blockAt(new Vec3(pos.x + dx, pos.y + dy, pos.z + dz), false) as Record<string, unknown> | null)
@@ -421,11 +416,10 @@ export class Movements {
     return b
   }
 
-  /** Upstream-compatible; always false here — this planner never digs. */
+  /** Check whether mining is enabled and safe under liquid, falling-block and exclusion constraints. */
   safeToBreak (block: { position?: { x: number, y: number, z: number }, type?: number }): boolean {
     if (!this.canDig) return false
-    // Unreachable in this package (canDig is rejected at setMovements), but
-    // keep the upstream logic for API completeness.
+    // Mining beside liquid can create a flow into the path.
     if (this.dontCreateFlow) {
       if ((this.getBlock(block.position ?? null, 0, 1, 0) as { liquid: boolean }).liquid) return false
       if ((this.getBlock(block.position ?? null, -1, 0, 0) as { liquid: boolean }).liquid) return false
@@ -439,21 +433,20 @@ export class Movements {
         return false
       }
     }
-    return Boolean(block.type) && !this.blocksCantBreak.has(block.type as number) && this.exclusionBreak(block) < 100
+    return Boolean(block.type) && !this.blocksCantBreak.has(block.type as number) && this.exclusionBreak(block as unknown as Block) < 100
   }
 
-  /** Upstream-compatible cost probe: safe blocks cost their weights, unbreakable = 100. */
+  /** Return step and entity weights, or 100 for an unbreakable block; append required breaks to toBreak. */
   safeOrBreak (block: { safe?: boolean, position?: { x: number, y: number, z: number } }, toBreak: Array<{ x: number, y: number, z: number }> = []): number {
     let cost = 0
-    cost += this.exclusionStep(block)
+    cost += this.exclusionStep(block as unknown as Block)
     cost += this.getNumEntitiesAt(block.position ?? null, 0, 0, 0) * this.entityCost
     if (block.safe) return cost
     if (!this.safeToBreak(block as { position?: { x: number, y: number, z: number }, type?: number })) return 100
     if (block.position) toBreak.push(block.position)
-    return cost // dig-time labor cost is unreachable with canDig=false
+    return cost 
   }
 
-  // ── package-internal ─────────────────────────────────────────────────────
 
   /** Serializable solver config snapshot of this profile. */
   toConfig (): MovementsConfig {
@@ -474,20 +467,21 @@ export class Movements {
       useBubbleColumns: this.useBubbleColumns,
       bubbleCost: this.bubbleCost,
       parkourSafetyMargin: this.parkourSafetyMargin,
-      allowParkourMomentum: this.allowParkourMomentum
+      allowParkourMomentum: this.allowParkourMomentum,
+      allowParkourTight: this.allowParkourTight,
+      allowParkourPhysics: this.allowParkourPhysics
     }
   }
 
-  /**
-   * Fingerprint of everything the block-classification LUT depends on. The
-   * LUT (and any snapshot built from it) is rebuilt when this changes.
-   */
+  /** Fingerprint of the block-classification settings; changes invalidate
+   * the LUT and snapshots built from it. */
   lutFingerprint (): string {
     const setKey = (s: Set<number>): string => [...s].sort((a, b) => a - b).join(',')
     return [
-      // Registry identity: state ids renumber between MC versions, so two
-      // bots on different versions must never share LUT tables.
+      // State IDs vary by Minecraft version, so bots on different versions cannot share LUTs.
       String((this.bot as { version?: string }).version ?? ''),
+      // The kernel's climbable table follows the bot's physics, not only this profile.
+      physicsClimbsVines(this.bot) ? 'v1' : 'v0',
       setKey(this.blocksToAvoid),
       setKey(this.liquids),
       setKey(this.climbables),
@@ -496,19 +490,40 @@ export class Movements {
       setKey(this.openable),
       setKey(this.doors),
       this.canOpenRealDoors ? 'd1' : 'd0',
-      // The LUT's special grid (bubble columns) exists only when opted in.
+      // Optional special-grid contents are part of the cache identity.
       this.useBubbleColumns ? 'b1' : 'b0',
-      // Extended parkour marks slime blocks into the special grid.
       this.allowParkourExtended ? 'x1' : 'x0'
     ].join('|')
   }
 
-  /** Loud invariant check, called from setMovements / goto. */
-  assertSupported (): void {
+  /**
+   * Apply a named set of movement flags, and return this profile.
+   * `parkour` turns on every physics-verified move and the fastest gaits; `default` turns them back off.
+   */
+  applyPreset (preset: MovementPreset): this {
+    if (preset !== 'default' && preset !== 'parkour') throw new Error(`Unknown movement preset: ${String(preset)}`)
+    const on = preset === 'parkour'
+    this.allowParkour = true
+    this.allowSprinting = true
+    this.allowCornerCut = true
+    this.allowParkourExtended = on
+    this.allowParkourMomentum = on
+    this.allowParkourPhysics = on
+    this.allowSprintHop = on
+    this.allowLowCeilingHop = on
+    this.allowRunUp = on
+    this.allowLandingRetire = on
+    this.allowHopIntoJump = on
+    this.allowStrafe = on
+    return this
+  }
+
+  /** Warn once when unsupported block-placement settings are enabled. */
+  assertSupported (warn: (message: string) => void = console.warn): void {
     if ((this.allow1by1towers || this.scafoldingBlocks.length > 0) && !warnedScaffolding) {
       warnedScaffolding = true
-      console.warn(
-        '@bulba/pathfinder: allow1by1towers/scafoldingBlocks are ignored — this planner generates no block-placement moves.'
+      warn(
+        '@bulba/pathfinder: allow1by1towers and scafoldingBlocks are ignored, because this planner generates no block placement moves.'
       )
     }
   }

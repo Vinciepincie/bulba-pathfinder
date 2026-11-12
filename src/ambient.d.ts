@@ -1,5 +1,4 @@
-// Minimal WebAssembly ambient types (we compile with lib:ES2022 only — no
-// DOM lib — and only need this narrow surface).
+// WebAssembly needs ambient types because the compiler excludes the DOM library.
 declare namespace WebAssembly {
   interface Memory {
     readonly buffer: ArrayBuffer

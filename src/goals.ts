@@ -193,7 +193,7 @@ export class GoalLookAtBlock extends Goal {
     super()
     this.pos = pos
     this.world = world
-    this.reach = options.reach || 4.5 // default survival: 4.5 creative: 5
+    this.reach = options.reach || 4.5 // Survival reach is 4.5 blocks; creative reach is 5.
     this.entityHeight = options.entityHeight || 1.6
   }
 
@@ -205,12 +205,12 @@ export class GoalLookAtBlock extends Goal {
   }
 
   isEnd (node: XYZ): boolean {
-    // Upstream calls node.distanceTo (nodes are Vec3 subclasses); accept
-    // plain XYZ nodes too.
-    const eye = this.pos.offset(0, this.entityHeight, 0)
-    const ex = node.x - eye.x
-    const ey = node.y - eye.y
-    const ez = node.z - eye.z
+    // A cheap bound before the raycasts: from the stance's eye to the nearest point of the block.
+    // mineflayer-pathfinder measures from the feet to a point above the block, which rejects
+    // reachable blocks above the bot.
+    const ex = node.x + 0.5 - Math.min(Math.max(node.x + 0.5, this.pos.x), this.pos.x + 1)
+    const ey = node.y + this.entityHeight - Math.min(Math.max(node.y + this.entityHeight, this.pos.y), this.pos.y + 1)
+    const ez = node.z + 0.5 - Math.min(Math.max(node.z + 0.5, this.pos.z), this.pos.z + 1)
     if (Math.sqrt(ex * ex + ey * ey + ez * ez) > this.reach) return false
     const dx = node.x - (this.pos.x + 0.5)
     const dy = node.y + this.entityHeight - (this.pos.y + 0.5)
@@ -237,11 +237,7 @@ export class GoalLookAtBlock extends Goal {
   }
 }
 
-/**
- * Path to a position from which a face of the block is visible. You'll
- * manually need to break the block — THIS WON'T BREAK IT. (Ported verbatim,
- * including upstream's constructor signature.)
- */
+/** Path to a visible block face for manual breaking; reaching this goal does not break it. */
 export class GoalBreakBlock extends Goal {
   goal: GoalLookAtBlock
 
@@ -401,8 +397,9 @@ export class GoalFollow extends Goal {
     return false
   }
 
+  /** A despawned or disconnected entity ends the goal instead of leaving a walk to where it was. */
   isValid (): boolean {
-    return this.entity != null
+    return this.entity != null && this.entity.isValid !== false
   }
 }
 

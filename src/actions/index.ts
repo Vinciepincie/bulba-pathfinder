@@ -1,16 +1,27 @@
-// Assembles the overridable interaction table.
 import { ActionError, ActionErrors, DEFAULT_ACTION_CONFIG } from './types.js'
-import type { ActionConfig, ActionTable, ActivateOptions, BlockLike } from './types.js'
+import type { ActionConfig, ActionName, ActionTable, ActivateOptions, BlockLike } from './types.js'
 import type { ActionContext } from './context.js'
-import { createDig } from './dig.js'
+import { createDig, throwIfAborted } from './dig.js'
 import { createPlace } from './place.js'
 import { createOpen } from './open.js'
 import { Pacer } from './pacing.js'
 import {
-  cellCentre, fmt, hasLineOfSight, inReach, pickFace, reachToCell, eyePos, settleAim, waitTicks
+  cellCentre, fmt, hasLineOfSight, inReach, pickFace, reachToCell, eyePos, settleAim, untilStopped, waitTicks
 } from './reach.js'
 
-export function createActionTable (ctx: ActionContext): ActionTable {
+type AnyAction = (...args: unknown[]) => Promise<unknown>
+
+/** One `actions.wrap`, linked to its neighbours so that it can leave from anywhere in the stack. */
+interface WrapLayer {
+  call: AnyAction
+  below: AnyAction
+  above: WrapLayer | null
+}
+
+export function createActionTable (host: Omit<ActionContext, 'equip'>): ActionTable {
+  const ctx: ActionContext = { ...host, equip: async (item, destination) => await table.equip(item, destination) }
+  const slots = (): Record<ActionName, AnyAction> => table as unknown as Record<ActionName, AnyAction>
+  const layers = new WeakMap<AnyAction, WrapLayer>()
   const table: ActionTable = {
     config: ctx.config,
     dig: createDig(ctx),
@@ -18,16 +29,36 @@ export function createActionTable (ctx: ActionContext): ActionTable {
     open: createOpen(ctx),
     activate: createActivate(ctx),
     equip: async (item: unknown, destination = 'hand') => {
-      await ctx.bot.equip(item, destination)
+      await untilStopped(ctx.bot, () => ctx.bot.equip(item, destination))
+    },
+    wrap (name, wrapper) {
+      const layer: WrapLayer = { call: async () => {}, below: slots()[name], above: null }
+      const wrapped = (wrapper as unknown as (next: AnyAction) => AnyAction)(async (...args) => await layer.below(...args))
+      let active = true
+      // The pass-through serves anyone who kept a reference to this layer before it left.
+      layer.call = async (...args) => await (active ? wrapped(...args) : layer.below(...args))
+      const under = layers.get(layer.below)
+      if (under !== undefined) under.above = layer
+      layers.set(layer.call, layer)
+      slots()[name] = layer.call
+      return () => {
+        if (!active) return
+        active = false
+        const lower = layers.get(layer.below)
+        if (layer.above !== null) {
+          layer.above.below = layer.below
+          if (lower !== undefined) lower.above = layer.above
+        } else if (slots()[name] === layer.call) {
+          slots()[name] = layer.below
+          if (lower !== undefined) lower.above = null
+        }
+      }
     }
   }
   return table
 }
 
-/**
- * Right-click a block without expecting a window: a lever, a button, a door,
- * a note block. Same reach and aim discipline as the rest; no window wait.
- */
+/** Right-click without waiting for a window, using the same reach and aim guards as other actions. */
 function createActivate (ctx: ActionContext) {
   return async function activate (block: BlockLike, options: ActivateOptions = {}): Promise<void> {
     const bot = ctx.bot
@@ -38,9 +69,7 @@ function createActivate (ctx: ActionContext) {
 
     let lastError: Error | null = null
     for (let attempt = 1; attempt <= retries; attempt++) {
-      if (options.signal?.aborted === true) {
-        throw new ActionError(ActionErrors.ABORTED, `Activate on ${fmt(pos)} was aborted.`, pos)
-      }
+      throwIfAborted(options.signal, pos)
       const live = bot.blockAt(pos, false)
       if (!live) {
         throw new ActionError(ActionErrors.NO_TARGET, `No block loaded at ${fmt(pos)}.`, pos)
@@ -75,15 +104,16 @@ function createActivate (ctx: ActionContext) {
       }
 
       const sneak = options.sneak === true
-      if (sneak) {
-        bot.setControlState('sneak', true)
-        await waitTicks(bot, 2)
-      }
       try {
-        await bot.activateBlock(live, aim ? aim.face : undefined)
+        if (sneak) {
+          bot.setControlState('sneak', true)
+          await waitTicks(bot, 2)
+        }
+        await untilStopped(bot, () => bot.activateBlock(live, aim ? aim.face : undefined), options.signal)
         bot.emit('pathfinder:activate', pos, live)
         return
       } catch (err) {
+        if (err instanceof ActionError && err.name === ActionErrors.ABORTED) throw err
         lastError = err as Error
         await waitTicks(bot, 4)
       } finally {

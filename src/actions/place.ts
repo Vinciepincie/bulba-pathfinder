@@ -1,25 +1,5 @@
-// The default place.
-//
-// `bot.placeBlock(ref, face)` clicks a face and waits for a block update. Two
-// things about that are wrong often enough to matter:
-//
-// 1. **Right-clicking an interactable block opens it.** Chests, barrels,
-//    hoppers, crafting tables, furnaces — clicking one with a block in hand
-//    opens its window instead of placing, exactly as it does in vanilla. The
-//    fix is the same as in vanilla: sneak. A shulker station sitting on a
-//    hopper is unplaceable without it, and the failure is silent — a window
-//    opens, no block appears, and the next action finds a window it did not
-//    open.
-// 2. **`placeBlock` rejecting is not the same as the placement failing.** Its
-//    block-update wait times out on a lagging server after the placement
-//    landed. Treating the rejection as failure makes the bot place a second
-//    block, or "fail" a placement that worked. The world is the only judge.
-//
-// The face order also matters for shulker boxes specifically: a shulker
-// opens along the face it was placed against, and a shulker whose opening is
-// sealed by another block can never be opened again. Preferring the support
-// BELOW (so it opens upward) and refusing any face whose opening is blocked
-// is what stops the bot from bricking its own storage.
+// Sneak against interactable supports so placement does not open them.
+// Verify world state even after rejection; a block-update wait can time out after placement lands.
 import { Vec3 } from 'vec3'
 import { ActionError, ActionErrors } from './types.js'
 import type { PlaceOptions } from './types.js'
@@ -27,17 +7,14 @@ import type { ActionContext } from './context.js'
 import { interactableBlocks } from '../interactableBlocks.js'
 import {
   bodyOverlaps, facePoint, fmt, hasLineOfSight, inReach, reachToCell, eyePos,
-  settleAim, settleGrounded, waitTicks
+  settleAim, settleGrounded, untilStopped, waitTicks
 } from './reach.js'
 import { deadlineFrom, throwIfAborted } from './dig.js'
 
 const INTERACTABLE = new Set(interactableBlocks)
 
-/**
- * Faces to try, best first: the block below (opens upward), then the four
- * sides, then hung from a ceiling. Expressed as the direction from the target
- * cell TOWARD the supporting block.
- */
+/** Supporting directions in preference order: below, sides, then above.
+ * A support below leaves a placed shulker box opening upward. */
 const DEFAULT_FACES: Vec3[] = [
   new Vec3(0, -1, 0),
   new Vec3(0, 0, 1),
@@ -76,9 +53,8 @@ export function createPlace (ctx: ActionContext) {
 
       const occupant = bot.blockAt(pos, false)
       if (occupant && !AIR_NAMES.has(occupant.name)) {
-        // Already filled. If it is what we wanted, we are done; if not, the
-        // caller asked for something this action must not do (break it).
-        if (wantName === null || occupant.name === wantName) return
+        // Existing blocks are accepted only when they match; placement must not break replacements.
+        if (wantName === null || placedFrom(bot, occupant, item)) return
         throw new ActionError(
           ActionErrors.PLACE_FAILED,
           `${fmt(pos)} already holds ${occupant.name}; refusing to replace it.`, pos
@@ -92,11 +68,12 @@ export function createPlace (ctx: ActionContext) {
         )
       }
 
-      const support = findSupport(ctx, pos, options)
+      const support = findSupport(ctx, pos, options, item.name ?? '', reach)
       if (!support) {
+        // Not refused: walking elsewhere changes nothing about the faces around the cell.
         throw new ActionError(
           ActionErrors.PLACE_FAILED,
-          `No supporting face for ${fmt(pos)} that leaves the block usable.`, pos, true
+          `No supporting face for ${fmt(pos)} that leaves the block usable.`, pos
         )
       }
 
@@ -143,19 +120,19 @@ interface Support {
 }
 
 /**
- * Find a block to place against. Rejects any face whose "opening" side is
- * obstructed, which is what keeps a placed shulker box openable.
+ * Find a supporting face, in preference order, preferring one the bot can reach and see now.
+ * A shulker box opens away from its support, so for one the opposite side must be clear.
  */
-function findSupport (ctx: ActionContext, pos: Vec3, options: PlaceOptions): Support | null {
+function findSupport (ctx: ActionContext, pos: Vec3, options: PlaceOptions, itemName: string, reach: number): Support | null {
   const bot = ctx.bot
   const faces = options.faces ?? DEFAULT_FACES
-  const requireOpenable = options.requireOpenable !== false
+  const requireOpenable = options.requireOpenable ?? itemName.endsWith('shulker_box')
 
+  let first: Support | null = null
   for (const dir of faces) {
     const refPos = pos.plus(dir)
     const ref = bot.blockAt(refPos, false)
-    // boundingBox, not the name: `cave_air` is not `air`, and a name check
-    // misses half the world.
+    // boundingBox includes all air variants, including cave_air.
     if (!ref || ref.boundingBox !== 'block') continue
 
     if (requireOpenable) {
@@ -164,13 +141,15 @@ function findSupport (ctx: ActionContext, pos: Vec3, options: PlaceOptions): Sup
       if (opening && opening.boundingBox !== 'empty') continue
     }
 
-    return {
+    const support: Support = {
       ref: refPos,
       faceVector: dir.scaled(-1), // ref → target
       interactable: INTERACTABLE.has(ref.name)
     }
+    if (inReach(bot, refPos, reach) && hasLineOfSight(bot, refPos, facePoint(refPos, support.faceVector), reach)) return support
+    first ??= support
   }
-  return null
+  return first
 }
 
 async function attemptPlace (
@@ -194,7 +173,7 @@ async function attemptPlace (
   }
 
   if (bot.heldItem == null || bot.heldItem.type !== item.type) {
-    await bot.equip(item, 'hand')
+    await ctx.equip(item, 'hand')
   }
 
   if (options.requireGrounded !== false) await settleGrounded(bot, 20)
@@ -206,22 +185,21 @@ async function attemptPlace (
     )
   }
 
-  // Sneak whenever the reference block would otherwise open. Doing it
-  // unconditionally is also fine and slightly safer, which is why it is the
-  // default — sneaking never prevents a placement.
+  // Sneaking prevents interactable reference blocks from opening during placement.
   const sneak = options.sneak !== false && (support.interactable || options.sneak === true)
   bot.emit('pathfinder:place_start', pos, item)
-  if (sneak) {
-    bot.setControlState('sneak', true)
-    await waitTicks(bot, 2)
-  }
   try {
-    ctx.pacer.noteAction(item.name ?? null)
-    await bot.placeBlock(refBlock, support.faceVector)
-  } catch {
-    // Deliberately swallowed: placeBlock's block-update wait rejects on a
-    // lagging server even when the placement landed. The verify below is the
-    // only judge.
+    if (sneak) {
+      bot.setControlState('sneak', true)
+      await waitTicks(bot, 2)
+    }
+    await untilStopped(bot, async () => {
+      ctx.pacer.noteAction(item.name ?? null)
+      await bot.placeBlock(refBlock, support.faceVector)
+    }, options.signal)
+  } catch (err) {
+    if (err instanceof ActionError && err.name === ActionErrors.ABORTED) throw err
+    // A delayed update can reject after placement succeeds; verify the world below.
   } finally {
     if (sneak) bot.setControlState('sneak', false)
   }
@@ -229,7 +207,7 @@ async function attemptPlace (
   await waitTicks(bot, options.settleTicks ?? 10)
 
   const placed = bot.blockAt(pos, false)
-  const ok = placed && !AIR_NAMES.has(placed.name) && (item.name === undefined || placed.name === item.name)
+  const ok = placed && !AIR_NAMES.has(placed.name) && (item.name === undefined || placedFrom(bot, placed, item))
   if (!ok) {
     throw new ActionError(
       ActionErrors.PLACE_FAILED,
@@ -238,10 +216,29 @@ async function attemptPlace (
     )
   }
 
-  // Placements share the break pacing window: a checker counting block
-  // actions does not care which kind they were.
+  // Breaks and placements share the same server action-rate budget.
   await ctx.pacer.cooldown(options.pacing ?? ctx.config.pacing, t => waitTicks(bot, t))
   bot.emit('pathfinder:place_finish', pos, placed)
+}
+
+/**
+ * Whether this block is what placing `item` makes. Most items place a block of their own name; some place
+ * another (torch on a wall, redstone, string, seeds, signs on a wall). Those drop the item, and no item
+ * carries their name. That rule rejects stone for cobblestone, though stone drops it.
+ */
+export function placedFrom (bot: ActionContext['bot'], block: { name: string, type: number }, item: { type: number, name?: string }): boolean {
+  if (item.name === undefined || block.name === item.name) return true
+  if (block.name === 'wheat' && item.name === 'wheat_seeds') return true
+  const registry = (bot as { registry?: { blocks?: Record<number, { drops?: unknown[] }>, itemsByName?: Record<string, unknown> } }).registry
+  if (registry?.blocks === undefined || registry.itemsByName === undefined) return false
+  if (registry.itemsByName[block.name] !== undefined) return false
+  // minecraft-data lists a drop as an item id, or as { drop: id } or { drop: { id } }.
+  const dropId = (d: unknown): number | undefined => {
+    if (typeof d === 'number') return d
+    const drop = (d as { drop?: unknown }).drop
+    return typeof drop === 'number' ? drop : (drop as { id?: number } | undefined)?.id
+  }
+  return (registry.blocks[block.type]?.drops ?? []).some(d => dropId(d) === item.type)
 }
 
 function resolveItem (

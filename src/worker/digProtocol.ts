@@ -1,4 +1,2 @@
-// Shared constant for the host↔worker dig-table residency protocol. Both
-// sides evict by insertion order at the SAME bound, so the host's record of
-// what it has sent always matches what the worker still holds.
+// Host and worker evict at the same insertion-order bound so their residency records agree.
 export const MAX_DIG_TABLES = 8

@@ -1,21 +1,4 @@
-// The default dig.
-//
-// `bot.dig(block)` is one packet sequence with no guards around it. Every
-// failure below is one this file exists to stop, and each one presents to the
-// application as "the bot just stood there":
-//
-//   - out of the server's reach, so the START packet is dropped in silence
-//   - aimed at a face the server derives differently from the rotation it has
-//   - swung while airborne or sliding, from a position not yet agreed
-//   - swung within the correction window after a lagback
-//   - the block decayed/changed between the decision and the swing
-//   - the footing broke mid-dig and the bot is now falling somewhere else
-//   - the dig "succeeded" client-side but the block is still there
-//
-// The contract: this either breaks the block, or throws. A refusal (out of
-// reach, occluded, lagback) throws with `refused = true` so the caller can
-// reposition and retry rather than treating it as a hard failure. It never
-// re-hammers a block the server has already dropped a click for.
+// Refuse invalid swings and verify the world update; client-side dig completion is not proof of a break.
 import { Vec3 } from 'vec3'
 import { ActionError, ActionErrors } from './types.js'
 import type { BlockLike, DigOptions } from './types.js'
@@ -38,6 +21,9 @@ const WATCH_INTERVAL = 50
 /** Slack added to the dig-time estimate before the wall-clock timeout fires. */
 const DIG_TIMEOUT_SLACK = 2000
 
+/** Ticks a break waits for the server's answer when no pacing cooldown already gives it the time. */
+const REFUSAL_TICKS = 4
+
 export function createDig (ctx: ActionContext) {
   return async function dig (block: BlockLike, options: DigOptions = {}): Promise<void> {
     const cfg = ctx.config
@@ -59,14 +45,17 @@ export function createDig (ctx: ActionContext) {
         )
       }
 
-      // Re-read every attempt: the world moved on while we were failing.
+      // Retries need fresh state because the target can change while waiting.
       const live = ctx.bot.blockAt(pos, false)
-      if (!live || live.name === 'air' || live.name === 'cave_air' || live.name === 'void_air') {
-        return // already gone — that is a success, whoever did it
+      // Unloaded is not air: nothing is known about that cell.
+      if (live === null || live === undefined) {
+        throw new ActionError(ActionErrors.NO_TARGET, `The chunk at ${fmt(pos)} is not loaded.`, pos, true)
+      }
+      if (live.name === 'air' || live.name === 'cave_air' || live.name === 'void_air') {
+        return // An absent block already satisfies the request.
       }
       if (live.name !== wantName) {
-        // Something else is there now. Breaking it would be a different act
-        // than the caller asked for.
+        // A replacement block is outside the requested action.
         throw new ActionError(
           ActionErrors.NO_TARGET,
           `Block at ${fmt(pos)} is ${live.name}, expected ${wantName}.`, pos, true
@@ -77,11 +66,12 @@ export function createDig (ctx: ActionContext) {
         await attemptDig(ctx, live, pos, { ...options, reach, pacing })
         return
       } catch (err) {
+        // Cancelling a swing makes it fail, and that is not a failure to retry or to report.
+        throwIfAborted(options.signal, pos)
         lastError = err as Error
         const refused = err instanceof ActionError && err.refused
         if (!refused && !(err instanceof ActionError)) {
-          // A genuine dig error from mineflayer — surface it rather than
-          // spending the remaining attempts on something structural.
+          // Structural dig errors cannot be repaired by retrying.
           throw err
         }
         if (err instanceof ActionError && err.name === ActionErrors.OUT_OF_REACH && options.approach !== false) {
@@ -94,8 +84,7 @@ export function createDig (ctx: ActionContext) {
           }
           continue
         }
-        // Give the world a moment to settle before the next attempt; a retry
-        // fired on the same tick would hit the same state.
+        // Retrying in the same tick would see the same state.
         await waitTicks(ctx.bot, 4)
       }
     }
@@ -115,7 +104,6 @@ async function attemptDig (
   const bot = ctx.bot
   const reach = options.reach
 
-  // 1. Vanilla range, measured the way the server measures it.
   if (!inReach(bot, pos, reach)) {
     throw new ActionError(
       ActionErrors.OUT_OF_REACH,
@@ -124,19 +112,16 @@ async function attemptDig (
     )
   }
 
-  // 2. Tool first: equipping AFTER aiming re-sends a held-item change between
-  // the rotation and the swing, and the swing is what the server times.
+  // Equip before aiming so a held-item change does not interrupt rotation and swing ordering.
   if (options.equipTool !== false) {
     const tool = ctx.bestHarvestTool(block)
     if (tool && (bot.heldItem == null || (bot.heldItem as { type: number }).type !== (tool as { type: number }).type)) {
-      await bot.equip(tool, 'hand').catch(() => {})
+      await ctx.equip(tool, 'hand').catch(() => {})
     }
   }
 
-  // 3. Aim at the block and let the rotation reach the server.
   await settleAim(bot, pos, cellCentre(pos), { minTicks: 3, maxTicks: 5, reach })
 
-  // 4. Pick the face the server will agree with.
   const aim = pickFace(bot, pos, {
     requireCursor: options.requireCursor !== false,
     allowGeometric: options.allowGeometric === true,
@@ -149,8 +134,7 @@ async function attemptDig (
     )
   }
 
-  // 5. Feet planted. A swing sent while falling is sent from a position the
-  // server has not accepted yet.
+  // Falling sends a swing from a position the server may not have accepted.
   if (options.requireGrounded !== false) {
     const grounded = await settleGrounded(bot, 20)
     if (!grounded) {
@@ -160,7 +144,6 @@ async function attemptDig (
     }
   }
 
-  // 6. Re-aim precisely at the chosen face and confirm the cursor agrees.
   const aimed = await settleAim(bot, pos, aim.point, {
     minTicks: 3, maxTicks: 8, wantFace: aim.id, reach
   })
@@ -170,7 +153,7 @@ async function attemptDig (
     )
   }
 
-  // 7. Decay guard: leaves and falling blocks change under a slow aim.
+  // Slow aiming leaves time for leaves or falling blocks to change.
   const stillThere = bot.blockAt(pos, false)
   if (!stillThere || stillThere.name !== block.name) {
     throw new ActionError(
@@ -180,7 +163,6 @@ async function attemptDig (
     )
   }
 
-  // 8. Stance guard: never swing inside the correction window.
   if (ctx.msSinceForcedMove() < ctx.config.forcedMoveGrace) {
     throw new ActionError(
       ActionErrors.DIG_FAILED,
@@ -194,14 +176,21 @@ async function attemptDig (
     )
   }
 
-  // 9. Swing, watched.
   bot.emit('pathfinder:dig_start', stillThere)
+  // After the event: a listener can abort, and a swing would miss a signal that has already fired.
+  throwIfAborted(options.signal, pos)
   await swingWatched(ctx, stillThere, pos, aim.face, options)
 
-  // 10. Judge by the world, not by the promise. mineflayer resolves its dig
-  // on its own timer; the block is the only authority on whether it broke.
+  // Mineflayer writes air into its own world as it sends the finish, so the world proves nothing yet.
+  // A server that refuses the break puts the block back a round trip later: wait for that first.
+  const pacing = options.pacing ?? ctx.config.pacing
+  await ctx.pacer.cooldown(pacing, t => waitTicks(bot, t))
+  if (pacing === 'none') await waitTicks(bot, REFUSAL_TICKS)
   const after = bot.blockAt(pos, false)
-  const broke = !after || after.name === 'air' || after.name === 'cave_air' || after.name === 'void_air'
+  if (after === null || after === undefined) {
+    throw new ActionError(ActionErrors.DIG_FAILED, `The chunk at ${fmt(pos)} unloaded during the dig; the result is unknown.`, pos, true)
+  }
+  const broke = after.name === 'air' || after.name === 'cave_air' || after.name === 'void_air'
   if (!broke) {
     throw new ActionError(
       ActionErrors.DIG_FAILED,
@@ -209,16 +198,10 @@ async function attemptDig (
     )
   }
 
-  await ctx.pacer.cooldown(options.pacing ?? ctx.config.pacing, t => waitTicks(bot, t))
   bot.emit('pathfinder:dig_finish', pos)
 }
 
-/**
- * Run the dig with a watchdog that cancels it the moment the swing stops
- * being valid — a lagback, the footing decaying out from under the bot, or
- * being pushed. Letting the dig run on in those cases is how a bot keeps
- * mining a block it can no longer see.
- */
+/** Cancel a dig when correction, lost footing or drift invalidates its reach and aim. */
 async function swingWatched (
   ctx: ActionContext,
   block: BlockLike,
@@ -251,15 +234,21 @@ async function swingWatched (
   const onAbortSignal = (): void => abort('aborted by caller')
   options.signal?.addEventListener('abort', onAbortSignal, { once: true })
 
-  // Pad the dig-time estimate so mineflayer's own timer does not fire early
-  // on a server running behind, and derive a wall-clock backstop from it.
+  // Pad client dig timing for slow servers, with a wall-clock backstop.
   const original = typeof block.digTime === 'function' ? block.digTime.bind(block) : null
   const scale = tpsScale(ctx.serverTps())
   let budget = DIG_TIMEOUT_SLACK
   if (original) {
-    try { budget = Math.ceil(original(bot.heldItem ? bot.heldItem.type : null) * scale) + DIG_TIMEOUT_SLACK } catch { /* keep the default */ }
     ;(block as { digTime: (...a: unknown[]) => number }).digTime = (...args: unknown[]) =>
       Math.ceil(original(...args) * 1.3 * scale) + 100
+    // The backstop must outlast the wait mineflayer will make, with water, footing, enchantments and effects.
+    const helper = (bot as { digTime?: (b: unknown) => number }).digTime
+    try {
+      const wait = typeof helper === 'function'
+        ? helper.call(bot, block)
+        : Math.ceil(original(bot.heldItem ? bot.heldItem.type : null) * 1.3 * scale) + 100
+      budget = Math.ceil(wait) + DIG_TIMEOUT_SLACK
+    } catch { /* keep the default */ }
   }
 
   let digError: unknown = null
@@ -278,8 +267,7 @@ async function swingWatched (
   }
 
   if (aborted) {
-    // The START (and its CANCEL) still counted against the server's break
-    // pacing, so pay the cooldown even though nothing broke.
+    // START and CANCEL still count toward server break pacing.
     await ctx.pacer.cooldown(options.pacing ?? ctx.config.pacing, t => waitTicks(bot, t))
     bot.emit('pathfinder:dig_aborted', pos, aborted)
     throw new ActionError(ActionErrors.DIG_FAILED, `Dig at ${fmt(pos)} abandoned: ${aborted}.`, pos, true)

@@ -1,13 +1,12 @@
-// World snapshot: the classification of every block in an AABB around the
-// search, resolved through the LUT into flat SharedArrayBuffer-backed arrays.
-// Building it is one linear pass over chunk columns; after that the solver
-// (in-process or in the worker) probes cells with pure typed-array reads and
-// zero allocation, and block updates patch single cells in place instead of
-// forcing a rebuild.
+// Resolve a search box through the LUT into shared typed arrays for allocation-free probes.
+// Block updates patch cells in place so the snapshot can stay resident.
 import type { Bot } from 'mineflayer'
 import type { BlockLut } from './lut.js'
 import type { Movements } from './movements.js'
 import type { SnapshotMeta } from './types.js'
+
+/** Weight above both solvers' impassability threshold, used for banned landings and takeoffs. */
+export const BAN_WEIGHT = 200
 
 export interface Box {
   x0: number
@@ -24,9 +23,12 @@ export class Snapshot {
   readonly heights: Uint8Array
   /** Present only when the goal needs raycasting (GoalLookAtBlock / GoalPlaceBlock). */
   states: Uint16Array | null = null
-  /** LutSpecial byte per cell (bubble columns). Present only when the
-   * profile's LUT carries a special table (useBubbleColumns). */
+  /** Optional special grid for features enabled by the LUT, including bubble columns. */
   special: Uint8Array | null = null
+  /** Optional thin-footprint grid for extended parkour. */
+  thin: Uint8Array | null = null
+  /** Chunk columns inside the box that were not loaded when it was built (their cells read as unsafe), as cx,cz keys. */
+  missingColumns: Set<string> = new Set()
   entityIdx: Int32Array = EMPTY_I32
   entityWeight: Int32Array = EMPTY_I32
   /** LUT this snapshot was resolved through (for in-place cell patches). */
@@ -68,30 +70,34 @@ export class Snapshot {
     }
     return this.special
   }
+
+  allocThin (): Uint8Array {
+    if (!this.thin) {
+      this.thin = new Uint8Array(new SharedArrayBuffer(this.cellCount))
+    }
+    return this.thin
+  }
 }
 
 const EMPTY_I32 = new Int32Array(0)
 
-// Process-global so two bots (or tests) can never mint colliding generations
-// — downstream caches key on (generation, patchCount).
+// Process-wide generations keep snapshot cache keys unique across bots.
 let globalGeneration = 0
 
 export function nextSnapshotGeneration (): number {
   return ++globalGeneration
 }
 
-/**
- * Compute the snapshot box for a solve. `targets` are the goal's known
- * coordinates (empty for goals without any); `slack` is the searchRadius
- * cost-slack (-1 = unbounded → generous default, bounded by growth+cap).
- */
+/** Size a solve box around start and known targets; slack is cost allowance (-1 = unbounded).
+ * `floorY` extends the box downward, for example to include a deep slime landing. */
 export function computeBox (
   bot: Bot,
   start: { x: number, y: number, z: number },
   targets: Array<{ x: number, y?: number, z: number }>,
   slack: number,
   growFactor: number,
-  maxCells: number
+  maxCells: number,
+  floorY?: number
 ): Box {
   let minX = start.x
   let maxX = start.x
@@ -108,22 +114,10 @@ export function computeBox (
     if (d > maxDist) maxDist = d
   }
 
-  // Horizontal margin beyond the start/goal hull. With a cost-slack bound a
-  // detour of d off the straight line costs ≥ ~2d (out and back), so any
-  // on-path node stays within ~slack/2 of the hull; parkour compresses
-  // distance-per-cost, which the boundary-growth retry absorbs. Unbounded
-  // searches start moderate and grow on boundary contact — a small first box
-  // keeps the snapshot build in the low-millisecond range.
-  //
-  // Every cell costs ~60 ns before the search starts (LUT resolution here,
-  // the copy into wasm memory, the arena arrays), and the search itself
-  // touches a few thousand. Measured on the arena's basic2 (93-block route):
-  // the old 0.5·d + 32 margin made a 1.63M-cell box, 100 ms of setup around
-  // a 12 ms search that visited 145 nodes. 0.3·d + 20 halves the box; the
-  // boundary-growth retry still covers the rare route that needs more.
+  // A detour costs roughly twice its distance from the start/goal hull.
+  // Keep the initial margin modest; boundary retries grow it for longer detours and parkour.
   let margin = Math.ceil((slack >= 0 ? slack / 2 + 16 : maxDist * 0.3 + 20) * growFactor)
-  // A close goal doesn't need a slack-sized box — the boundary-growth retry
-  // covers the rare long detour, so first builds stay small and fast.
+  // Close goals start with a small box; boundary retries cover long detours.
   if (targets.length > 0) margin = Math.min(margin, Math.ceil((maxDist + 24) * growFactor))
   const vMargin = Math.ceil(16 * growFactor)
 
@@ -132,18 +126,15 @@ export function computeBox (
 
   const box: Box = {
     x0: Math.floor(minX - margin),
-    y0: Math.max(worldMinY, Math.floor(minY - vMargin)),
+    y0: Math.max(worldMinY, Math.min(Math.floor(minY - vMargin), floorY ?? Infinity)),
     z0: Math.floor(minZ - margin),
     x1: Math.ceil(maxX + margin),
     y1: Math.min(worldMinY + worldHeight - 1, Math.ceil(maxY + vMargin)),
     z1: Math.ceil(maxZ + margin)
   }
 
-  // Respect the memory cap: shrink the horizontal margin first, and only when
-  // the start/goal hull alone is over the cap, cut a window of the hull around
-  // the start. Each axis shrinks by its own extent — the old loop shrank z by
-  // 5% of x and turned long narrow boxes inside out, a negative cell count
-  // that SharedArrayBuffer throws on from inside the physics tick.
+  // Meet the memory cap by shrinking margins, then windowing the hull around the start.
+  // Shrink each axis by its own extent to keep long narrow boxes valid.
   const h = box.y1 - box.y0 + 1
   const fits = (m: number): boolean =>
     (Math.ceil(maxX + m) - Math.floor(minX - m) + 1) * h * (Math.ceil(maxZ + m) - Math.floor(minZ - m) + 1) <= maxCells
@@ -187,20 +178,75 @@ interface ColumnLike {
     data?: {
       get?: (idx: number) => number
       value?: number
+      palette?: unknown
     }
   } | null>
+}
+
+/** Find slime within `depth` below the box with a clear drop from `openTo`.
+ * Extend snapshots for deep bounce landings; skip sections whose palettes contain no slime. */
+export function slimeUnderBox (bot: Bot, lut: BlockLut, box: Box, depth: number, openTo: number): Array<[number, number, number]> {
+  const slime = (bot.registry as unknown as { blocksByName?: Record<string, { minStateId?: number }> }).blocksByName?.slime_block?.minStateId
+  if (slime === undefined) return []
+  const worldMinY = (bot.game as { minY?: number }).minY ?? 0
+  const lo = Math.max(worldMinY, box.y0 - depth)
+  const hi = box.y0 - 1
+  if (hi < lo) return []
+  const world = bot.world as unknown as WorldLike
+  const probe = { x: 0, y: 0, z: 0 }
+  const collides = (st: number): boolean => st > 0 && st <= lut.maxStateId && lut.shapeStarts[st] >= 0 && lut.shapeCounts[st] > 0
+  const out: Array<[number, number, number]> = []
+  for (let cx = box.x0 >> 4; cx <= box.x1 >> 4; cx++) {
+    for (let cz = box.z0 >> 4; cz <= box.z1 >> 4; cz++) {
+      let column: ColumnLike | null | undefined
+      try { column = world.getColumn(cx, cz) } catch { column = null }
+      if (!column) continue
+      const sections = column.sections
+      const colMinY = column.minY
+      if (Array.isArray(sections) && typeof colMinY === 'number' && (colMinY & 15) === 0) {
+        let any = false
+        for (let sy = (lo - colMinY) >> 4; sy <= (hi - colMinY) >> 4 && !any; sy++) {
+          const d = sections[sy]?.data
+          if (d === undefined) continue
+          if (typeof d.value === 'number') any = d.value === slime
+          else if (Array.isArray(d.palette)) any = d.palette.includes(slime)
+          else any = true // A direct container has no palette to filter.
+        }
+        if (!any) continue
+      }
+      for (let x = Math.max(box.x0, cx << 4); x <= Math.min(box.x1, (cx << 4) + 15); x++) {
+        for (let z = Math.max(box.z0, cz << 4); z <= Math.min(box.z1, (cz << 4) + 15); z++) {
+          probe.x = x & 15
+          probe.z = z & 15
+          let top = -Infinity
+          for (let y = hi; y >= lo; y--) {
+            probe.y = y
+            const st = column.getBlockStateId(probe)
+            if (!collides(st)) continue
+            if (st === slime) top = y
+            break
+          }
+          if (top === -Infinity) continue
+          // A landing needs an unobstructed drop through the box.
+          let open = true
+          for (let y = box.y0; y <= openTo && open; y++) {
+            probe.y = y
+            if (collides(column.getBlockStateId(probe))) open = false
+          }
+          if (open) out.push([x, top, z])
+        }
+      }
+    }
+  }
+  return out
 }
 
 interface WorldLike {
   getColumn (cx: number, cz: number): ColumnLike | null | undefined
 }
 
-/**
- * A section's packed cells plus its palette resolved through the LUT: the
- * per-value flags/heights/special/state that a palette index maps to (a
- * direct container's "palette" is the state id itself, resolved on demand
- * over the LUT — its arrays are the LUT's own).
- */
+/** Packed section cells and LUT-resolved palette values.
+ * Direct containers store state IDs and use the LUT itself as the palette. */
 interface NoSpanBits {
   words: Uint32Array
   bitsPerValue: number
@@ -209,17 +255,14 @@ interface NoSpanBits {
   flags: Uint8Array
   heights: Uint8Array
   special: Uint8Array
+  thin: Uint8Array
   states: Uint16Array
 }
 
 const NO_SPECIAL = new Uint8Array(0)
 
-/**
- * Recognise a prismarine-chunk palette container backed by BitArrayNoSpan
- * (1.16+ block storage) and resolve its palette once. Null when the object
- * does not look exactly like that — the caller then falls back to `get`.
- * `cache` is per build: the same section object serves all 16 of its rows.
- */
+/** Resolve a BitArrayNoSpan palette once per section during a snapshot build.
+ * Return null for unsupported layouts so callers can use the generic accessor. */
 function noSpanBits (container: unknown, lut: BlockLut, cache: Map<unknown, NoSpanBits | null>): NoSpanBits | null {
   const hit = cache.get(container)
   if (hit !== undefined) return hit
@@ -238,6 +281,7 @@ function noSpanBits (container: unknown, lut: BlockLut, cache: Map<unknown, NoSp
       const flags = new Uint8Array(n)
       const heights = new Uint8Array(n)
       const special = new Uint8Array(n)
+      const thin = new Uint8Array(n)
       const states = new Uint16Array(n)
       let ok = true
       for (let i = 0; i < n; i++) {
@@ -246,26 +290,26 @@ function noSpanBits (container: unknown, lut: BlockLut, cache: Map<unknown, NoSp
         flags[i] = lut.flags[s]
         heights[i] = lut.heights[s]
         special[i] = lut.special ? lut.special[s] : 0
+        thin[i] = lut.thin ? lut.thin[s] : 0
         states[i] = s
       }
       if (ok) {
         out = {
           words: ba.data, bitsPerValue: ba.bitsPerValue, valuesPerLong: ba.valuesPerLong, valueMask: ba.valueMask,
-          flags, heights, special, states
+          flags, heights, special, thin, states
         }
       }
     } else if (palette === undefined) {
-      // Direct container: the packed value IS the state id.
+      // Direct containers store state IDs rather than palette indices.
       const n = lut.maxStateId + 1
       if (directStates === null || directStates.length !== n) {
         directStates = new Uint16Array(n)
         for (let i = 0; i < n; i++) directStates[i] = i
       }
-      // No special table → the snapshot has no special grid either, so the
-      // empty array is never indexed.
+      // Without a special grid this empty array is never indexed.
       out = {
         words: ba.data, bitsPerValue: ba.bitsPerValue, valuesPerLong: ba.valuesPerLong, valueMask: ba.valueMask,
-        flags: lut.flags, heights: lut.heights, special: lut.special ?? NO_SPECIAL, states: directStates
+        flags: lut.flags, heights: lut.heights, special: lut.special ?? NO_SPECIAL, thin: lut.thin ?? NO_SPECIAL, states: directStates
       }
     }
   }
@@ -291,6 +335,7 @@ export function buildSnapshot (bot: Bot, lut: BlockLut, box: Box, needStates: bo
   const snap = new Snapshot(meta, lut.fingerprint)
   const states = needStates ? snap.allocStates() : null
   const special = lut.special ? snap.allocSpecial() : null
+  const thin = lut.thin ? snap.allocThin() : null
 
   const world = bot.world as unknown as WorldLike
   const flags = snap.flags
@@ -298,6 +343,7 @@ export function buildSnapshot (bot: Bot, lut: BlockLut, box: Box, needStates: bo
   const lutFlags = lut.flags
   const lutHeights = lut.heights
   const lutSpecial = lut.special
+  const lutThin = lut.thin
   const maxStateId = lut.maxStateId
 
   const cx0 = box.x0 >> 4
@@ -306,7 +352,6 @@ export function buildSnapshot (bot: Bot, lut: BlockLut, box: Box, needStates: bo
   const cz1 = box.z1 >> 4
   const probe = { x: 0, y: 0, z: 0 }
   const bitsCache = new Map<unknown, NoSpanBits | null>()
-  // PF_SOLVE_TIMING=1: how many rows each path resolved (diagnostic).
   const counting = process.env.PF_SOLVE_TIMING === '1'
   let rowsUniform = 0
   let rowsFast = 0
@@ -326,13 +371,9 @@ export function buildSnapshot (bot: Bot, lut: BlockLut, box: Box, needStates: bo
       } catch {
         column = null
       }
-      if (!column) { colsMissing++; continue } // unloaded → cells stay 0 (upstream null-block: unsafe, not physical)
+      if (!column) { colsMissing++; snap.missingColumns.add(`${cx},${cz}`); continue } // Unloaded cells remain unsafe and non-physical.
 
-      // Fast path: read section containers directly (prismarine-chunk 1.18+).
-      // A SingleValueContainer section (all air, all stone) resolves without
-      // per-cell reads; paletted sections use container.get (bit-read +
-      // palette index — no hash lookup, no Vec3). Falls back to the generic
-      // per-cell API if the internals don't look as expected.
+      // Read known section layouts directly; unfamiliar layouts use generic cell access.
       const sections = column.sections
       const colMinY = column.minY
       const useSections = Array.isArray(sections) && typeof colMinY === 'number' && (colMinY & 15) === 0
@@ -355,10 +396,7 @@ export function buildSnapshot (bot: Bot, lut: BlockLut, box: Box, needStates: bo
             uniformState = sec.data.value
             sectionOk = true
           } else {
-            // Fastest path: unpack the section's no-span bit array directly
-            // (prismarine-chunk 1.16+ BitArrayNoSpan), the palette resolved
-            // through the LUT once per section. Two method calls per cell
-            // become a few integer ops; measured 27 ns/cell → well under 10.
+            // Resolve the palette once, then unpack no-span values without per-cell method calls.
             bits = noSpanBits(sec.data, lut, bitsCache)
             if (bits !== null) {
               sectionOk = true
@@ -379,12 +417,14 @@ export function buildSnapshot (bot: Bot, lut: BlockLut, box: Box, needStates: bo
               const f = lutFlags[uniformState]
               const h = lutHeights[uniformState]
               const sp = lutSpecial ? lutSpecial[uniformState] : 0
+              const th = lutThin ? lutThin[uniformState] : 0
               for (let x = bx0; x <= bx1; x++) {
                 const idx = base + x
                 flags[idx] = f
                 heights[idx] = h
                 if (states) states[idx] = uniformState
                 if (special) special[idx] = sp
+                if (thin) thin[idx] = th
               }
             }
             continue
@@ -399,6 +439,7 @@ export function buildSnapshot (bot: Bot, lut: BlockLut, box: Box, needStates: bo
             const pf = bits.flags
             const ph = bits.heights
             const ps = bits.special
+            const pt = bits.thin
             const pst = bits.states
             for (let x = bx0; x <= bx1; x++) {
               const ci = zPart | (x & 15)
@@ -419,6 +460,7 @@ export function buildSnapshot (bot: Bot, lut: BlockLut, box: Box, needStates: bo
                 heights[idx] = ph[v]
                 if (states) states[idx] = pst[v]
                 if (special) special[idx] = ps[v]
+                if (thin) thin[idx] = pt[v]
               }
             }
             continue
@@ -435,11 +477,11 @@ export function buildSnapshot (bot: Bot, lut: BlockLut, box: Box, needStates: bo
                   heights[idx] = lutHeights[stateId]
                   if (states) states[idx] = stateId
                   if (special) special[idx] = lutSpecial![stateId]
+                  if (thin) thin[idx] = lutThin![stateId]
                 }
               }
               continue
             } catch {
-              // fall through to the generic path for this row
             }
           }
           rowsGeneric++
@@ -457,6 +499,7 @@ export function buildSnapshot (bot: Bot, lut: BlockLut, box: Box, needStates: bo
               heights[idx] = lutHeights[stateId]
               if (states) states[idx] = stateId
               if (special) special[idx] = lutSpecial![stateId]
+              if (thin) thin[idx] = lutThin![stateId]
             }
           }
         }
@@ -487,19 +530,18 @@ export function applySnapshotBlockUpdate (
     snap.heights[idx] = lut.heights[stateId]
     if (snap.states) snap.states[idx] = stateId
     if (snap.special) snap.special[idx] = lut.special ? lut.special[stateId] : 0
+    if (snap.thin) snap.thin[idx] = lut.thin ? lut.thin[stateId] : 0
   } else {
     snap.flags[idx] = 0
     snap.heights[idx] = 0
     if (snap.states) snap.states[idx] = 0
     if (snap.special) snap.special[idx] = 0
+    if (snap.thin) snap.thin[idx] = 0
   }
   return true
 }
 
-/**
- * Bake the movements' entity-intersection index (already computed via
- * updateCollisionIndex, upstream-identical) into sparse per-cell weights.
- */
+/** Bake the movements' entity-intersection index into sparse per-cell weights. */
 export function bakeEntityIndex (snap: Snapshot, movements: Movements): void {
   const entries = Object.entries(movements.entityIntersections)
   if (entries.length === 0) {

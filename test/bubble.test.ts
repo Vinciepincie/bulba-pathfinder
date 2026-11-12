@@ -104,7 +104,7 @@ describe('bubble-column elevators', function () {
     let wasmResult: RawSolveResult | null = null
     if (wasm) {
       wasmResult = wasm.solve(
-        { meta: snap.meta, flags: snap.flags, heights: snap.heights, states: null, special: snap.special, entityIdx: snap.entityIdx, entityWeight: snap.entityWeight },
+        { meta: snap.meta, flags: snap.flags, heights: snap.heights, states: null, special: snap.special, thin: snap.thin, entityIdx: snap.entityIdx, entityWeight: snap.entityWeight },
         movements.toConfig(), descriptor, start, null,
         { timeout: 30000, searchRadius: -1, sliceMs: 1e9, cancelFlag: null, onPartial: () => {} }
       )
@@ -211,7 +211,7 @@ describe('bubble-column elevators', function () {
     }
     const solveWasm = (): RawSolveResult | null => wasm
       ? wasm.solve(
-        { meta: snap.meta, flags: snap.flags, heights: snap.heights, states: null, special: snap.special, entityIdx: snap.entityIdx, entityWeight: snap.entityWeight },
+        { meta: snap.meta, flags: snap.flags, heights: snap.heights, states: null, special: snap.special, thin: snap.thin, entityIdx: snap.entityIdx, entityWeight: snap.entityWeight },
         movements.toConfig(), descriptor, { x: 0, y: 1, z: 0 }, null,
         { timeout: 30000, searchRadius: -1, sliceMs: 1e9, cancelFlag: null, onPartial: () => {} })
       : null

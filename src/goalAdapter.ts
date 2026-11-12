@@ -1,6 +1,4 @@
-// Bridges a Goal object to the solver's (x, y, z) evaluator interface with a
-// single reused Vec3 scratch node — goals see a real Vec3 (upstream passes
-// Move, a Vec3 subclass) but the hot path allocates nothing.
+// Reuse a real Vec3 so custom goals retain Vec3 methods without per-probe allocation.
 import { Vec3 } from 'vec3'
 import type { Goal } from './goals.js'
 import type { GoalEvaluator } from './solver.js'
