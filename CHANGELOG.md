@@ -3,7 +3,7 @@
 This project follows [semantic versioning](https://semver.org/). Before 1.0, a minor version can break the API.
 `@bulba/pathfinder/internals` and `PF_*` environment variables carry no stability promise at any version.
 
-## 0.1.0 (unreleased)
+## 0.1.0 (2026-11-13)
 
 First public release.
 
