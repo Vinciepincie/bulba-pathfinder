@@ -46,7 +46,7 @@
     }
   },
   "bin": {
-    "bulba-pathfinder-patch-physics": "./scripts/patchPhysics.mjs"
+    "bulba-pathfinder-patch-physics": "scripts/patchPhysics.mjs"
   },
   "files": [
     "dist",

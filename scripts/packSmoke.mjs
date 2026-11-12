@@ -17,7 +17,9 @@ const REQUIRED = ['dist/esm/index.js', 'dist/cjs/index.js', 'dist/types/index.d.
 
 // On Windows npm is a .cmd, which only runs through a shell: quote what the shell would split.
 const quote = (a) => process.platform === 'win32' && /[\s"&|<>^]/.test(a) ? `"${a.replace(/"/g, '""')}"` : a
-const npm = (args, cwd) => execFileSync('npm', args.map(quote), { cwd, encoding: 'utf8', shell: process.platform === 'win32', stdio: ['ignore', 'pipe', 'pipe'] })
+// Run from `npm publish --dry-run`, npm's own settings reach these calls too, and a dry-run pack writes no tarball.
+const npmEnv = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^npm_config_dry_run$/i.test(k)))
+const npm = (args, cwd) => execFileSync('npm', args.map(quote), { cwd, env: npmEnv, encoding: 'utf8', shell: process.platform === 'win32', stdio: ['ignore', 'pipe', 'pipe'] })
 const node = (args, cwd) => execFileSync(process.execPath, args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
 const step = (s) => console.log(`[pack] ${s}`)
 
