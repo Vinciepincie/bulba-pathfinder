@@ -124,10 +124,9 @@ const { status, path } = await bot.pathfinder.computePath(goal)
 Change how blocks are broken, including by the path's own digs:
 
 ```js
-// Runs before every dig. `next` is the normal dig: call it to go ahead, or throw to refuse.
 bot.pathfinder.actions.wrap('dig', (next) => async (block, options) => {
-  if (isProtected(block.position)) throw new Error('not this one') // isProtected is your own check
-  return await next(block, options)
+  if (isProtected(block.position)) throw new Error('not this one') // your own check runs first
+  return await next(block, options) // then the normal dig
 })
 ```
 

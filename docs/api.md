@@ -400,10 +400,9 @@ Layer your own code over `'dig'`, `'place'`, `'open'`, `'activate'` or `'equip'`
 function that removes the layer, in any order. The path's own digs and doors go through the same table.
 
 ```js
-// `next` is the dig as it was before this layer: call it to go ahead, or throw to refuse.
 const unwrap = bot.pathfinder.actions.wrap('dig', (next) => async (block, options) => {
-  if (protectedRegion.contains(block.position)) throw new Error('not here') // protectedRegion is yours
-  return await next(block, options)
+  if (protectedRegion.contains(block.position)) throw new Error('not here') // your own check runs first
+  return await next(block, options) // then the normal dig
 })
 
 unwrap() // removes this layer again
