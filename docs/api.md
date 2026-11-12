@@ -411,7 +411,23 @@ const unwrap = bot.pathfinder.actions.wrap('dig', (next) => async (block, option
 unwrap() // removes this layer again
 ```
 
-Assigning `actions.dig = fn` replaces the entry outright.
+### Replacing an action
+
+If you have your own implementation that should not use any of the built-in behaviour, assign it instead of wrapping:
+
+```js
+const builtIn = bot.pathfinder.actions.dig     // keep it to restore later
+
+bot.pathfinder.actions.dig = async (block, options) => {
+  await myOwnDig(block)                        // runs instead of the built-in dig, also for the path's own digs
+}
+
+bot.pathfinder.actions.dig = builtIn           // back to normal
+```
+
+Your function then does everything itself: the built-in reach check, aiming, retries and the check that the block is
+really gone no longer run, and any layer another plugin added with `wrap` is discarded. Use `wrap` when you only want to
+add a check or run code around the normal action.
 
 ### Calling actions from your own code
 
