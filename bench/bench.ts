@@ -1,4 +1,4 @@
-// Benchmark: @bulba/pathfinder vs upstream mineflayer-pathfinder on
+// Benchmark: bulba-pathfinder vs upstream mineflayer-pathfinder on
 // identical worlds and identical movement profiles. Run with:
 //   npm run bench            (compact table)
 //   PF_BENCH_N=100 npm run bench
@@ -373,7 +373,7 @@ async function main (): Promise<void> {
   const headers = ['scenario', 'upstream', 'ours cold', 'ours warm', 'worker e2e', 'speedup warm/cold']
   const widths = headers.map((h, i) => Math.max(h.length, ...rows.map(r => r[i].length)))
   const line = (cells: string[]): string => cells.map((c, i) => c.padEnd(widths[i])).join(' | ')
-  console.log(`\n@bulba/pathfinder vs mineflayer-pathfinder — N=${N} solves per cell\n`)
+  console.log(`\nbulba-pathfinder vs mineflayer-pathfinder — N=${N} solves per cell\n`)
   console.log(line(headers))
   console.log(widths.map(w => '-'.repeat(w)).join('-|-'))
   for (const r of rows) console.log(line(r))

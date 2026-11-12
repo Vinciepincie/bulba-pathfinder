@@ -249,10 +249,10 @@ export async function loadImpl (impl: Impl): Promise<{
   }
   let mod: Record<string, unknown>
   try {
-    mod = await import('@bulba/pathfinder') as Record<string, unknown>
+    mod = await import('bulba-pathfinder') as Record<string, unknown>
   } catch (error) {
     throw new Error(
-      `could not load the built @bulba/pathfinder — run "npm run build" first (${(error as Error).message})`
+      `could not load the built bulba-pathfinder — run "npm run build" first (${(error as Error).message})`
     )
   }
   // Both cores run in the worker (the hop pipeline lives there); `core`

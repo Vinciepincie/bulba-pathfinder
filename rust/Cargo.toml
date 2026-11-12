@@ -2,7 +2,7 @@
 name = "bulba-pathfinder-core"
 version = "0.1.0"
 edition = "2021"
-description = "wasm A* core for @bulba/pathfinder — consumes the same snapshot buffers as the JS solver, which stays the reference implementation"
+description = "wasm A* core for bulba-pathfinder — consumes the same snapshot buffers as the JS solver, which stays the reference implementation"
 license = "MIT"
 
 [lib]

@@ -3,7 +3,7 @@
 `bench/bench.ts` measures the solver on synthetic voxel worlds. This measures
 the whole thing — solver, executor, and physics — against terrain nobody
 designed to be walkable: **2b2t spawn**, on a real Paper server, with
-`@bulba/pathfinder` and upstream `mineflayer-pathfinder` racing the same
+`bulba-pathfinder` and upstream `mineflayer-pathfinder` racing the same
 routes side by side.
 
 One bot per engine, one OS process each, one start block, released together.
@@ -229,7 +229,7 @@ running", and that only exists across runs.
   collision sweep then refuses the next move and teleports the client back —
   silently, every tick, for as long as the bot keeps producing that position.
   It is a mineflayer physics bug rather than a pathfinding one, and
-  `@bulba/pathfinder` applies the nudge itself on inject, so the harness
+  `bulba-pathfinder` applies the nudge itself on inject, so the harness
   applies it to upstream too. It is not a small effect: without it upstream
   finished 4 of 16 route runs and ours 10, with it upstream finishes 12 and
   ours 16. Measuring pathfinding means neither engine racing the bug.

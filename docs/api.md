@@ -43,13 +43,13 @@ All bots in a process share one worker thread. It does not keep the process aliv
 ### Imports
 
 ```js
-import { pathfinder, createPathfinder, Movements, goals, autoEatIntegration } from '@bulba/pathfinder'
-const { pathfinder, Movements, goals } = require('@bulba/pathfinder')
+import { pathfinder, createPathfinder, Movements, goals, autoEatIntegration } from 'bulba-pathfinder'
+const { pathfinder, Movements, goals } = require('bulba-pathfinder')
 ```
 
 Importing the package also types `bot.pathfinder` and its events on `bot.on` in TypeScript.
 
-The solver, snapshot and worker host are exported from `@bulba/pathfinder/internals`. They carry no stability promise.
+The solver, snapshot and worker host are exported from `bulba-pathfinder/internals`. They carry no stability promise.
 Environment variables starting with `PF_` are benchmark switches and traces, unsupported, and can change in any release.
 
 ## bot.pathfinder
@@ -469,7 +469,7 @@ An adapter for [mineflayer-auto-eat](https://github.com/linkle69/mineflayer-auto
 interrupt so it never happens mid-jump:
 
 ```js
-import { pathfinder, autoEatIntegration } from '@bulba/pathfinder'
+import { pathfinder, autoEatIntegration } from 'bulba-pathfinder'
 import { loader as autoEat } from 'mineflayer-auto-eat'
 
 bot.loadPlugin(pathfinder)

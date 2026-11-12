@@ -1,7 +1,7 @@
 # Changelog
 
 This project follows [semantic versioning](https://semver.org/). Before 1.0, a minor version can break the API.
-`@bulba/pathfinder/internals` and `PF_*` environment variables carry no stability promise at any version.
+`bulba-pathfinder/internals` and `PF_*` environment variables carry no stability promise at any version.
 
 ## 0.1.0 (2026-11-13)
 
@@ -22,7 +22,7 @@ First public release.
 
 ### Changed
 
-- The solver, snapshot and worker building blocks moved from the package root to `@bulba/pathfinder/internals`.
+- The solver, snapshot and worker building blocks moved from the package root to `bulba-pathfinder/internals`.
 - Installing no longer edits prismarine-physics. The patch is now an explicit, optional command,
   `bulba-pathfinder-patch-physics`, and an unpatched install leaves nether and cave vines out of its plans.
 - Node 22 or newer, mineflayer 4.37 or newer.

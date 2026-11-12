@@ -79,7 +79,7 @@ interface ReserveMessage {
 type InMessage = LutMessage | DigMessage | SolveMessage | ReserveMessage
 
 if (!parentPort) {
-  throw new Error('@bulba/pathfinder worker entry must run inside a worker_thread')
+  throw new Error('bulba-pathfinder worker entry must run inside a worker_thread')
 }
 const port = parentPort
 

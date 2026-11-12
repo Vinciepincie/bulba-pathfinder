@@ -1,0 +1,32 @@
+name: Release
+
+# Publishing a GitHub release publishes the same version to npm.
+on:
+  release:
+    types: [published]
+
+jobs:
+  npm:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # provenance: npm shows which commit and workflow built the package
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          cache: npm
+      - name: Check the tag matches package.json
+        run: |
+          version="v$(node -p "require('./package.json').version")"
+          if [ "$version" != "$GITHUB_REF_NAME" ]; then
+            echo "Release tag $GITHUB_REF_NAME does not match package.json version $version"
+            exit 1
+          fi
+      - run: npm ci
+      # prepublishOnly builds, runs the tests and checks the packed tarball before anything is uploaded.
+      - run: npm publish --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

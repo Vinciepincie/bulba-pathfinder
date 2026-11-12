@@ -1,8 +1,8 @@
-# @bulba/pathfinder
+# bulba-pathfinder
 
-[![npm](https://img.shields.io/npm/v/@bulba/pathfinder)](https://www.npmjs.com/package/@bulba/pathfinder)
+[![npm](https://img.shields.io/npm/v/bulba-pathfinder)](https://www.npmjs.com/package/bulba-pathfinder)
 [![CI](https://github.com/Vinciepincie/bulba-pathfinder/actions/workflows/ci.yml/badge.svg)](https://github.com/Vinciepincie/bulba-pathfinder/actions/workflows/ci.yml)
-[![license](https://img.shields.io/npm/l/@bulba/pathfinder)](https://github.com/Vinciepincie/bulba-pathfinder/blob/main/LICENSE)
+[![license](https://img.shields.io/npm/l/bulba-pathfinder)](https://github.com/Vinciepincie/bulba-pathfinder/blob/main/LICENSE)
 
 Pathfinding for [mineflayer](https://github.com/PrismarineJS/mineflayer) bots, with the same API as
 [mineflayer-pathfinder](https://github.com/PrismarineJS/mineflayer-pathfinder). Most code moves over by changing the
@@ -23,7 +23,7 @@ import; [a few defaults differ](#moving-from-mineflayer-pathfinder).
 ## Install
 
 ```sh
-npm install @bulba/pathfinder mineflayer
+npm install bulba-pathfinder mineflayer
 ```
 
 Node 22 or newer, and mineflayer 4.37 or a later 4.x.
@@ -34,7 +34,7 @@ Save as `bot.mjs` and run `node bot.mjs`:
 
 ```js
 import { createBot } from 'mineflayer'
-import { pathfinder, Movements, goals } from '@bulba/pathfinder'
+import { pathfinder, Movements, goals } from 'bulba-pathfinder'
 
 const bot = createBot({ host: 'localhost', username: 'bot' })
 bot.loadPlugin(pathfinder)
@@ -64,13 +64,13 @@ bot.on('chat', async (username, message) => {
 })
 ```
 
-CommonJS works too, with `require('@bulba/pathfinder')`, and TypeScript types are included.
+CommonJS works too, with `require('bulba-pathfinder')`, and TypeScript types are included.
 
 ## Moving from mineflayer-pathfinder
 
 Change the import and uninstall mineflayer-pathfinder. A few things behave differently:
 
-| | mineflayer-pathfinder | @bulba/pathfinder |
+| | mineflayer-pathfinder | bulba-pathfinder |
 |---|---|---|
 | Breaking blocks | On by default | Off by default. Set `movements.canDig = true` to turn it on. |
 | A `goto` with no path | Rejects, but the bot keeps walking toward the goal | Rejects, and the bot stops |
@@ -159,6 +159,9 @@ npm install
 npm test
 npm run test:pack   # checks the packed tarball from ESM, CommonJS and TypeScript projects
 ```
+
+To release, bump the version with `npm version`, push, and publish a GitHub release named after the tag, such as
+`v0.1.0`. The release workflow publishes it to npm.
 
 ## License
 

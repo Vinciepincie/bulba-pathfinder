@@ -1,4 +1,4 @@
-//! wasm A* core for @bulba/pathfinder.
+//! wasm A* core for bulba-pathfinder.
 //!
 //! Match the JS core in src/solver.ts and src/moveGen.ts so either solver
 //! produces identical statuses, costs, and paths. Coordinate goals, including

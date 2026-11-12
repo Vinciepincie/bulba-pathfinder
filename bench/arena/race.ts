@@ -1,4 +1,4 @@
-// The arena benchmark: @bulba/pathfinder vs mineflayer-pathfinder, racing
+// The arena benchmark: bulba-pathfinder vs mineflayer-pathfinder, racing
 // the same routes through real 2b2t spawn terrain on a real server.
 //
 //   npm run arena:race

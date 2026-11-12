@@ -523,7 +523,7 @@ export class Movements {
     if ((this.allow1by1towers || this.scafoldingBlocks.length > 0) && !warnedScaffolding) {
       warnedScaffolding = true
       warn(
-        '@bulba/pathfinder: allow1by1towers and scafoldingBlocks are ignored, because this planner generates no block placement moves.'
+        'bulba-pathfinder: allow1by1towers and scafoldingBlocks are ignored, because this planner generates no block placement moves.'
       )
     }
   }
