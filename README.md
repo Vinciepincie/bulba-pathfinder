@@ -68,15 +68,17 @@ CommonJS works too, with `require('@bulba/pathfinder')`, and TypeScript types ar
 
 ## Moving from mineflayer-pathfinder
 
-Change the import, and remove mineflayer-pathfinder from your dependencies: in TypeScript both type `bot.pathfinder`.
-Then check these:
+Change the import and uninstall mineflayer-pathfinder. A few things behave differently:
 
-- `canDig` is `false` by default. Set it to `true` to let paths break blocks.
-- A `goto` that fails stops the bot. It rejects with `NoPath` or `Timeout` and does not keep walking.
-- The goal ends when the bot dies. Set `bot.pathfinder.stopOnDeath = false` to keep it.
-- Paths never place blocks, so `allow1by1towers` and `scafoldingBlocks` do nothing.
-- Goal objects from mineflayer-pathfinder itself, such as those plugins like mineflayer-pvp create, are accepted, but
-  search on the main thread.
+| | mineflayer-pathfinder | @bulba/pathfinder |
+|---|---|---|
+| Breaking blocks | On by default | Off by default. Set `movements.canDig = true` to turn it on. |
+| A `goto` with no path | Rejects, but the bot keeps walking toward the goal | Rejects, and the bot stops |
+| When the bot dies | It walks back to the goal after respawning | The goal ends. Set `bot.pathfinder.stopOnDeath = false` to keep it. |
+| Placing blocks (towers, bridges) | Yes | Never. `allow1by1towers` and `scafoldingBlocks` are ignored. |
+
+Plugins that bring their own mineflayer-pathfinder, such as mineflayer-pvp and mineflayer-collectblock, do not work
+with it yet: they pass it mineflayer-pathfinder's own `Movements`.
 
 The [full list](https://github.com/Vinciepincie/bulba-pathfinder/blob/main/docs/api.md#differences-from-mineflayer-pathfinder)
 is in the API reference.
@@ -122,8 +124,9 @@ const { status, path } = await bot.pathfinder.computePath(goal)
 Change how blocks are broken, including by the path's own digs:
 
 ```js
+// Runs before every dig. `next` is the normal dig: call it to go ahead, or throw to refuse.
 bot.pathfinder.actions.wrap('dig', (next) => async (block, options) => {
-  if (isProtected(block.position)) throw new Error('not this one')
+  if (isProtected(block.position)) throw new Error('not this one') // isProtected is your own check
   return await next(block, options)
 })
 ```
