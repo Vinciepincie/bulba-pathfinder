@@ -83,10 +83,11 @@ is in the API reference.
 
 ## More than walking
 
-Cancel a goal from outside:
+Stop whenever you like, from any event, and hear how it ended:
 
 ```js
-await bot.pathfinder.goto(goal, { signal: AbortSignal.timeout(30_000) })
+bot.on('health', () => { if (bot.health < 6) bot.pathfinder.stop() })
+bot.on('path_stop', (reason) => bot.chat(`stopped: ${reason}`))
 ```
 
 Break, place and use blocks, walking into range first:
