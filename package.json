@@ -1,6 +1,6 @@
 {
   "name": "bulba-pathfinder",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Pathfinder for mineflayer bots: A* on a worker thread, physics-verified parkour, and interruptible movement. API-compatible with mineflayer-pathfinder.",
   "license": "MIT",
   "repository": {
