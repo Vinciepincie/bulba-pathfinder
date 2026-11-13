@@ -29,7 +29,11 @@ import { CATCH_HALF, topCatchClass } from './shapes.js'
 import { headingDir, programHeading, sneakLanding, F_FWD, F_SPRINT, F_JUMP, LAND_OVERLAP, CLIMB_ON_SLACK, BEAM_DEPTH, ONE_FLIGHT_REACH, LIVE_PREFIX, jumpRearmed, STAY_TICKS, REGION_SETTLE, FLIGHT_CAP, FLIGHT_TICKS_MAX } from './hopOracle.js'
 import { HOP_TURN_COS, PARKOUR_LAND_DY, CLIMB_HOLD_ENABLED } from './gaitSearch.js'
 import { landingHurts, fallDamagePoints, dropForHealth, fallVetoForHealth, FALL_VETO, SAFE_FALL } from './fallDamage.js'
-import { simKindOf } from './playerSim.js'
+import { simKindOf, simTablesFromLut } from './playerSim.js'
+import type { SimWorld } from './playerSim.js'
+import { FallGuard } from './fall/guard.js'
+import type { FallRecoveryOptions } from './fall/guard.js'
+import { defaultFallItems } from './fall/items.js'
 import { sideStandoff, wallSlide, againstWall as wallAhead, SPRINT_WALL_MARGIN, STEP_UP_MIN, WALK_STEP_REACH } from './wallSteer.js'
 import type { Heading as SteerHeading } from './wallSteer.js'
 import type { HopProgram } from './hopOracle.js'
@@ -719,6 +723,10 @@ export function createPathfinder (options: PathfinderOptions = {}) {
     pf.keepPathDuringRecompute = true // keep walking the valid prefix while replanning
     pf.minHealth = 0 // below it the goal stops once supported, and planned drops are capped; 0 = off
     pf.stopOnDeath = true // end the goal on death rather than walking back after the respawn
+    const fallRecovery: FallRecoveryOptions = { mode: 'observe', items: defaultFallItems, pickUpWater: true, equipTotem: true }
+    Object.defineProperty(pf, 'fallRecovery', { get () { return fallRecovery }, enumerable: true })
+    /** Aborted when a fall recovery takes the body, ending the user's actions in progress. */
+    let fallAbort = new AbortController()
 
     pf.bestHarvestTool = (block: { digTime: (...args: unknown[]) => number }) => {
       const availableTools = bot.inventory.items()
@@ -780,9 +788,14 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       return feet !== null && (climbableIds.has(feet.type))
     }
 
+    /** Fall recovery; created after the executor state it reads, used by hooks defined before it. */
+    let guard = null as FallGuard | null
+    const guardOwns = (): boolean => guard?.owns() === true
+
     // Yield only when the body is supported and no interaction is half-finished.
     const interrupts = new InterruptController(bot as unknown as { emit: (e: string, ...a: unknown[]) => boolean }, {
-      isSafe: () => !digging && !placing && bodySupported(),
+      isSafe: () => !digging && !placing && !guardOwns() && bodySupported(),
+      blocked: guardOwns,
       onPause: () => {
         // The last writes before the holder owns the controls: release every executor key, with no
         // coast, so nothing stays held for the length of the pause. Before login there is nothing to release.
@@ -813,7 +826,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
     let settling = false
     /** An exclusive interrupt holder owns every control: the executor writes none until release. */
     function handedOver (): boolean {
-      return !handingOver && interrupts.exclusive
+      return guardOwns() || (!handingOver && interrupts.exclusive)
     }
 
     pf.interrupt = async (reason: string, options?: InterruptOptions): Promise<InterruptHandle> =>
@@ -826,6 +839,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
 
     /** Current movement phase for coordinating other actions. */
     function motionPhase (): MotionPhase {
+      if (guardOwns()) return 'recovering'
       if (interrupts.paused) return 'paused'
       if (digging) return 'digging'
       if (placing) return 'interacting'
@@ -846,7 +860,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
        * Use interrupt() to wait for a safe handover. */
       get critical (): boolean {
         const phase = motionPhase()
-        return phase === 'airborne' || phase === 'digging' || phase === 'interacting'
+        return phase === 'airborne' || phase === 'digging' || phase === 'interacting' || phase === 'recovering'
       },
       /** True when the next node is a jump the executor has not committed to yet. */
       get jumpPending (): boolean {
@@ -976,7 +990,10 @@ export function createPathfinder (options: PathfinderOptions = {}) {
     async function interaction<O extends { approach?: boolean, reach?: number, signal?: AbortSignal }, T> (
       reason: string, target: BlockTarget, options: O, act: (pos: Vec3, options: O) => Promise<T>
     ): Promise<T> {
-      const signal = options.signal === undefined ? lifecycle.signal : AbortSignal.any([options.signal, lifecycle.signal])
+      // A fall recovery that takes the body ends the action: its equips and looks would undo the clutch.
+      const signals = [lifecycle.signal, fallAbort.signal]
+      if (options.signal !== undefined) signals.push(options.signal)
+      const signal = AbortSignal.any(signals)
       return await runAction(reason, signal, async () => {
         const pos = toVec3(target)
         if (options.approach !== false) await approachBlock(pos, options.reach ?? actions.config.reach, signal)
@@ -1582,7 +1599,51 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         cfg.maxDropDown = Math.min(cfg.maxDropDown, dropForHealth(spare))
         cfg.fallVeto = fallVetoForHealth(spare)
       }
+      // Clutch drops only when recovery will place the water: with a usable bucket, where water stays.
+      // (Each clutch edge starts from solid footing in the planner; a mid-air start gets none from its first node.)
+      if (!clutchAllowed(cfg)) cfg.clutchDropDown = 0
       return cfg
+    }
+
+    /** Last clutch verdict a solve used; a flip asks for a new plan. */
+    function clutchAllowed (cfg: MovementsConfig): boolean {
+      if ((cfg.clutchDropDown ?? 0) <= 0 || guard === null) return false
+      return guard.clutchAvailable()
+    }
+
+    /** A clutch drop is walked off only with the bucket in hand and water still allowed on its landing. */
+    function clutchTakeoffReady (): boolean {
+      if (guard === null) return true
+      // Every second: a bucket gained or spent changes which drops are open (against the live path's solve).
+      if (physTicks % 20 === 0 && path.length > 0 && stateMovements.maxClutchDropDown > 0 && !guard.active() && lastSolveCfg !== null) {
+        const now = clutchAllowed(stateMovements.toConfig())
+        if (now !== ((lastSolveCfg.clutchDropDown ?? 0) > 0)) softReplan('clutch_changed')
+      }
+      if (path.length === 0 || path[0].clutch !== true) return true
+      // An interrupt holder owns the hands too: no staging while one is held.
+      if (interrupts.paused) return true
+      if ((bot.entity as { onGround?: boolean }).onGround !== true) return true
+      // The last fall is still settling: wait at the edge rather than step off unchecked.
+      if (guard.active()) {
+        fullStop()
+        return false
+      }
+      const n = path[0]
+      if (!guard.clutchLandingOk(n.cell[0], n.cell[1] - 1, n.cell[2])) {
+        banTakeoff(n)
+        resetPath('clutch_unfit')
+        return false
+      }
+      const r = guard.prepareClutch()
+      if (r === 'missing') {
+        resetPath('clutch_missing')
+        return false
+      }
+      if (r === 'staging') {
+        fullStop()
+        return false
+      }
+      return true
     }
 
     /** Health above the floor, or null with no floor set. */
@@ -2700,6 +2761,9 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         flushPatches() // no-op while a solve is reading the SAB
       }
 
+      // The recovery's own water or block: the path planned for it, or the recovery replans after.
+      const op = oldBlock.position
+      if (guard?.ownsCell(op.x, op.y, op.z) === true) return
       if (isPositionNearPath(oldBlock.position, path) && oldBlock.type !== newBlock.type) {
         // Clear imminent obstructions; otherwise keep following the valid prefix during replanning.
         let imminent = false
@@ -2718,6 +2782,8 @@ export function createPathfinder (options: PathfinderOptions = {}) {
     }) as never)
 
     listen('death', () => {
+      // First, so the keys a recovery held are released by the lines below.
+      guard?.abort('death')
       releaseClimbHold()
       pendingStop = null
       if ((pf.stopOnDeath as boolean) && goalActive()) {
@@ -2732,6 +2798,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
 
     // A respawn or a dimension change: the path and the snapshot describe another place.
     listen('respawn', () => {
+      guard?.onSpawn()
       snapshotStale = true
       deepFloorFresh = false
       if (path.length > 0 || solveInFlight()) resetPath('respawn')
@@ -2739,6 +2806,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
 
     // No tick ever comes again: whatever is waiting on one has to be told now.
     listen('end', () => {
+      guard?.abort('disconnect')
       ended = 'disconnected'
       interrupts.close('The bot disconnected.')
       if (goalActive()) {
@@ -2753,6 +2821,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
     }
 
     listen('forcedMove', (() => {
+      guard?.onForcedMove()
       lastForcedMoveAt = performance.now()
       forcedAtTick = physTicks
       // Corrections invalidate line-up presses verified for the old body state.
@@ -2782,7 +2851,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         }
       } else {
         resetPath('forced_move', false)
-        if (FORCED_RELEASE) {
+        if (FORCED_RELEASE && !guardOwns()) {
           bot.setControlState('forward', false)
           bot.setControlState('back', false)
           bot.setControlState('left', false)
@@ -2979,6 +3048,21 @@ export function createPathfinder (options: PathfinderOptions = {}) {
     }
 
     function monitorMovementInner (): void {
+      // A fall recovery drives the body: nothing here writes, not even this tick's releases.
+      if (guardOwns()) {
+        execBranch = 'recover'
+        return
+      }
+      if (reseedFallTally) {
+        // The recovery's fall is over: count from here, so its descent never arms a landing wait.
+        reseedFallTally = false
+        const p = bot.entity.position
+        prevTickY = p.y
+        prevTickPos = p.clone()
+        prevTickAt = physTicks
+        fallen = 0
+        airTicks = 0
+      }
       if (skip !== null && (path.length === 0 || path[0] !== skip.target)) skip = null
       // A support brake lasts one tick; the no-path branch does not release it.
       if (holdKeyed) {
@@ -3018,6 +3102,8 @@ export function createPathfinder (options: PathfinderOptions = {}) {
         }
         return
       }
+      // After stops and pauses: a clutch drop is stepped off only with the bucket in hand.
+      if (!clutchTakeoffReady()) return
 
       // A take-off search from liquid cannot find a jump, so hazard escape precedes replanning.
       if (stateGoal !== null && hazardEscape()) {
@@ -5472,16 +5558,80 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       futile(swimming)
     }
 
+    /** The executor's fall tally restarts from the body once a recovery hands the controls back. */
+    let reseedFallTally = false
+    let recoverStartedAt = 0
+    function createGuard (): FallGuard {
+      let fallTables: { lut: BlockLut, tables: Omit<SimWorld, 'stateAt'> } | null = null
+      const autoEatReason = (): string =>
+        (bot as unknown as { pathfinderAutoEat?: { options?: { reason?: string } } }).pathfinderAutoEat?.options?.reason ?? 'autoeat'
+      return new FallGuard({
+        bot: bot as never,
+        options: fallRecovery,
+        tables: () => {
+          let lut: BlockLut
+          try { lut = cachedLut ?? getLut(bot, stateMovements) } catch { return null }
+          if (fallTables === null || fallTables.lut !== lut) fallTables = { lut, tables: simTablesFromLut(lut) }
+          return fallTables.tables
+        },
+        wholeFall: () => wholeFall,
+        minHealth: () => pf.minHealth as number,
+        flight: () => {
+          const driving = path.length > 0 && stateGoal !== null && !interrupts.paused
+          let floorY: number | null = null
+          for (let i = 0; i < Math.min(5, path.length); i++) floorY = floorY === null ? path[i].y : Math.min(floorY, path[i].y)
+          const n0 = path[0] as (Move & { clutch?: boolean }) | undefined
+          // The planner's cell: postprocessing moves node coordinates off block corners.
+          const clutch = n0 !== undefined && n0.clutch === true ? { x: n0.cell[0], y: n0.cell[1] - 1, z: n0.cell[2] } : null
+          return { driving, floorY, clutch }
+        },
+        // An exclusive hold of the user's keeps its controls; autoEat's gives way to a recovery.
+        userHolds: () => interrupts.exclusive && interrupts.holders.some(r => r !== autoEatReason()),
+        takeOver: () => {
+          recoverStartedAt = performance.now()
+          if (digging || placing) cancelExecInteraction()
+          coastHold = false
+          climbHold = false
+          const abort = fallAbort
+          fallAbort = new AbortController()
+          abort.abort(new Error('A fall recovery took the controls.'))
+          const ae = (bot as unknown as { pathfinderAutoEat?: { eating?: boolean }, autoEat?: { cancelEat?: () => void } })
+          if (ae.pathfinderAutoEat?.eating === true) {
+            try { ae.autoEat?.cancelEat?.() } catch {}
+          }
+        },
+        released: (planned) => {
+          reseedFallTally = true
+          const d = recoverStartedAt > 0 ? performance.now() - recoverStartedAt : 0
+          recoverStartedAt = 0
+          lastNodeTime += d
+          lastNodeArrival += d
+          goalSetTime += d
+          // Also a solve started before the fall: its path starts where the bot no longer is.
+          if (!planned && goalActive() && !stopPathing) resetPath('fall')
+          // Requests that waited for the recovery are granted now.
+          interrupts.gate()
+        },
+        warn
+      })
+    }
+
     // Count before movement monitoring so the teleport check sees the physics tick gap.
     listen('physicsTick', () => { physTicks++ })
+    guard = createGuard()
+    // Before the executor: a recovery that takes the body this tick keeps the executor's hands off it.
+    listen('physicsTick', () => { guard?.tick() })
     listen('physicsTick', monitorMovement)
+    // After this tick's movement packet: a clutch sent now is judged from the position just sent.
+    listen('move', () => { guard?.onMove() })
+    listen('spawn', () => { guard?.onSpawn() })
 
     // Sneak on slime touchdown to suppress an unplanned rebound.
     // Planned bounces and program replays control their own landings.
     const slimeLand = { slimeLand: true, tx: 0, ty: 0, tz: 0 } as HopProgram
     const SLIME_KIND = simKindOf('slime_block', false)
     listen('physicsTick', () => {
-      if (path.length === 0 || stateGoal === null || interrupts.paused) return
+      if (path.length === 0 || stateGoal === null || interrupts.paused || guardOwns()) return
       const ent = bot.entity as { onGround?: boolean, position: Vec3, velocity: Vec3 }
       const vy = ent.velocity.y
       const n0 = path[0] as Move
@@ -5536,12 +5686,18 @@ export function createPathfinder (options: PathfinderOptions = {}) {
       if (self === undefined || packet.entityId !== self.id) return
       const v = packet.velocity as { x: number, y: number, z: number } | undefined
       if (motionExact && v !== undefined) self.velocity.set(v.x, v.y, v.z)
+      guard?.onVelocity(self.velocity.x, self.velocity.y, self.velocity.z)
       hurtSeen = true
       // Damage on an exempt landing indicates the server uses the older fall rule.
       if (spared > 0) {
         wholeFall = false
         spared = 0
       }
+    })
+    // An explosion that pushes the bot (a wind charge, TNT) makes its fall unplanned.
+    onPacket('explosion', (packet) => {
+      const k = (packet.playerKnockback ?? packet.playerMotion) as { x?: number, y?: number, z?: number } | undefined
+      if (k !== undefined && k !== null && (Math.abs(k.x ?? 0) + Math.abs(k.y ?? 0) + Math.abs(k.z ?? 0)) > 0.01) guard?.onExplosion()
     })
     if (execTraceFile !== null) {
       // Packet traces distinguish physics decisions from server motion corrections.
@@ -5585,6 +5741,7 @@ export function createPathfinder (options: PathfinderOptions = {}) {
     pf.dispose = () => {
       if (disposed) return
       disposed = true
+      guard?.dispose()
       if (ended === null) ended = 'disposed'
       interrupts.close('The pathfinder was disposed.')
       if (goalActive()) {

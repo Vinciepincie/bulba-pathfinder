@@ -2,7 +2,7 @@
 // Momentum states use sparse secondary slots linked per cell, avoiding a full state grid.
 import { performance } from 'node:perf_hooks'
 import { MinHeap } from './heap.js'
-import { MoveGen, META_PARKOUR, META_USEONE, META_BOUNCE, META_CHAIN, META_RUN, META_AIM, META_DEEP, MOM_NONE } from './moveGen.js'
+import { MoveGen, META_PARKOUR, META_USEONE, META_BOUNCE, META_CHAIN, META_RUN, META_AIM, META_DEEP, META_CLUTCH, MOM_NONE } from './moveGen.js'
 import type { SnapshotView, StepExclusionFn, DigContext } from './moveGen.js'
 import type { MovementsConfig, RawPathNode, SolveStatus } from './types.js'
 
@@ -308,9 +308,12 @@ export class Solver {
   private makeResult (status: SolveStatus, node: number, cancelled = false): RawSolveResult {
     const arena = this.arena
     const path: RawPathNode[] = []
+    const idxs: number[] = []
+    let end = node
     if (node >= 0) {
       let cur = node
       while (cur >= 0 && arena.stamp[cur] === this.myEpoch && arena.parent[cur] >= 0) {
+        idxs.push(cur)
         const parent = arena.parent[cur]
         const meta = arena.meta[cur]
         const cell = this.cellOf(cur)
@@ -326,6 +329,7 @@ export class Solver {
           useOne: (meta & META_USEONE) !== 0 ? { x, y, z } : null
         }
         if ((meta & META_RUN) !== 0) node.run = true
+        if ((meta & META_CLUTCH) !== 0) node.clutch = true
         if ((meta & META_AIM) !== 0) {
           const aim = this.aims?.get(cur)
           if (aim !== undefined) node.aim = aim
@@ -347,11 +351,20 @@ export class Solver {
         cur = parent
       }
       path.reverse()
+      idxs.reverse()
+      // Only a whole path may spend a bucket on a one-way drop: a partial stops before it (lib.rs serialize_result).
+      if (status !== 'success') {
+        const cut = path.findIndex(n => n.clutch === true)
+        if (cut >= 0) {
+          path.length = cut
+          end = cut > 0 ? idxs[cut - 1] : -1
+        }
+      }
     }
     return {
       status,
       cancelled,
-      cost: node >= 0 && arena.stamp[node] === this.myEpoch ? arena.g[node] : 0,
+      cost: end >= 0 && arena.stamp[end] === this.myEpoch ? arena.g[end] : 0,
       time: performance.now() - this.startTime,
       visitedNodes: this.visited,
       generatedNodes: this.visited + this.openCount,

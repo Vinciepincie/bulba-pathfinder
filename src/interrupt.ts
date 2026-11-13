@@ -13,6 +13,8 @@ export type MotionPhase =
   | 'digging'
   | 'interacting'
   | 'paused'
+  /** Fall recovery owns the body (`fallRecovery.mode = 'recover'`). */
+  | 'recovering'
 
 /** Control lease returned by bot.pathfinder.interrupt(); movement stays paused until release. */
 export interface InterruptHandle {
@@ -59,6 +61,8 @@ interface Hooks {
   onPause: (reasons: string[]) => void
   /** Resume driving after pausedMs milliseconds of interruption. */
   onResume: (pausedMs: number) => void
+  /** Grant nothing, not even forced or expired requests (a fall recovery owns the body). */
+  blocked?: () => boolean
 }
 
 interface EmitterLike {
@@ -165,6 +169,7 @@ export class InterruptController {
   }
 
   private grantWhatWeCan (): void {
+    if (this.hooks.blocked?.() === true) return
     const now = performance.now()
     const wasPaused = this.held.size > 0
     let paused = wasPaused

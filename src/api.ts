@@ -7,6 +7,7 @@ import type { ComputedPathResult } from './plugin.js'
 import type { GotoOptions, ComputePathOptions } from './types.js'
 import type { InterruptHandle, InterruptOptions, MotionPhase } from './interrupt.js'
 import type { AutoEatControl } from './integrations/autoEat.js'
+import type { FallInfo, FallOutcome, FallRecoveryOptions } from './fall/guard.js'
 import type {
   ActionTable, ActivateOptions, BlockTarget, DigOptions, OpenOptions, PlaceOptions, WindowLike
 } from './actions/types.js'
@@ -38,7 +39,14 @@ export type PathStopReason =
 /** Why the current path was thrown away. The goal stays, and a new path follows. */
 export type PathResetReason =
   | 'goal_updated' | 'movements_updated' | 'block_updated' | 'chunk_loaded' | 'goal_moved'
-  | 'dig_error' | 'place_error' | 'stuck' | 'forced_move' | 'respawn' | 'basin' | (string & {})
+  | 'dig_error' | 'place_error' | 'stuck' | 'forced_move' | 'respawn' | 'basin'
+  /** A fall recovery moved the body off the path. */
+  | 'fall'
+  /** The water bucket a planned drop needs is gone. */
+  | 'clutch_missing'
+  /** The landing of a planned clutch drop no longer takes water (changed, or it would soak in). */
+  | 'clutch_unfit'
+  | (string & {})
 
 /** The error `goto` rejects with when a goal is stopped. */
 export interface PathStoppedError extends Error {
@@ -71,6 +79,15 @@ export interface PathfinderEvents {
   'pathfinder:activate': (position: Vec3, block: unknown) => void
   /** A door the executor opened for a path failed to respond. */
   'pathfinder:activate_error': (error: unknown) => void
+  /**
+   * The bot is falling in a way the executor did not plan (knocked, its floor removed, or not driving)
+   * and the landing will hurt. Once per fall, with the predicted landing and the plan.
+   */
+  'pathfinder:fall_start': (info: FallInfo) => void
+  /** No known plan survives this fall. Usually emitted well before the landing, so your own logic can act. */
+  'pathfinder:fall_lethal': (info: FallInfo) => void
+  /** The fall is over: what it cost and what recovery did. */
+  'pathfinder:fall_finish': (outcome: FallOutcome) => void
   /** Only with the `autoEatIntegration` plugin loaded. */
   'pathfinder:autoeat_start': () => void
   'pathfinder:autoeat_finish': () => void
@@ -118,6 +135,8 @@ export interface Pathfinder {
   minHealth: number
   /** End the goal when the bot dies, instead of walking back after the respawn (default true). */
   stopOnDeath: boolean
+  /** Fall recovery: report unplanned falls, or also steer and use a breaker. Change its fields. */
+  readonly fallRecovery: FallRecoveryOptions
 
   /** Walk to a goal. Rejects with `NoPath`, `Timeout`, `GoalChanged` or `PathStopped`, or the signal's reason. */
   goto: (goal: Goal, options?: GotoOptions) => Promise<void>

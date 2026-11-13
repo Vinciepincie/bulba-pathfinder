@@ -29,6 +29,8 @@ export class Move extends Vec3 {
   chain: boolean
   /** A jump beyond standing reach; the executor builds sprint speed from the support's rear. */
   run = false
+  /** A drop past the fall budget, landed by placing water just before touchdown (fall recovery). */
+  clutch = false
   /** Whether the landing support is narrow; null until the executor checks its shape. */
   narrowLanding: boolean | null = null
   /** Signed takeoff/landing offsets in blocks along the flight's perpendicular (-dz, dx).
@@ -78,6 +80,7 @@ export class Move extends Vec3 {
     const via = raw.via ? new Vec3(raw.via.x, raw.via.y, raw.via.z) : null
     const move = new Move(raw.x, raw.y, raw.z, 0, raw.cost, toBreak, toPlace, raw.parkour, via, raw.chain === true)
     move.run = raw.run === true
+    if (raw.clutch === true) move.clutch = true
     if (raw.program !== undefined) move.program = raw.program
     if (raw.aim !== undefined && raw.aim !== 0) {
       const v = AIM_VARIANTS[(raw.aim & 0x7f) - 1]

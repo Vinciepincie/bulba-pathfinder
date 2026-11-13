@@ -129,6 +129,10 @@ const META_AIM: u8 = 32;
 /// A drop into liquid deeper than max_drop_down (mirror of moveGen.ts
 /// META_DEEP): inherited down the tree, never the best node of a partial.
 const META_DEEP: u8 = 64;
+/// A drop past the fall budget landed with a water bucket (moveGen.ts META_CLUTCH): not inherited.
+const META_CLUTCH: u8 = 128;
+/// A clutch drop only pays when the landing would hurt (moveGen.ts CLUTCH_MIN_DROP).
+const CLUTCH_MIN_DROP: i32 = 4;
 const CARRY_WIDE: u8 = 7;
 /// Thin footprint interval classes in sixteenths (mirror of shapes.ts THIN_INTERVALS).
 const THIN_LO: [f64; 16] = [0.0, 0.0, 13.0, 7.0, 6.0, 5.0, 4.0, 0.0, 0.0, 0.0, 0.0, 7.0, 6.0, 5.0, 4.0, 0.0];
@@ -463,6 +467,10 @@ struct Config {
     use_bubble: bool,
     allow_parkour_momentum: bool,
     max_drop_down: i32,
+    /// Clutch drops (moveGen.ts): deepest support distance - 1, shallowest worth it, extra cost.
+    clutch_drop_down: i32,
+    clutch_min: i32,
+    clutch_cost: f64,
     liquid_cost: f64,
     entity_cost: f64,
     dig_cost: f64,
@@ -579,6 +587,8 @@ struct SolverState {
     h: i32,
     l: i32,
     world_min_y: i32,
+    /// Set by find_landing when its landing needs a clutch.
+    land_clutch: bool,
 
     // dig residency (uploaded via dig_begin)
     dig_labor: Vec<f32>,
@@ -715,6 +725,7 @@ impl SolverState {
             h: 0,
             l: 0,
             world_min_y: 0,
+            land_clutch: false,
             dig_labor: Vec::new(),
             dig_flags: Vec::new(),
             entity_keys: Vec::new(),
@@ -1524,6 +1535,7 @@ impl SolverState {
         let lx = x + dx;
         let lz = z + dz;
         let mut ly = y - 2;
+        self.land_clutch = false;
         while ly > self.world_min_y {
             let idx = self.cell_index(lx, ly, lz);
             if idx < 0 {
@@ -1555,6 +1567,12 @@ impl SolverState {
                 if y - ly <= self.cfg.max_drop_down {
                     return ly + 1;
                 }
+                // Too deep to walk off: a water bucket can still land it on a plain full top.
+                if self.cfg.clutch_drop_down > 0 && y - ly > self.cfg.clutch_min && y - ly <= self.cfg.clutch_drop_down + 1
+                    && self.clutch_fits(lx, ly, lz, idx) {
+                    self.land_clutch = true;
+                    return ly + 1;
+                }
                 return i32::MIN;
             }
             // Fence/wall tops leave the feet 0.5 into the cell above.
@@ -1573,6 +1591,27 @@ impl SolverState {
         i32::MIN
     }
 
+    /// A clutch landing: a full, plain top (no catch), open air above, no lava beside (moveGen.ts clutchFits).
+    fn clutch_fits(&mut self, lx: i32, ly: i32, lz: i32, idx: i32) -> bool {
+        let ht = self.heights[idx as usize];
+        if (ht & 63) != 32 || (ht >> 6) != 0 {
+            return false;
+        }
+        let above = self.flags_at(lx, ly + 1, lz);
+        if (above & (LIQUID | CLIMBABLE)) != 0 || !self.is_safe(above) {
+            return false;
+        }
+        !self.lava_flanked(lx, ly + 1, lz)
+    }
+
+    /// A clutch drop starts from solid footing (moveGen.ts clutchSource).
+    fn clutch_source(&mut self, x: i32, y: i32, z: i32) -> bool {
+        if (self.flags_at(x, y - 1, z) & PHYSICAL) == 0 {
+            return false;
+        }
+        (self.flags_at(x, y, z) & (LIQUID | CLIMBABLE)) == 0
+    }
+
     fn move_drop_down(&mut self, x: i32, y: i32, z: i32, dx: i32, dz: i32) {
         self.begin_move();
         let mut cost = 1.0;
@@ -1581,7 +1620,11 @@ impl SolverState {
         if land_y == i32::MIN {
             return;
         }
-        if !self.cfg.infinite_liquid_dropdown && (y - land_y) > self.cfg.max_drop_down {
+        let clutch = self.land_clutch;
+        if !clutch && !self.cfg.infinite_liquid_dropdown && (y - land_y) > self.cfg.max_drop_down {
+            return;
+        }
+        if clutch && !self.clutch_source(x, y, z) {
             return;
         }
 
@@ -1604,6 +1647,13 @@ impl SolverState {
 
         cost += self.entities_at(x + dx, land_y, z + dz) * self.cfg.entity_cost;
 
+        if clutch {
+            // The fall itself, then the stop for the water (moveGen.ts moveDropDown order).
+            cost += (y - land_y) as f64;
+            cost += self.cfg.clutch_cost;
+            self.push_out(x + dx, land_y, z + dz, cost, META_CLUTCH | META_DEEP);
+            return;
+        }
         let deep = (y - land_y) > self.cfg.max_drop_down;
         self.push_out(x + dx, land_y, z + dz, cost, if deep { META_DEEP } else { 0 });
         if self.ext_on() && !self.special.is_empty() {
@@ -1621,6 +1671,10 @@ impl SolverState {
 
         let land_y = self.find_landing(x, y, z, 0, 0);
         if land_y == i32::MIN {
+            return;
+        }
+        // Straight down is also the dig-down move: no clutch here.
+        if self.land_clutch {
             return;
         }
 
@@ -3470,8 +3524,27 @@ impl SolverState {
         let mut out = Vec::with_capacity(4096);
         out.push(status);
         out.push(self.boundary_touched as u8);
-        let cost = if self.best_idx >= 0 && self.stamp[self.best_idx as usize] == self.epoch {
-            self.g[self.best_idx as usize]
+
+        let mut nodes: Vec<i32> = Vec::new();
+        if self.best_idx >= 0 {
+            let mut cur = self.best_idx;
+            while cur >= 0 && self.stamp[cur as usize] == self.epoch && self.parent[cur as usize] >= 0 {
+                nodes.push(cur);
+                cur = self.parent[cur as usize];
+            }
+            nodes.reverse();
+        }
+        // Only a whole path may spend a bucket on a one-way drop: a partial stops before it
+        // (solver.ts makeResult). Status 0 is success.
+        let mut end = self.best_idx;
+        if status != 0 {
+            if let Some(cut) = nodes.iter().position(|&n| (self.meta[n as usize] & META_CLUTCH) != 0) {
+                nodes.truncate(cut);
+                end = if cut > 0 { nodes[cut - 1] } else { -1 };
+            }
+        }
+        let cost = if end >= 0 && self.stamp[end as usize] == self.epoch {
+            self.g[end as usize]
         } else {
             0.0
         };
@@ -3485,15 +3558,6 @@ impl SolverState {
             out.extend_from_slice(&cz.to_le_bytes());
         }
 
-        let mut nodes: Vec<i32> = Vec::new();
-        if self.best_idx >= 0 {
-            let mut cur = self.best_idx;
-            while cur >= 0 && self.stamp[cur as usize] == self.epoch && self.parent[cur as usize] >= 0 {
-                nodes.push(cur);
-                cur = self.parent[cur as usize];
-            }
-            nodes.reverse();
-        }
         out.extend_from_slice(&(nodes.len() as u32).to_le_bytes());
         for &n in &nodes {
             let ni = n as usize;
@@ -3591,6 +3655,9 @@ pub unsafe extern "C" fn solve_init(params: *const u8) -> i32 {
     let ext_len = read_u32(params, &mut off) as usize;
     let banned_ptr = read_u32(params, &mut off) as *const u8;
     let banned_count = read_u32(params, &mut off) as usize;
+    // Appended after the banned edges (wasmSolver.ts packParams).
+    let clutch_drop_down = read_i32(params, &mut off);
+    let clutch_cost = read_f64(params, &mut off);
 
     st.cfg = Config {
         allow_sprinting: cfg_bits & 1 != 0,
@@ -3605,6 +3672,9 @@ pub unsafe extern "C" fn solve_init(params: *const u8) -> i32 {
         allow_parkour_extended: cfg_bits & 512 != 0,
         allow_parkour_momentum: cfg_bits & 1024 != 0,
         max_drop_down,
+        clutch_drop_down,
+        clutch_min: if max_drop_down > CLUTCH_MIN_DROP { max_drop_down } else { CLUTCH_MIN_DROP },
+        clutch_cost,
         liquid_cost,
         entity_cost,
         dig_cost,

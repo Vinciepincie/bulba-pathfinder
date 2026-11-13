@@ -25,6 +25,12 @@ export type {
 } from './actions/types.js'
 export { autoEatIntegration } from './integrations/autoEat.js'
 export type { AutoEatControl, AutoEatIntegrationOptions } from './integrations/autoEat.js'
+export { defaultFallItems } from './fall/items.js'
+export type { FallItemKind, FallItemRule } from './fall/items.js'
+export type {
+  FallCause, FallChoice, FallInfo, FallOutcome, FallRecoveryMode, FallRecoveryOptions
+} from './fall/guard.js'
+export type { LandingMedium } from './fall/predict.js'
 
 /** Default export includes `{ pathfinder, Movements, goals }` for compatibility. */
 export default { pathfinder, createPathfinder, Movements, goals, autoEatIntegration }

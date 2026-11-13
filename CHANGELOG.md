@@ -3,6 +3,22 @@
 This project follows [semantic versioning](https://semver.org/). Before 1.0, a minor version can break the API.
 `bulba-pathfinder/internals` and `PF_*` environment variables carry no stability promise at any version.
 
+## Unreleased
+
+### Added
+
+- Fall recovery (`bot.pathfinder.fallRecovery`). The pathfinder counts falls the way the server does and notices a
+  fall the path did not plan (knockback, explosions, a floor broken away, or falling with no goal).
+  - Events `pathfinder:fall_start`, `pathfinder:fall_lethal` and `pathfinder:fall_finish`.
+  - In `'recover'` mode it steers in the air toward the cheapest landing and uses a fall breaker just before landing:
+    water or fish buckets, cobweb or hay bales, then takes the water back.
+  - Items are chosen with `items` rules (name, id or a function) and limited with an `inventory` function.
+- `movements.maxClutchDropDown`: paths may plan drops deeper than `maxDropDown` and land them with a water bucket. Off
+  by default; needs `'recover'` mode and a usable bucket.
+- `motion.phase` can be `'recovering'`; `path_reset` can carry `'fall'`, `'clutch_missing'` and `'clutch_unfit'`.
+
+The default mode, `'observe'`, only emits events: paths are walked as before.
+
 ## 0.1.0 (2026-11-13)
 
 First public release.

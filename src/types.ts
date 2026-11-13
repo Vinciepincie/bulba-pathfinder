@@ -92,6 +92,13 @@ export interface MovementsConfig {
   /** Open non-iron doors as well as gates when canOpenDoors is enabled. Default true. */
   canOpenRealDoors: boolean
   maxDropDown: number
+  /**
+   * Deepest drop (to the landing cell) planned with a water bucket clutch; 0 disables. The plugin
+   * sends 0 unless fall recovery is in 'recover' mode with a usable bucket where water stays.
+   */
+  clutchDropDown?: number
+  /** Cost added to a clutch drop on top of its height (the stop to take the water back). */
+  clutchCost?: number
   infiniteLiquidDropdownDistance: boolean
   liquidCost: number
   entityCost: number
@@ -156,6 +163,8 @@ export interface RawPathNode {
   chain?: boolean
   /** Jump requiring a run-up because standing reach is insufficient. */
   run?: boolean
+  /** A drop past the fall budget, landed with a water bucket placed just before touchdown. */
+  clutch?: boolean
   /** Aimed flight: bits 0-6 hold the 1-based AIM_VARIANTS index; bit 7 mirrors
    * the variant in world space. Variant offsets shift takeoff and landing from cell centres. */
   aim?: number

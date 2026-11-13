@@ -176,6 +176,14 @@ export class Movements {
 
   maxDropDown: number
   infiniteLiquidDropdownDistance: boolean
+  /**
+   * Deepest drop to plan with a water bucket, placed just before landing (default 0: never).
+   * Used only with `bot.pathfinder.fallRecovery.mode = 'recover'` and a usable bucket, outside the Nether.
+   * A failed clutch takes the whole fall, so this is a bet on the connection; `minHealth` does not cap it.
+   */
+  maxClutchDropDown: number
+  /** Cost of a clutch drop on top of its height, for taking the water back (default 3). */
+  clutchCost: number
 
   entityIntersections: Record<string, number>
 
@@ -297,6 +305,8 @@ export class Movements {
 
     this.maxDropDown = 4
     this.infiniteLiquidDropdownDistance = true
+    this.maxClutchDropDown = 0
+    this.clutchCost = 3
 
     this.entityIntersections = {}
   }
@@ -457,6 +467,8 @@ export class Movements {
       canOpenDoors: this.canOpenDoors,
       canOpenRealDoors: this.canOpenRealDoors,
       maxDropDown: this.maxDropDown,
+      clutchDropDown: this.maxClutchDropDown,
+      clutchCost: this.clutchCost,
       infiniteLiquidDropdownDistance: this.infiniteLiquidDropdownDistance,
       liquidCost: this.liquidCost,
       entityCost: this.entityCost,

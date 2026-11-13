@@ -431,6 +431,19 @@ is also the next route's start, the next start sign sits on the cell beside
 it, or on a single post one block above it (the start snaps down onto it). Most of these routes do not plan yet — that is the
 point of them.
 
+## Fall recovery checks
+
+`npx tsx bench/arena/fall.ts [--only id,id] [--repeat n] [--attach] [--watch]` checks fall recovery on the live server, not
+against routes. Each scenario builds a lane in empty sky (x −672…−449, z −688…−641, a stone floor at y 179 and a
+one-block pillar), gives the bot its items, then knocks it off with `/damage <bot> 0.5 minecraft:mob_attack at <pos>`,
+removes the pillar, or sends it down with `goto`. It prints one line per scenario: the damage the fall cost (the
+knock's half heart left out), death and its message, the plugin's fall events, the plan, whether a totem popped, and
+which buckets came back. `PF_FALL_TRACE=1` logs the guard's decisions.
+
+A joining or respawned player ignores damage for a while, so the harness pokes the bot until a hit lands before the
+first scenario, and waits 3.5 s after any respawn. With `--watch` it waits for you to join, brings you to each lane
+and pauses before each fall.
+
 ## Watching
 
 Join `127.0.0.1:25599` with any username (offline mode). You spawn as a

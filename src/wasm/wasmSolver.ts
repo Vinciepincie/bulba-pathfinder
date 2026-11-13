@@ -230,7 +230,7 @@ export class WasmSolver {
     const entityCount = snap.entityIdx.length
     const entitySize = entityCount * 8
     const bannedPairs = snap.bannedEdges != null ? snap.bannedEdges.length >> 1 : 0
-    const paramsSize = 4 * 4 + specs.length * 36 + 4 * 2 + 8 * 7 + 4 * 2 + 4 * 2 + 4 * 2
+    const paramsSize = 4 * 4 + specs.length * 36 + 4 * 2 + 8 * 7 + 4 * 2 + 4 * 2 + 4 * 2 + 4 + 8
     // Upload the process-constant parkour table once when residency exports exist.
     const extWanted = cfg.allowParkourExtended && cfg.allowParkour && cfg.allowSprinting
     let extBlob: ArrayBuffer | null = null
@@ -304,6 +304,9 @@ export class WasmSolver {
     u32(entityPtr); u32(entityCount)
     u32(extPtr); u32(extBlob !== null ? extBlob.byteLength : 0)
     u32(bannedPtr); u32(bannedPairs)
+    // Clutch drops, appended last (lib.rs solve_init).
+    i32(cfg.clutchDropDown ?? 0)
+    f64(cfg.clutchCost ?? 3)
 
     try {
       const initT0 = timing ? performance.now() : 0
@@ -388,6 +391,7 @@ export class WasmSolver {
         useOne: (meta & 2) !== 0 ? { x, y, z } : null
       }
       if ((meta & 16) !== 0) node.run = true // META_RUN
+      if ((meta & 128) !== 0) node.clutch = true // META_CLUTCH
       if ((meta & 32) !== 0) {
         // META_AIM: the AIM byte follows the meta byte (lib.rs serialize_result)
         node.aim = view.getUint8(off); off += 1

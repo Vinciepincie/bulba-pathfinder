@@ -16,6 +16,8 @@ import; [a few defaults differ](#moving-from-mineflayer-pathfinder).
   and the walk resumes where it stopped. An adapter for mineflayer-auto-eat is included.
 - **Dig, place and open in one call.** `dig`, `place`, `open` and `activate` walk into range first. `dig` and `place`
   aim at a face the server accepts, and check that the block really changed.
+- **Fall recovery.** Knocked off a ledge, the bot steers to the softest landing and places water, cobweb or hay just
+  before it lands.
 
 > **0.x:** the API can still change between minor versions. Tested live on Paper 1.21.11; the unit tests cover
 > Minecraft 1.8.9 to 1.21.1.
@@ -106,6 +108,14 @@ path plans is limited to the health above the floor:
 ```js
 bot.pathfinder.minHealth = 8
 bot.on('pathfinder:low_health', () => { /* eat first: a goal set below the floor stops too */ })
+```
+
+Survive being knocked off a ledge: steer to the softest landing, and pour a water bucket (or place cobweb or hay) just
+before hitting the ground. With `maxClutchDropDown`, paths may also jump down on purpose and land in water:
+
+```js
+bot.pathfinder.fallRecovery.mode = 'recover' // the default, 'observe', only reports
+bot.on('pathfinder:fall_lethal', (info) => console.log(`no way out, ${info.ticksToImpact} ticks left`))
 ```
 
 Pause the walk to run your own code. The first argument is a label. It waits for the bot to land, then the walk

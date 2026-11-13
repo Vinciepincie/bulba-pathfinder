@@ -153,6 +153,11 @@ export const META_AIM = 32;
  * Descendants inherit this flag and cannot be endpoints of partial or noPath
  * results, even when they are closer to the goal. */
 export const META_DEEP = 64;
+/** A drop past the fall budget onto a full top, landed with a water bucket placed just before
+ * touchdown. Not inherited; always paired with META_DEEP. */
+export const META_CLUTCH = 128;
+/** A clutch drop only pays when the landing would hurt: support at least this far below the feet. */
+const CLUTCH_MIN_DROP = 4;
 const SAFE = LutFlags.SAFE;
 const PHYSICAL = LutFlags.PHYSICAL;
 const LIQUID = LutFlags.LIQUID;
@@ -272,6 +277,12 @@ export class MoveGen {
   private readonly canOpenDoors!: boolean
   private readonly doorMode!: boolean
   private readonly maxDropDown!: number
+  /** Clutch drops: deepest node drop + 1 (support distance), the shallowest worth a bucket, and the extra cost. */
+  private readonly clutchDropDown!: number
+  private readonly clutchMin!: number
+  private readonly clutchCost!: number
+  /** Set by findLanding when its landing needs a clutch. */
+  private landClutch = false
   private readonly infiniteLiquidDropdownDistance!: boolean
   private readonly liquidCost!: number
   private readonly entityCost!: number
@@ -333,6 +344,9 @@ export class MoveGen {
         this.canOpenDoors = cfg.canOpenDoors;
         this.doorMode = cfg.canOpenDoors && cfg.canOpenRealDoors;
         this.maxDropDown = cfg.maxDropDown;
+        this.clutchDropDown = cfg.clutchDropDown ?? 0;
+        this.clutchMin = Math.max(cfg.maxDropDown, CLUTCH_MIN_DROP);
+        this.clutchCost = cfg.clutchCost ?? 3;
         this.infiniteLiquidDropdownDistance = cfg.infiniteLiquidDropdownDistance;
         this.liquidCost = cfg.liquidCost;
         this.entityCost = cfg.entityCost;
@@ -915,6 +929,7 @@ export class MoveGen {
         const lx = x + dx;
         const lz = z + dz;
         let ly = y - 2;
+        this.landClutch = false;
         while (ly > this.worldMinY) {
             const idx = this.cellIndex(lx, ly, lz);
             if (idx < 0)
@@ -940,6 +955,11 @@ export class MoveGen {
             if ((f & PHYSICAL) !== 0) {
                 if (y - ly <= this.maxDropDown)
                     return ly + 1;
+                // Too deep to walk off: a water bucket can still land it on a plain full top.
+                if (this.clutchDropDown > 0 && y - ly > this.clutchMin && y - ly <= this.clutchDropDown + 1 && this.clutchFits(lx, ly, lz, idx)) {
+                    this.landClutch = true;
+                    return ly + 1;
+                }
                 return NaN;
             }
             // A fence or wall raises the feet and head 0.5 blocks into the cells above.
@@ -954,13 +974,32 @@ export class MoveGen {
         }
         return NaN;
     }
+  /** A clutch landing: a full, plain top (no catch) with open air above and no lava beside. Water over slime still catches. */
+  private clutchFits (lx: number, ly: number, lz: number, idx: number): boolean {
+        const ht = this.heights[idx];
+        if ((ht & 63) !== 32 || (ht >> 6) !== 0)
+            return false;
+        const above = this.flagsAt(lx, ly + 1, lz);
+        if ((above & (LIQUID | CLIMBABLE)) !== 0 || !this.isSafe(above))
+            return false;
+        return !this.lavaFlanked(lx, ly + 1, lz);
+    }
+  /** A clutch drop starts from solid footing: the bucket is staged on the ground, and the fall counts from there. */
+  private clutchSource (x: number, y: number, z: number): boolean {
+        if ((this.flagsAt(x, y - 1, z) & PHYSICAL) === 0)
+            return false;
+        return (this.flagsAt(x, y, z) & (LIQUID | CLIMBABLE)) === 0;
+    }
   private moveDropDown (x: number, y: number, z: number, dx: number, dz: number): void {
         this.beginMove();
-        let cost = 1; 
+        let cost = 1;
         const landY = this.findLanding(x, y, z, dx, dz);
         if (Number.isNaN(landY))
             return;
-        if (!this.infiniteLiquidDropdownDistance && (y - landY) > this.maxDropDown)
+        const clutch = this.landClutch;
+        if (!clutch && !this.infiniteLiquidDropdownDistance && (y - landY) > this.maxDropDown)
+            return;
+        if (clutch && !this.clutchSource(x, y, z))
             return;
         cost += this.safeOrBreak(x + dx, y + 1, z + dz); 
         if (cost > 100)
@@ -974,6 +1013,13 @@ export class MoveGen {
         if ((this.flagsAt(x + dx, y, z + dz) & LIQUID) !== 0)
             return; 
         cost += this.entitiesAt(x + dx, landY, z + dz) * this.entityCost;
+        if (clutch) {
+            // The fall itself, so a staircase wins unless the drop saves real distance (lib.rs move_drop_down).
+            cost += y - landY;
+            cost += this.clutchCost;
+            this.push(x + dx, landY, z + dz, cost, META_CLUTCH | META_DEEP);
+            return;
+        }
         this.push(x + dx, landY, z + dz, cost, (y - landY) > this.maxDropDown ? META_DEEP : 0);
         if (this.parkourExtended && this.special !== null)
             this.slimeBounce(x, y, z, x + dx, landY, z + dz);
@@ -987,7 +1033,10 @@ export class MoveGen {
         const landY = this.findLanding(x, y, z, 0, 0);
         if (Number.isNaN(landY))
             return;
-        cost += this.safeOrBreak(x, y - 1, z); 
+        // Straight down is also the dig-down move: no clutch here.
+        if (this.landClutch)
+            return;
+        cost += this.safeOrBreak(x, y - 1, z);
         if (cost > 100)
             return;
         if ((this.flagsAt(x, y, z) & LIQUID) !== 0)
