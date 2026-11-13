@@ -910,14 +910,14 @@
       "name": "opk2-1",
       "scenario": "parkour-advanced",
       "start": [
-        973,
+        509,
         242,
-        -392
+        648
       ],
       "end": [
-        968,
+        504,
         244,
-        -391
+        649
       ],
       "notes": "Optimizing Parkour 2 (Heppe) stage 1, \"head destroyer\": from the stage's spawn to its finish platform; the map's required time is 71 ticks over the course columns (TAS time 1)"
     },
@@ -926,14 +926,14 @@
       "name": "opk2-2",
       "scenario": "parkour-advanced",
       "start": [
-        970,
+        506,
         244,
-        -379
+        661
       ],
       "end": [
-        928,
+        464,
         209,
-        -378
+        662
       ],
       "notes": "Optimizing Parkour 2 (Heppe) stage 2, \"bouncy castle\": from the stage's spawn to its finish platform; the map's required time is 150 ticks over the course columns (TAS time 121)"
     },
@@ -942,14 +942,14 @@
       "name": "opk2-3",
       "scenario": "parkour-advanced",
       "start": [
-        917,
+        453,
         209,
-        -378
+        662
       ],
       "end": [
-        864,
+        400,
         220,
-        -382
+        658
       ],
       "notes": "Optimizing Parkour 2 (Heppe) stage 3, \"Rek's plan\": from the stage's spawn to its finish platform; the map's required time is 170 ticks over the course columns (TAS time 158)"
     },
@@ -958,14 +958,14 @@
       "name": "opk2-5",
       "scenario": "parkour-advanced",
       "start": [
-        823,
+        359,
         231,
-        -395
+        645
       ],
       "end": [
-        776,
+        312,
         230,
-        -395
+        645
       ],
       "notes": "Optimizing Parkour 2 (Heppe) stage 5, \"slippery one\": from the stage's spawn to its finish platform; the map's required time is 124 ticks over the course columns (TAS time 118)"
     }

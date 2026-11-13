@@ -401,8 +401,8 @@ Thirty routes above y 266 over the arena's south-east quadrant (nothing of
 
 The stages of two maps built for speedrunners, each with the time the map
 demands (its command blocks or datapack time the run in ticks). The
-courses are at arena x 690–732 (the first map, z −410…−30) and x 770–986
-(the second, z −412…−350), y 180–270.
+courses are at arena x 690–732 (the first map, z −410…−30) and x 306–521
+(the second, z 628–689), y 180–270.
 
 | routes | source | required time (ticks) |
 | --- | --- | --- |
